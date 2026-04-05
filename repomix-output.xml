@@ -103,6 +103,7 @@ This section contains the contents of the repository's files.
 //! Layout icon segment — shows the current tiling layout symbol.
 //! For the variants indicator see variantss.zig.
 
+const core    = @import("core");
 const types   = @import("types");
 const drawing = @import("drawing");
 const build   = @import("build_options");
@@ -140,6 +141,7 @@ pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, star
 
 const build = @import("build_options");
 
+const core  = @import("core");
 const types = @import("types");
 
 const drawing = @import("drawing");
@@ -476,6 +478,7 @@ pub fn draw(
     conn:                *xcb.xcb_connection_t,
     focused_window:      ?u32,
     focused_title:       []const u8,
+    minimized_title:     []const u8,
     current_ws_wins:     []const u32,
     minimized_set:       *const std.AutoHashMapUnmanaged(u32, void),
     cached_title:        *std.ArrayList(u8),
@@ -495,7 +498,7 @@ pub fn draw(
         .{
             .focused_window  = focused_window,
             .focused_title   = focused_title,
-            .minimized_title = "",
+            .minimized_title = minimized_title,
             .current_ws_wins = current_ws_wins,
             .minimized_set   = minimized_set,
         },
@@ -2739,6 +2742,7 @@ fn textObjBracket(vs: *VimState, open: u8, close: u8, inner: bool) ?MotionResult
 //! Calling render-thread-only functions from the main thread is a data race.
 
 const std     = @import("std");
+const defs    = @import("defs");
 const drawing = @import("drawing");
 const core    = @import("core");
 const xcb     = core.xcb;
@@ -3903,6 +3907,7 @@ fn fetchWindowTitle(
 //! Displays the current time and manages the update timer.
 
 const std     = @import("std");
+const core    = @import("core");
 const types   = @import("types");
 const drawing = @import("drawing");
 const bar     = @import("bar");
@@ -4008,6 +4013,7 @@ fn formatTime(buf: []u8, sec: i64) ![]const u8 {
 //! the main thread.
 
 const std     = @import("std");
+const core    = @import("core");
 const types   = @import("types");
 const drawing = @import("drawing");
 
@@ -4529,13 +4535,22 @@ const State = struct {
                 snap.current_workspace, snap.workspace_has_windows.items, snap.is_all_view_active),
             .layout   => try layoutSegment.draw(self.render.dc, self.render.config, self.render.height, x),
             .variants => try variantsSegment.draw(self.render.dc, self.render.config, self.render.height, x),
-            .title    => try prompt.draw(
-                self.render.dc, self.render.config, self.render.height, x, width orelse 100,
-                self.win.conn, snap.focused_window,
-                snap.focused_title.items,
-                snap.current_workspace_windows.items, &snap.minimized_windows,
-                &self.title_cache.title, &self.title_cache.title_window,
-                snap.is_title_invalidated, self.render.allocator),
+            .title    => blk: {
+                const wins = snap.current_workspace_windows.items;
+                const minimized_title: []const u8 =
+                    if (wins.len > 0 and snap.minimized_windows.contains(wins[0]))
+                        snap.windowTitle(0)
+                    else
+                        "";
+                break :blk try prompt.draw(
+                    self.render.dc, self.render.config, self.render.height, x, width orelse 100,
+                    self.win.conn, snap.focused_window,
+                    snap.focused_title.items,
+                    minimized_title,
+                    snap.current_workspace_windows.items, &snap.minimized_windows,
+                    &self.title_cache.title, &self.title_cache.title_window,
+                    snap.is_title_invalidated, self.render.allocator);
+            },
             .clock    => try clockSegment.draw(self.render.dc, self.render.config, self.render.height, x),
         };
     }
@@ -8879,6 +8894,8 @@ pub const Limits = struct {
 
 const std = @import("std");
 
+const constants = @import("constants");
+
 // On every @cImport, C code has to be translated to Zig on every compilation.
 // That's why importing xcb here, and then making other files import it
 // through this file is a tiny bit more efficient.
@@ -9105,7 +9122,6 @@ pub fn setupSignalPipe() !void {
     std.posix.sigaction(std.posix.SIG.HUP,  &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
     std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
-    std.posix.sigaction(std.posix.SIG.CHLD, &sa, null);
 }
 
 /// Closes both ends of the signal pipe.
@@ -9130,20 +9146,8 @@ fn handleSignalPipe(fd: std.posix.fd_t) void {
             sigToU8(std.posix.SIG.HUP)  => utils.reload(),
             sigToU8(std.posix.SIG.TERM),
             sigToU8(std.posix.SIG.INT)  => utils.quit(),
-            sigToU8(std.posix.SIG.CHLD) => reapChildren(),
             else => {},
         }
-    }
-}
-
-/// Drain all terminated child processes and remove their spawn-queue entries
-/// so a later MapRequest cannot be mis-routed to the wrong workspace.
-fn reapChildren() void {
-    while (true) {
-        var status: u32 = undefined;
-        const pid = @as(isize, @bitCast(std.os.linux.waitpid(-1, &status, std.os.linux.W.NOHANG)));
-        if (pid <= 0) break;
-        window.removeSpawnByPid(@intCast(pid));
     }
 }
 
@@ -9673,6 +9677,20 @@ pub fn initAtomCache(conn: *xcb.xcb_connection_t) !void {
     atom_cache = cache;
 }
 
+/// Interns a single atom by name, always making a server round-trip.
+/// Prefer `getAtomCached` for atoms known at compile time.
+pub fn getAtom(conn: *xcb.xcb_connection_t, name: []const u8) !u32 {
+    const reply = xcb.xcb_intern_atom_reply(
+        conn,
+        xcb.xcb_intern_atom(conn, 0, @intCast(name.len), name.ptr),
+        null,
+    ) orelse {
+        debug.err("Failed to intern atom: {s}", .{name});
+        return error.AtomFailed;
+    };
+    defer std.c.free(reply);
+    return reply.*.atom;
+}
 
 /// Looks up a cached atom by name.
 /// Unknown names produce a compile error rather than a silent runtime failure.
@@ -9981,6 +9999,31 @@ pub const WMClass = struct {
     }
 };
 
+/// Reads and parses the WM_CLASS property for `win`. The raw value is two
+/// null-terminated strings concatenated: instance name then class name.
+/// Returns null if the property is absent, malformed, or allocation fails.
+pub fn getWMClass(conn: *xcb.xcb_connection_t, win: u32, allocator: std.mem.Allocator) ?WMClass {
+    const class_atom = getAtomCached("WM_CLASS") catch return null;
+    const reply = xcb.xcb_get_property_reply(conn,
+        xcb.xcb_get_property(conn, PROPERTY_NO_DELETE, win, class_atom, xcb.XCB_ATOM_STRING, 0, MAX_PROPERTY_LENGTH), null,
+    ) orelse return null;
+    defer std.c.free(reply);
+    if (reply.*.format != 8 or reply.*.value_len == 0) return null;
+
+    const data: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(reply));
+    const len: usize = @intCast(reply.*.value_len);
+
+    const sep = std.mem.indexOfScalar(u8, data[0..len], 0) orelse return null;
+    if (sep + 1 >= len) return null; // no class string follows the null separator
+
+    const instance = allocator.dupe(u8, data[0..sep]) catch return null;
+    const class_str = std.mem.sliceTo(data[sep + 1 .. len], 0);
+    const class     = allocator.dupe(u8, class_str) catch {
+        allocator.free(instance);
+        return null;
+    };
+    return .{ .instance = instance, .class = class };
+}
 
 // Private helpers
 
@@ -10431,6 +10474,14 @@ fn intermediateChild(exec_pipe_write: c_int, pid_pipe_write: c_int, cmd_z: [*:0]
 }
 
 fn executeShellCommand(cmd: []const u8) !void {
+    // Snapshot the target workspace before any blocking syscalls.  In a
+    // single-threaded WM the value cannot change while we are blocked in
+    // waitpid/read, but capturing it here makes the intent explicit and
+    // correctly handles sequence actions of the form [exec, switch_workspace]
+    // where a later action in the same sequence mutates g_current before
+    // registerSpawn is called.
+    const spawn_ws = tracking.getCurrentWorkspace();
+
     const cmd_z = try core.alloc.dupeZ(u8, cmd);
     defer core.alloc.free(cmd_z);
 
@@ -10488,7 +10539,7 @@ fn executeShellCommand(cmd: []const u8) !void {
     _ = c.close(exec_fds[0]);
     if (n > 0) return; // exec failed; skip spawn registration
 
-    if (tracking.getCurrentWorkspace()) |ws| {
+    if (spawn_ws) |ws| {
         const pid_u32: u32 = if (grandchild_pid > 0) @intCast(grandchild_pid) else 0;
         window.registerSpawn(ws, pid_u32);
     }
@@ -10604,6 +10655,7 @@ const XcbCursor = struct {
 
 const std  = @import("std");
 
+const defs = @import("defs");
 
 pub const xkb = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
@@ -12655,6 +12707,48 @@ pub fn swapWithMasterFocusSwap() void {
     if (other) |win| focus.setFocus(win, .tiling_operation);
 }
 
+/// Swap the on-screen positions of the currently focused window and the most
+/// recently previously focused window.
+///
+/// In tiling mode both windows exchange their slots in the tracking list so the
+/// layout engine places each one exactly where the other was. In floating mode
+/// (or when either window is individually floated) the actual X11 geometries are
+/// exchanged directly and the cache is kept coherent for workspace-switch restore.
+pub fn swapFocusedWithPrevious() void {
+    const s       = getState();
+    const focused = focus.getFocused() orelse return;
+    const history = focus.historyItems();
+    if (history.len == 0) return;
+    const prev = history[0];
+    if (prev == focused) return;
+
+    if (!tracking.isOnCurrentWorkspace(focused)) return;
+    if (!tracking.isOnCurrentWorkspace(prev))    return;
+
+    const is_focused_tiled = s.is_enabled and s.windows.contains(focused);
+    const is_prev_tiled    = s.is_enabled and s.windows.contains(prev);
+
+    if (!is_focused_tiled or !is_prev_tiled) {
+        // One or both windows are floating: exchange their on-screen geometries
+        // directly without touching the tiling list.
+        swapWindowGeometriesDirectly(s, focused, prev);
+        _ = xcb.xcb_flush(core.conn);
+        return;
+    }
+
+    // Both are under tiler control: swap their positions in the tracking list
+    // in a single pass so the next retile assigns each window to the other's cell.
+    const all = s.windows.items();
+    var idx_focused: ?usize = null;
+    var idx_prev:    ?usize = null;
+    for (all, 0..) |w, i| {
+        if (w == focused) idx_focused = i;
+        if (w == prev)    idx_prev    = i;
+        if (idx_focused != null and idx_prev != null) break;
+    }
+    swapWindowsInList(s, idx_focused orelse return, idx_prev orelse return);
+    retileCurrentWorkspace();
+}
 
 // Query functions 
 
@@ -12980,6 +13074,17 @@ fn moveWindowToFilteredSlot(s: *State, win: u32, target: usize) void {
     if (effective_to != from_global) moveWindowToIndex(s, from_global, effective_to);
 }
 
+/// Swap the two elements at `idx_a` and `idx_b` inside the tracking list.
+fn swapWindowsInList(s: *State, idx_a: usize, idx_b: usize) void {
+    if (idx_a == idx_b) return;
+    const current = s.windows.items();
+    if (!hasScratchCapacity(s, current.len, "swapWindowsInList")) return;
+    @memcpy(s.scratch_wins[0..current.len], current);
+    const tmp              = s.scratch_wins[idx_a];
+    s.scratch_wins[idx_a]  = s.scratch_wins[idx_b];
+    s.scratch_wins[idx_b]  = tmp;
+    s.windows.reorder(s.scratch_wins[0..current.len]);
+}
 
 /// Locates the focused window and the current workspace's master window in the
 /// ordered window list. Returns null when preconditions are not met (nothing
@@ -13035,6 +13140,24 @@ fn updateCacheRect(s: *State, win: u32, rect: utils.Rect) void {
     s.cache.getOrPut(win).value_ptr.rect = rect;
 }
 
+/// Exchange the on-screen positions of `win_a` and `win_b`.
+fn swapWindowGeometriesDirectly(s: *State, win_a: u32, win_b: u32) void {
+    const rect_a: utils.Rect = blk: {
+        if (s.cache.get(win_a)) |wd| if (wd.hasValidRect()) break :blk wd.rect;
+        break :blk queryWindowRect(win_a) orelse return;
+    };
+    const rect_b: utils.Rect = blk: {
+        if (s.cache.get(win_b)) |wd| if (wd.hasValidRect()) break :blk wd.rect;
+        break :blk queryWindowRect(win_b) orelse return;
+    };
+
+    if (layouts.rectsEqual(rect_a, rect_b)) return;
+
+    utils.configureWindow(core.conn, win_a, rect_b);
+    utils.configureWindow(core.conn, win_b, rect_a);
+    updateCacheRect(s, win_a, rect_b);
+    updateCacheRect(s, win_b, rect_a);
+}
 
 // Misc private helpers 
 
@@ -15378,7 +15501,6 @@ fn commitFocusTransition(old: ?u32, win: u32, flags: CommitFlags) void {
     if (build.has_tiling) tiling.updateWindowFocus(old, win);
     carousel.notifyFocusChanged(win);
     if (flags.schedule_bar) bar.scheduleFocusRedraw(win);
-    bar.monitorFocusedWindow(); // subscribe to property-change events for live title updates
 
     advertiseActiveWindow(win);
 }
@@ -16405,11 +16527,27 @@ fn findSpawnQueueWorkspace(
         return ws;
     }
 
-    // Oldest-entry fallback — queue is non-empty per precondition: firePropertyCookies
-    // only sets net_wm_pid when the spawn queue is non-empty.
-    if (g_spawn_queue.items.len == 0) return null;
+    // Oldest-entry fallback — only safe when there is exactly one pending entry.
+    // Common case: the app was launched via `sh -c "cmd"` and the window reports
+    // a PID that is a grandchild of the tracked sh process (sh exec-optimised into
+    // cmd, or cmd forked a subprocess for its UI).  With a single entry there is
+    // no ambiguity: it must belong to this window.
+    //
+    // With multiple entries we cannot know which entry belongs to this window.
+    // Consuming items[0] would mis-route the window to whatever workspace the
+    // *oldest* pending spawn was registered on — which may be a completely
+    // different workspace than where the user currently is (the classic symptom:
+    // "window spawns on the workspace I was previously on").  Return null so
+    // handleMapRequest falls back to current_ws instead.
+    if (g_spawn_queue.items.len != 1) {
+        std.log.debug(
+            "spawn: no exact PID match for pid={d}, {d} entries pending — ambiguous, routing to current workspace",
+            .{ win_pid, g_spawn_queue.items.len },
+        );
+        return null;
+    }
     std.log.debug(
-        "spawn: no exact PID match for pid={d}, using oldest entry ws={d}",
+        "spawn: no exact PID match for pid={d}, sole entry ws={d} — using heuristic",
         .{ win_pid, g_spawn_queue.items[0].workspace },
     );
     const ws = g_spawn_queue.items[0].workspace;
