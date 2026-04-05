@@ -3379,8 +3379,6 @@ const carousel = @import("carousel");
 /// Fixed left indent applied inside every title cell, independent of
 /// `scaledSegmentPadding`.  Provides visual breathing room between the
 /// segment edge and the title text.
-///
-/// TODO: Replace with a config-driven value so users can tune the inset.
 const title_lead_px: u16 = 4;
 
 /// Maximum number of windows rendered in split-view.
@@ -4008,7 +4006,7 @@ fn formatTime(buf: []u8, sec: i64) ![]const u8 {
 //! Call `invalidate()` whenever the font, config, or DPI changes (i.e. on bar
 //! reload) so the next draw remeasures everything with the fresh DrawContext.
 //!
-//! draw() now receives pre-computed workspace state from a BarSnapshot rather
+//! draw() receives pre-computed workspace state from a BarSnapshot rather
 //! than reading the workspaces singleton directly, avoiding a data race with
 //! the main thread.
 
@@ -7363,9 +7361,8 @@ extern fn pclose(stream: *FILE) c_int;
 extern fn fread(ptr: [*]u8, size: usize, nmemb: usize, stream: *FILE) usize;
 extern fn feof(stream: *FILE) c_int;
 
-// Iter 1: removed unused `allocator` parameter — detectTerminal is a pure PATH
-// scan that does not allocate and returns a static string slice.
 /// Returns the first available terminal from TERMINALS, or "xterm".
+/// Pure PATH scan — does not allocate; returns a static string slice.
 pub fn detectTerminal() []const u8 {
     for (TERMINALS) |cmd| {
         if (isCommandAvailable(cmd)) {
@@ -9472,15 +9469,13 @@ fn deinitModules() void {
     window.deinit();
 }
 
-/// Initializes global WM state: X atom cache and focus property cache.
+/// Initializes global WM state: X atom cache.
 fn initGlobalState(conn: *xcb.xcb_connection_t) !void {
     try utils.initAtomCache(conn);  // Intern frequently used X atoms
-    utils.initInputModelCache();     // Build per-window focus property cache (no allocator — static array)
 }
 
 /// Tears down global WM state initialized by initGlobalState.
 fn deinitGlobalState() void {
-    utils.deinitInputModelCache();
 }
 </file>
 
@@ -9490,7 +9485,7 @@ fn deinitGlobalState() void {
 
 const std = @import("std");
 
-const core      = @import("core"); //TODO: pending to deprecate
+const core      = @import("core");
     const xcb   = core.xcb;
 const constants = @import("constants");
 
@@ -9535,11 +9530,6 @@ pub inline fn consumeReload() bool {
 
 // Geometry operations
 
-/// Sets the border width and border colour of `win` in a single logical operation.
-pub inline fn configureBorder(conn: *xcb.xcb_connection_t, win: u32, width: u16, color: u32) void {
-    _ = xcb.xcb_configure_window(conn, win, xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH, &[_]u32{width});
-    _ = xcb.xcb_change_window_attributes(conn, win, xcb.XCB_CW_BORDER_PIXEL, &[_]u32{color});
-}
 
 /// Position and dimensions of a managed window, relative to the root window (the total display area).
 pub const Rect = struct {
@@ -9567,7 +9557,7 @@ pub const Margins = struct {
 };
 
 /// Moves and resizes `win` without touching border_width.
-/// Use `configureWindowGeom` when border_width must change atomically.
+/// Use `window.configureWindowGeom` when border_width must change atomically.
 pub inline fn configureWindow(conn: *xcb.xcb_connection_t, win: u32, rect: Rect) void {
     _ = xcb.xcb_configure_window(
         conn, win,
@@ -9582,48 +9572,10 @@ pub inline fn configureWindow(conn: *xcb.xcb_connection_t, win: u32, rect: Rect)
     );
 }
 
-/// Moves, resizes, and sets border_width atomically,
-/// preventing a one-frame flash on fullscreen enter/exit or workspace switch.
-pub inline fn configureWindowGeom(conn: *xcb.xcb_connection_t, win: u32, geom: core.WindowGeometry) void {
-    _ = xcb.xcb_configure_window(
-        conn, win,
-        xcb.XCB_CONFIG_WINDOW_X     | xcb.XCB_CONFIG_WINDOW_Y     |
-        xcb.XCB_CONFIG_WINDOW_WIDTH | xcb.XCB_CONFIG_WINDOW_HEIGHT |
-        xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH,
-        &[_]u32{
-            @bitCast(@as(i32, geom.x)),
-            @bitCast(@as(i32, geom.y)),
-            geom.width,
-            geom.height,
-            geom.border_width,
-        },
-    );
-}
-
-/// Queries the current geometry of `win`.
-/// Returns null if the window does not exist or is not yet mapped.
-pub fn getGeometry(conn: *xcb.xcb_connection_t, win: u32) ?Rect {
-    const reply = xcb.xcb_get_geometry_reply(conn, xcb.xcb_get_geometry(conn, win), null) orelse return null;
-    defer std.c.free(reply);
-    return Rect.fromXcb(reply);
-}
-
 /// Strips lock-key and pointer-button bits from a raw event modifier state,
 /// leaving only the modifier bits the WM uses for keybinding matching.
 pub inline fn normalizeModifiers(state: u16) u16 {
     return state & constants.MOD_MASK_BINDING;
-}
-
-/// Screen-space position of a window's top-left corner.
-pub const Pos = struct { x: u32, y: u32 };
-
-/// Returns the default floating window position
-/// (one quarter of the screen in from the top-left).
-pub inline fn floatDefaultPos() Pos {
-    return .{
-        .x = @intCast(core.screen.width_in_pixels  / 4),
-        .y = @intCast(core.screen.height_in_pixels / 4),
-    };
 }
 
 // Atom cache
@@ -9724,386 +9676,6 @@ pub fn fetchPropertyToBuffer(
     const value_ptr: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(reply));
     try buffer.appendSlice(allocator, value_ptr[0..@intCast(reply.*.value_len)]);
     return buffer.items;
-}
-
-// Window focus property cache
-//
-// Keyed by window ID; populated at map time via `populateFocusCacheFromCookies`.
-// Invalidated on WM_PROTOCOLS/WM_HINTS `PropertyNotify` and on window destruction.
-// Keeps the `setFocus` hot path and close-window path free of blocking X11 round-trips
-// for all windows that were seen at map time.
-//
-// `InputModel` (focus routing) and `wm_delete` (close protocol) are both derived from
-// WM_PROTOCOLS, so they are populated together in a single scan.
-// See the flat-array implementation below for rationale over AutoHashMap.
-
-/// The four ICCCM focus delivery modes (§4.1.7), determined by the combination of
-/// WM_HINTS.input and WM_TAKE_FOCUS presence in WM_PROTOCOLS.
-pub const InputModel = enum {
-    no_input,        // input=False, no WM_TAKE_FOCUS: window doesn't want focus
-    passive,         // input=True,  no WM_TAKE_FOCUS: set focus via `XSetInputFocus`
-    locally_active,  // input=True,  WM_TAKE_FOCUS:    set focus + send protocol
-    globally_active, // input=False, WM_TAKE_FOCUS:    only send protocol
-};
-
-/// Per-window focus properties derived from WM_PROTOCOLS and WM_HINTS,
-/// stored together since both are populated in a single WM_PROTOCOLS scan.
-const CachedProps = struct {
-    model:     InputModel,
-    wm_delete: bool,
-};
-
-// Flat-array window focus property cache
-//
-// Replaces AutoHashMap(u32, CachedProps). At realistic open-window counts (≤100 in
-// any real session, ≤300 in the most extreme case) a linear scan over 32-bit IDs beats
-// a hash table: cache-local, branch-predictor-friendly, zero heap allocation, one
-// initialization path, one teardown path, and no OOM error surface at all.
-//
-// Windows beyond MAX_WINDOW_CACHE still work correctly — they fall through to the live
-// X11 query path, which is always the safe fallback.
-const MAX_WINDOW_CACHE: usize = 512;
-
-const CacheSlot = struct {
-    id:    u32,
-    props: CachedProps,
-};
-
-var cache_slots: [MAX_WINDOW_CACHE]CacheSlot = undefined;
-var cache_len:   usize = 0;
-var cache_ready: bool  = false;
-
-/// Initializes the per-window focus property cache.
-/// No allocator required — the backing store is a module-level static array.
-pub fn initInputModelCache() void {
-    cache_len   = 0;
-    cache_ready = true;
-}
-
-/// Cleans up the per-window focus property cache.
-pub fn deinitInputModelCache() void {
-    cache_len   = 0;
-    cache_ready = false;
-}
-
-/// Consumes pre-fired WM_PROTOCOLS and WM_HINTS cookies and stores the result.
-///
-/// The caller fires the cookies immediately after xcb_map_window
-/// so the server processes property requests in parallel with the map.
-pub fn populateFocusCacheFromCookies(
-    conn: *xcb.xcb_connection_t,
-    win:  u32,
-
-    protocols_cookie: xcb.xcb_get_property_cookie_t,
-    hints_cookie:     xcb.xcb_get_property_cookie_t,
-) void {
-    // Resolve both atoms upfront so a failure on either can discard both cookies
-    // together along a single cleanup path.
-    const atoms = resolveFocusAtoms() orelse {
-        xcb.xcb_discard_reply(conn, protocols_cookie.sequence);
-        xcb.xcb_discard_reply(conn, hints_cookie.sequence);
-        return;
-    };
-
-    // Scan WM_PROTOCOLS once for both atoms (no second round-trip).
-    // Reads the raw atom list from the cookie reply and delegates to the shared helper.
-    var take_focus = false;
-    var wm_delete  = false;
-
-    protocols: {
-        const r = xcb.xcb_get_property_reply(conn, protocols_cookie, null) orelse break :protocols;
-        defer std.c.free(r);
-        if (r.*.format != 32 or r.*.value_len == 0) break :protocols;
-        const raw: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(r)));
-        const result = scanProtocolAtoms(raw[0..@intCast(r.*.value_len)], atoms.take_focus, atoms.wm_delete);
-        take_focus = result.take_focus;
-        wm_delete  = result.wm_delete;
-    }
-
-    const accepts_input = extractWMHintsInput(conn, hints_cookie);
-
-    putCachedProps(win, .{
-        .model     = inputModelFrom(take_focus, accepts_input),
-        .wm_delete = wm_delete,
-    });
-}
-
-/// Resolves WM_TAKE_FOCUS and WM_DELETE_WINDOW atoms from cache.
-/// Returns null if either atom is not cached (should not happen after initAtomCache).
-inline fn resolveFocusAtoms() ?struct { take_focus: u32, wm_delete: u32 } {
-    const take_focus = getAtomCached("WM_TAKE_FOCUS")    catch return null;
-    const wm_delete  = getAtomCached("WM_DELETE_WINDOW") catch return null;
-    return .{ .take_focus = take_focus, .wm_delete = wm_delete };
-}
-
-/// Extracts the WM_HINTS input field from a pre-fired cookie reply.
-/// Returns true when absent (assume True per ICCCM) or explicitly True.
-fn extractWMHintsInput(
-    conn: *xcb.xcb_connection_t,
-    hints_cookie: xcb.xcb_get_property_cookie_t,
-) bool {
-    const r = xcb.xcb_get_property_reply(conn, hints_cookie, null) orelse return true;
-    defer std.c.free(r);
-    if (r.*.format != 32 or r.*.value_len < 1) return true;
-    const hints: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(r)));
-    const input_flag_set  = (hints[WM_HINTS_FLAGS_FIELD] & WM_HINTS_INPUT_FLAG) != 0;
-    const has_input_field = r.*.value_len > WM_HINTS_INPUT_FIELD;
-    if (!input_flag_set or !has_input_field) return true;
-    return hints[WM_HINTS_INPUT_FIELD] != 0;
-}
-
-/// Recomputes and caches the focus properties after a WM_PROTOCOLS or WM_HINTS PropertyNotify — two round-trips, called only on rare property change events.
-pub fn recacheInputModel(conn: *xcb.xcb_connection_t, win: u32) void {
-    _ = queryAndCacheProps(conn, win);
-}
-
-/// Removes `win` from the focus property cache — called on window destruction
-/// to prevent stale entries from accumulating over the session.
-/// Swap-remove keeps the live region dense so subsequent scans stay short.
-pub inline fn uncacheWindowFocusProps(win: u32) void {
-    if (!cache_ready) return;
-    for (cache_slots[0..cache_len], 0..) |slot, i| {
-        if (slot.id == win) {
-            cache_len -= 1;
-            cache_slots[i] = cache_slots[cache_len]; // fill gap with last entry
-            return;
-        }
-    }
-}
-
-/// Returns the cached focus properties for `win`, or null on a cache miss.
-inline fn getCachedProps(win: u32) ?CachedProps {
-    if (!cache_ready) return null;
-    for (cache_slots[0..cache_len]) |slot| {
-        if (slot.id == win) return slot.props;
-    }
-    return null;
-}
-
-/// Inserts or updates the cache entry for `win`.
-/// Updates in place when the entry already exists (single write path, no branching).
-/// Silently drops the entry when the cache is full — the live-query fallback is always correct.
-fn putCachedProps(win: u32, props: CachedProps) void {
-    if (!cache_ready) return;
-    for (cache_slots[0..cache_len]) |*slot| {
-        if (slot.id == win) { slot.props = props; return; }
-    }
-    if (cache_len < MAX_WINDOW_CACHE) {
-        cache_slots[cache_len] = .{ .id = win, .props = props };
-        cache_len += 1;
-    } else {
-        // Cache full: fall through silently — next access issues a live X11 query.
-        debug.warn("Focus cache full, falling back to live queries", .{});
-    }
-}
-
-/// Runs both WM_PROTOCOLS and WM_HINTS queries, stores the result, and returns it.
-/// Used by cache-miss paths so the populate logic lives in exactly one place.
-fn queryAndCacheProps(conn: *xcb.xcb_connection_t, win: u32) CachedProps {
-    const protocols_props = queryWMProtocolsProps(conn, win);
-    const props = CachedProps{
-        .model     = inputModelFrom(protocols_props.take_focus, queryWMHintsAcceptsInput(conn, win)),
-        .wm_delete = protocols_props.wm_delete,
-    };
-    putCachedProps(win, props);
-    return props;
-}
-
-/// Returns the cached InputModel, falling back to a live query on miss.
-/// On the hover-focus hot path this should always be a cache hit.
-pub fn getInputModelCached(conn: *xcb.xcb_connection_t, win: u32) InputModel {
-    if (getCachedProps(win)) |props| return props.model;
-    return queryAndCacheProps(conn, win).model;
-}
-
-/// Returns true if `win` declared WM_DELETE_WINDOW support at map time.
-/// Falls back to a live query only on a genuine cache miss (extremely rare).
-pub fn supportsWMDeleteCached(conn: *xcb.xcb_connection_t, win: u32) bool {
-    if (getCachedProps(win)) |props| return props.wm_delete;
-    return queryAndCacheProps(conn, win).wm_delete;
-}
-
-/// Sends a WM_TAKE_FOCUS client message (ICCCM §4.1.7) if and only if the
-/// window actually advertises WM_TAKE_FOCUS support in its WM_PROTOCOLS.
-///
-/// The check is performed live against the X server on every call — matching
-/// DWM's sendevent(c, wmatom[WMTakeFocus]) exactly:
-///
-///   int sendevent(Client *c, Atom proto) {
-///       if (XGetWMProtocols(dpy, c->win, &protocols, &n)) {
-///           while (!exists && n--)
-///               exists = protocols[n] == proto;
-///           XFree(protocols);
-///       }
-///       if (exists) { ... XSendEvent ... }
-///   }
-///
-/// Why live instead of cached:
-///   Electron (Discord, VS Code, Equibop, etc.) and many GTK/Qt apps set
-///   WM_PROTOCOLS BEFORE or around the time they call XMapWindow.  The WM
-///   reads WM_PROTOCOLS at MapRequest time and caches the result.  If Electron
-///   sets WM_PROTOCOLS before the WM subscribes to PropertyNotify (i.e. before
-///   the MapRequest fires and handleMapRequest sets the event mask), the
-///   PropertyNotify is lost and the cache remains stale forever, recording the
-///   window as `passive` even though it actually advertises WM_TAKE_FOCUS.
-///
-///   Without WM_TAKE_FOCUS the app's Electron/Chromium renderer widget never
-///   activates its internal focus state (text caret, keyboard routing), even
-///   though XSetInputFocus technically succeeds on the top-level window.  DWM
-///   works around this by never trusting a cache — it re-reads WM_PROTOCOLS
-///   on every call.  We do the same here.
-///
-///   The XCB round-trip cost is one xcb_get_property per focus change event,
-///   which is imperceptible at human interaction speed and is pipelined on the
-///   same Unix-domain socket as xcb_set_input_focus.
-pub fn sendWMTakeFocus(conn: *xcb.xcb_connection_t, win: u32, time: u32) void {
-    const protocols_atom  = getAtomCached("WM_PROTOCOLS")  catch return;
-    const take_focus_atom = getAtomCached("WM_TAKE_FOCUS") catch return;
-
-    // Live WM_PROTOCOLS scan — same logic as DWM's sendevent.
-    const proto_reply = xcb.xcb_get_property_reply(conn,
-        xcb.xcb_get_property(conn, 0, win, protocols_atom, xcb.XCB_ATOM_ATOM, 0, MAX_PROPERTY_LENGTH),
-        null,
-    ) orelse return;
-    defer std.c.free(proto_reply);
-    if (proto_reply.*.format != 32 or proto_reply.*.value_len == 0) return;
-    const proto_list: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(proto_reply)));
-    var has_take_focus = false;
-    for (proto_list[0..@intCast(proto_reply.*.value_len)]) |a| {
-        if (a == take_focus_atom) { has_take_focus = true; break; }
-    }
-    if (!has_take_focus) return;
-
-    var event = std.mem.zeroes(xcb.xcb_client_message_event_t);
-    event.response_type  = xcb.XCB_CLIENT_MESSAGE;
-    event.window         = win;
-    event.type           = protocols_atom;
-    event.format         = 32;
-    event.data.data32[0] = take_focus_atom;
-    event.data.data32[1] = time;
-
-    _ = xcb.xcb_send_event(conn, 0, win, xcb.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&event));
-}
-
-// WM_CLASS
-
-/// The two components of the X11 WM_CLASS property (ICCCM §4.1.2.5).
-/// Both slices are heap-allocated and must be freed via deinit.
-pub const WMClass = struct {
-    instance: []const u8,
-    class:    []const u8,
-
-    pub fn deinit(self: WMClass, allocator: std.mem.Allocator) void {
-        allocator.free(self.instance);
-        allocator.free(self.class);
-    }
-};
-
-/// Reads and parses the WM_CLASS property for `win`. The raw value is two
-/// null-terminated strings concatenated: instance name then class name.
-/// Returns null if the property is absent, malformed, or allocation fails.
-pub fn getWMClass(conn: *xcb.xcb_connection_t, win: u32, allocator: std.mem.Allocator) ?WMClass {
-    const class_atom = getAtomCached("WM_CLASS") catch return null;
-    const reply = xcb.xcb_get_property_reply(conn,
-        xcb.xcb_get_property(conn, PROPERTY_NO_DELETE, win, class_atom, xcb.XCB_ATOM_STRING, 0, MAX_PROPERTY_LENGTH), null,
-    ) orelse return null;
-    defer std.c.free(reply);
-    if (reply.*.format != 8 or reply.*.value_len == 0) return null;
-
-    const data: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(reply));
-    const len: usize = @intCast(reply.*.value_len);
-
-    const sep = std.mem.indexOfScalar(u8, data[0..len], 0) orelse return null;
-    if (sep + 1 >= len) return null; // no class string follows the null separator
-
-    const instance = allocator.dupe(u8, data[0..sep]) catch return null;
-    const class_str = std.mem.sliceTo(data[sep + 1 .. len], 0);
-    const class     = allocator.dupe(u8, class_str) catch {
-        allocator.free(instance);
-        return null;
-    };
-    return .{ .instance = instance, .class = class };
-}
-
-// Private helpers
-
-/// Maps the two ICCCM boolean focus properties to the four InputModel variants.
-/// See ICCCM §4.1.7: the matrix of (accepts_input × supports_take_focus)
-/// determines which focus delivery mechanism the WM must use.
-inline fn inputModelFrom(supports_take_focus: bool, accepts_input: bool) InputModel {
-    return if (supports_take_focus)
-        (if (accepts_input) .locally_active else .globally_active)
-    else
-        (if (accepts_input) .passive else .no_input);
-}
-
-/// Flags extracted from a single WM_PROTOCOLS scan.
-const WMProtocolsProps = struct { take_focus: bool = false, wm_delete: bool = false };
-
-/// Scans a slice of protocol atoms and returns all WM_PROTOCOLS flags in one pass.
-/// Shared by queryWMProtocolsProps (live query) and populateFocusCacheFromCookies (cookie path).
-inline fn scanProtocolAtoms(atoms: []const u32, take_focus_atom: u32, wm_delete_atom: u32) WMProtocolsProps {
-    var props: WMProtocolsProps = .{};
-    for (atoms) |atom| {
-        if (atom == take_focus_atom) props.take_focus = true;
-        if (atom == wm_delete_atom)  props.wm_delete  = true;
-        if (props.take_focus and props.wm_delete) break;
-    }
-    return props;
-}
-
-/// Scans WM_PROTOCOLS once and returns all flags the WM cares about.
-fn queryWMProtocolsProps(conn: *xcb.xcb_connection_t, win: u32) WMProtocolsProps {
-    const protocols_atom  = getAtomCached("WM_PROTOCOLS")    catch return .{};
-    const take_focus_atom = getAtomCached("WM_TAKE_FOCUS")   catch return .{};
-    const wm_delete_atom  = getAtomCached("WM_DELETE_WINDOW") catch return .{};
-
-    const reply = xcb.xcb_get_property_reply(conn,
-        xcb.xcb_get_property(conn, PROPERTY_NO_DELETE, win, protocols_atom, xcb.XCB_ATOM_ATOM, 0, MAX_PROPERTY_LENGTH), null,
-    ) orelse return .{};
-    defer std.c.free(reply);
-    if (reply.*.format != 32 or reply.*.value_len == 0) return .{};
-
-    const raw: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
-    return scanProtocolAtoms(raw[0..@intCast(reply.*.value_len)], take_focus_atom, wm_delete_atom);
-}
-
-/// Queries the WM_HINTS input field. Returns true when absent (assume True) or explicitly True.
-fn queryWMHintsAcceptsInput(conn: *xcb.xcb_connection_t, win: u32) bool {
-    const reply = xcb.xcb_get_property_reply(conn,
-        xcb.xcb_get_property(conn, PROPERTY_NO_DELETE, win, xcb.XCB_ATOM_WM_HINTS, xcb.XCB_ATOM_WM_HINTS, 0, WM_HINTS_LONG_LENGTH),
-        null,
-    ) orelse return true;
-    defer std.c.free(reply);
-
-    if (reply.*.format != 32 or reply.*.value_len < 1) return true;
-
-    const hints: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
-    const input_flag_set  = (hints[WM_HINTS_FLAGS_FIELD] & WM_HINTS_INPUT_FLAG) != 0;
-    const has_input_field = reply.*.value_len > WM_HINTS_INPUT_FIELD;
-    if (!input_flag_set or !has_input_field) return true;
-    return hints[WM_HINTS_INPUT_FIELD] != 0;
-}
-
-// Child window resolution
-
-/// Walks up the X11 window tree from `win` to find the top-level window the WM
-/// manages. Electron apps and other toolkits often use child windows for
-/// rendering, so button events may arrive on a child rather than the managed parent.
-pub fn findManagedWindow(conn: *xcb.xcb_connection_t, win: u32, is_managed: *const fn (u32) bool) u32 {
-    var current = win;
-    for (0..MAX_WINDOW_TREE_DEPTH) |_| {
-        if (is_managed(current)) return current;
-
-        const tree_reply = xcb.xcb_query_tree_reply(
-            conn, xcb.xcb_query_tree(conn, current), null,
-        ) orelse return win;
-        defer std.c.free(tree_reply);
-
-        if (tree_reply.*.parent == tree_reply.*.root or tree_reply.*.parent == 0) return win;
-        current = tree_reply.*.parent;
-    }
-    return win;
 }
 </file>
 
@@ -10275,7 +9847,7 @@ pub fn handleButtonPress(event: *const xcb.xcb_button_press_event_t) void {
 
     // Ignore clicks on root / unknown windows
     const clicked_window = if (event.child != 0) event.child else event.event;
-    const managed_window = utils.findManagedWindow(core.conn, clicked_window, tracking.isManaged);
+    const managed_window = window.findManagedWindow(core.conn, clicked_window, tracking.isManaged);
 
     if (clicked_window == 0 or clicked_window == core.root or managed_window == 0) {
         replayPointer(event.time);
@@ -10304,7 +9876,18 @@ pub fn handleButtonPress(event: *const xcb.xcb_button_press_event_t) void {
         return;
     }
 
-    // Fallback: Any other click focuses the window
+    // Fallback: Any other click focuses and raises the window.
+    //
+    // The raise must be issued unconditionally here, before setFocus, because
+    // setFocus short-circuits when managed_window is already focused_window
+    // (the common case after hover-focus) and never reaches the raise inside
+    // commitFocusTransition.  Without this explicit raise, a window that holds
+    // focus but has been visually covered — by a newly-spawned window, a
+    // floating peer, or any stacking change that bypasses the focus path —
+    // stays buried despite the click.  The double-raise when setFocus also
+    // raises is a no-op from the server's perspective.
+    _ = xcb.xcb_configure_window(core.conn, managed_window,
+        xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
     focus.setFocus(managed_window, .mouse_click);
     releaseGrab(event.time);
 }
@@ -10336,7 +9919,7 @@ pub fn handleMotionNotify(event: *const xcb.xcb_motion_notify_event_t) void {
 /// Closes a window gracefully via WM_DELETE_WINDOW (ICCCM §4.1.2.7), falling
 /// back to xcb_destroy_window for clients that don't advertise the protocol.
 fn closeWindow(win: u32) void {
-    if (!utils.supportsWMDeleteCached(core.conn, win)) {
+    if (!window.supportsWMDeleteCached(core.conn, win)) {
         _ = xcb.xcb_destroy_window(core.conn, win);
         return;
     }
@@ -10955,7 +10538,7 @@ pub fn startDrag(win: u32, button: u8, x: i16, y: i16) void {
         if (comptime build.has_tiling) {
             if (tiling.getWindowGeom(win)) |g| break :blk g;
         }
-        break :blk utils.getGeometry(core.conn, win) orelse return;
+        break :blk window.getGeometry(core.conn, win) orelse return;
     };
     // pending_float is set for any drag (move *or* resize) on a tiled window
     // in a non-floating layout.  On the first motion event it triggers tiling
@@ -12019,19 +11602,6 @@ inline fn isEmptySizeHints(h: SizeHints) bool {
 <file path="src/window/modules/tiling/tiling.zig">
 //! Tiling window manager: orchestrates layout, window tracking, and the
 //! geometry/border cache. Delegates pixel arithmetic to the per-layout modules.
-//!
-//! Suggested future split 
-//! This file is ~1 200 lines; the single-responsibility boundary is between
-//! *state + public API* and *retile dispatch + screen geometry*.  When the
-//! retile surface grows further, extract the following into `retile.zig`:
-//!
-//!   retileCurrentWorkspace, retileAllWorkspaces, retileInactiveWorkspace,
-//!   retileForRestore, retileIfDirty, retile (core), dispatchLayout,
-//!   calcScreenArea, collectWorkspaceWindows, resolveLayout, resolveMasterWidth,
-//!   buildLayoutCtx, applyBorderColor, updateBorders.
-//!
-//! `retile.zig` would `@import("tiling")` for State/getState, and tiling.zig's
-//! internal callers would `@import("retile")`. State is the shared boundary.
 
 const std   = @import("std");
 const build = @import("build_options");
@@ -12053,8 +11623,8 @@ const floating = @import("floating");
 
 const fullscreen  = if (build.has_fullscreen) @import("fullscreen") else struct {};
 const workspaces  = if (build.has_workspaces) @import("workspaces") else struct {};
-const WsState     = if (build.has_workspaces) workspaces.State     else struct {}; //TODO: is this necessary?
-const WsWorkspace = if (build.has_workspaces) workspaces.Workspace else struct {}; //TODO: is this necessary?
+const WsState     = if (build.has_workspaces) workspaces.State     else struct {};
+const WsWorkspace = if (build.has_workspaces) workspaces.Workspace else struct {};
 
 const bar = if (build.has_bar) @import("bar") else struct {
     pub fn redrawInsideGrab() void {}
@@ -13531,7 +13101,7 @@ fn getSavedFloatGeom(win: u32) ?utils.Rect {
 /// Priority: g_float_saves -> tiling geometry cache -> floatDefaultPos fallback.
 /// Clears g_float_saves when done.
 fn restoreFloatingWindows(skip_win: u32) void {
-    const pos = utils.floatDefaultPos();
+    const pos = window.floatDefaultPos();
 
     // Improvement #3: the has_workspaces dispatch now lives only in
     // forEachWindowOnCurrentWorkspace.  We capture pos by its component
@@ -13599,7 +13169,7 @@ fn enterFullscreenCommit(win: u32, ws: u8, geom: core.WindowGeometry) void {
     // that fires inside setBarState sees a fully-committed fullscreen state and
     // skips (or correctly handles) the fullscreen window, leaving everything else
     // offscreen where we placed it.
-    utils.configureWindowGeom(core.conn, win, .{
+    window.configureWindowGeom(core.conn, win, .{
         .x            = 0,
         .y            = 0,
         .width        = @intCast(core.screen.width_in_pixels),
@@ -13643,7 +13213,7 @@ fn exitFullscreenCommit(win: u32, ws: u8) void {
         _ = xcb.xcb_configure_window(core.conn, win,
             xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH, &[_]u32{saved.border_width});
     } else {
-        utils.configureWindowGeom(core.conn, win, saved);
+        window.configureWindowGeom(core.conn, win, saved);
     }
 
     window.applyBorder(win);
@@ -14146,7 +13716,7 @@ fn restoreWindowImpl(win: u32, saved_fs: ?core.WindowGeometry, tiling_index: ?us
         // a sensible fallback.
         debug.warn("minimize: no saved geometry for 0x{x}, placing at float default position",
             .{win});
-        const pos = utils.floatDefaultPos();
+        const pos = window.floatDefaultPos();
         _ = xcb.xcb_configure_window(core.conn, win,
             xcb.XCB_CONFIG_WINDOW_X | xcb.XCB_CONFIG_WINDOW_Y,
             &[_]u32{ pos.x, pos.y });
@@ -14278,7 +13848,7 @@ pub fn unminimizeAll() void {
             }
             tiling.retileCurrentWorkspace();
         } else {
-            const pos = utils.floatDefaultPos();
+            const pos = window.floatDefaultPos();
             for (plain_wins) |rec| {
                 if (window.getWindowGeom(rec.win)) |rect| {
                     utils.configureWindow(core.conn, rec.win, rect);
@@ -14802,10 +14372,12 @@ pub fn switchToAll() void {
                 if (window.getWindowGeom(win)) |rect| {
                     utils.configureWindow(core.conn, win, rect);
                 } else {
-                    const pos = utils.floatDefaultPos();
                     _ = xcb.xcb_configure_window(core.conn, win,
                         xcb.XCB_CONFIG_WINDOW_X | xcb.XCB_CONFIG_WINDOW_Y,
-                        &[_]u32{ pos.x, pos.y });
+                        &[_]u32{
+                            @intCast(core.screen.width_in_pixels  / 4),
+                            @intCast(core.screen.height_in_pixels / 4),
+                        });
                 }
             }
         }
@@ -15003,7 +14575,8 @@ fn restoreWorkspaceWindows(ws: *const Workspace, old_ws: u8) void {
     }
 
     // Map every window; restore floating geometry for those not already on screen.
-    const pos = utils.floatDefaultPos();
+    const default_x: u32 = @intCast(core.screen.width_in_pixels  / 4);
+    const default_y: u32 = @intCast(core.screen.height_in_pixels / 4);
     for (ws.windows.items()) |win| {
         _ = xcb.xcb_map_window(core.conn, win);
         if ((!build.has_tiling or !tiling.isWindowActiveTiled(win)) and !isMinimized(win) and
@@ -15014,7 +14587,7 @@ fn restoreWorkspaceWindows(ws: *const Workspace, old_ws: u8) void {
             } else {
                 _ = xcb.xcb_configure_window(core.conn, win,
                     xcb.XCB_CONFIG_WINDOW_X | xcb.XCB_CONFIG_WINDOW_Y,
-                    &[_]u32{ pos.x, pos.y });
+                    &[_]u32{ default_x, default_y });
             }
         }
     }
@@ -15078,12 +14651,37 @@ fn executeSwitch(old_ws: u8, new_ws: u8) void {
     if (fs_info != null) bar.setBarState(.hide_fullscreen) else bar.setBarState(.show_fullscreen);
 
     if (fs_info) |info| {
-        utils.configureWindowGeom(core.conn, info.window, .{
-            .x = 0, .y = 0,
-            .width        = @intCast(core.screen.width_in_pixels),
-            .height       = @intCast(core.screen.height_in_pixels),
-            .border_width = 0,
-        });
+        // Map and push offscreen every non-fullscreen window on this workspace.
+        //
+        // When a window is spawned onto an inactive workspace that already has
+        // an active fullscreen, executeSwitch takes this branch and skips
+        // restoreWorkspaceWindows — the only place that calls xcb_map_window
+        // on switch-in. The spawned window therefore stays unmapped. On
+        // fullscreen exit, tiling allocates a tile cell for it (it is in
+        // s.windows and on this workspace) but the cell is invisible, leaving
+        // an empty gap until the next workspace round-trip triggers a normal
+        // restoreWorkspaceWindows path.
+        //
+        // Fix: map every non-fullscreen workspace window here, then push it
+        // offscreen so it is hidden behind the fullscreen window. Invalidate
+        // the tiling cache entry for tiled windows so the next retile after
+        // fullscreen exit does not find a stale zero-rect and skip configure.
+        for (new_ws_obj.windows.items()) |win| {
+            if (win == info.window) continue;
+            _ = xcb.xcb_map_window(core.conn, win);
+            pushOffscreen(core.conn, win);
+            if (comptime build.has_tiling) {
+                if (tiling.isWindowActiveTiled(win)) tiling.invalidateGeomCache(win);
+            }
+        }
+        _ = xcb.xcb_configure_window(core.conn, info.window,
+            xcb.XCB_CONFIG_WINDOW_X     | xcb.XCB_CONFIG_WINDOW_Y     |
+            xcb.XCB_CONFIG_WINDOW_WIDTH | xcb.XCB_CONFIG_WINDOW_HEIGHT |
+            xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH,
+            &[_]u32{ 0, 0,
+                @intCast(core.screen.width_in_pixels),
+                @intCast(core.screen.height_in_pixels),
+                0 });
         _ = xcb.xcb_configure_window(core.conn, info.window,
             xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
     } else {
@@ -15491,7 +15089,7 @@ fn commitFocusTransition(old: ?u32, win: u32, flags: CommitFlags) void {
 
     if (flags.send_wm_take_focus)
         // CurrentTime (0) — same reason as xcb_set_input_focus above.
-        utils.sendWMTakeFocus(core.conn, win, 0); // CurrentTime
+        window.sendWMTakeFocus(core.conn, win, 0); // CurrentTime
 
     if (flags.arm_confirm) {
         state.confirm_cookie = xcb.xcb_get_input_focus(core.conn);
@@ -15553,7 +15151,7 @@ pub fn bruteForceMouseEnterFocus(win: u32) void {
         xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
     _ = xcb.xcb_set_input_focus(core.conn, xcb.XCB_INPUT_FOCUS_POINTER_ROOT,
         win, 0);
-    utils.sendWMTakeFocus(core.conn, win, 0);
+    window.sendWMTakeFocus(core.conn, win, 0);
 }
 
 pub fn setFocus(win: u32, reason: Reason) void {
@@ -15566,7 +15164,7 @@ pub fn setFocus(win: u32, reason: Reason) void {
     if ((reason == .mouse_click or reason == .user_command) and
         !isWindowMapped(core.conn, win)) return;
 
-    const input_model = utils.getInputModelCached(core.conn, win);
+    const input_model = window.getInputModelCached(core.conn, win);
     if (input_model == .no_input) return;
 
     cancelPendingConfirm();
@@ -15614,7 +15212,7 @@ pub fn drainPendingConfirm() void {
 
     if (!window.isValidManagedWindow(win)) return;
 
-    const input_model = utils.getInputModelCached(core.conn, win);
+    const input_model = window.getInputModelCached(core.conn, win);
     if (input_model == .no_input) return;
 
     const c = focus_reply orelse return;
@@ -15632,7 +15230,7 @@ pub fn drainPendingConfirm() void {
 
     _ = xcb.xcb_set_input_focus(core.conn, xcb.XCB_INPUT_FOCUS_POINTER_ROOT,
         win, 0); // CurrentTime
-    utils.sendWMTakeFocus(core.conn, win, 0); // CurrentTime
+    window.sendWMTakeFocus(core.conn, win, 0); // CurrentTime
 }
 
 /// Discard a pending confirm reply without acting on it.
@@ -15667,7 +15265,7 @@ fn cancelPendingConfirm() void {
 /// A stale cache would skip the message, leaving the app's internal widget
 /// inactive.
 pub fn invalidateInputModelCache(win: u32) void {
-    utils.recacheInputModel(core.conn, win);
+    window.recacheInputModel(core.conn, win);
 }
 
 /// Send the X protocol focus signals for `win` using CurrentTime (0).
@@ -15676,14 +15274,14 @@ pub fn invalidateInputModelCache(win: u32) void {
 /// WM_TAKE_FOCUS is always sent; sendWMTakeFocus is a no-op for windows that
 /// do not advertise it.  No raise, no confirm/retry machinery.
 fn sendFocusProtocol(win: u32) void {
-    const model = utils.getInputModelCached(core.conn, win);
+    const model = window.getInputModelCached(core.conn, win);
     if (model == .no_input) return;
     if (model == .passive or model == .locally_active) {
         _ = xcb.xcb_set_input_focus(core.conn,
             xcb.XCB_INPUT_FOCUS_POINTER_ROOT, win, 0); // CurrentTime
         advertiseActiveWindow(win);
     }
-    utils.sendWMTakeFocus(core.conn, win, 0); // CurrentTime
+    window.sendWMTakeFocus(core.conn, win, 0); // CurrentTime
 }
 
 /// Hover focus following DWM's focus(c) semantics.
@@ -15708,7 +15306,7 @@ pub fn dwmFocus(win: u32) void {
 
     cancelPendingConfirm();
 
-    const model = utils.getInputModelCached(core.conn, win);
+    const model = window.getInputModelCached(core.conn, win);
     if (model == .no_input) return;
     const old = state.focused_window;
     commitFocusTransition(old, win, .{
@@ -15832,7 +15430,7 @@ pub fn syncPointerFocusNow() void {
 
     cancelPendingConfirm();
 
-    const input_model = utils.getInputModelCached(core.conn, child);
+    const input_model = window.getInputModelCached(core.conn, child);
     if (input_model == .no_input) return;
 
     const old = state.focused_window;
@@ -16271,6 +15869,20 @@ const XSizeHintsFlags = struct {
     const p_base_size:  u32 = 0x100;
 };
 
+// WM_HINTS constants (ICCCM §4.1.2.4)
+const WM_HINTS_INPUT_FLAG:  u32   = 1 << 0;
+const WM_HINTS_FLAGS_FIELD: usize = 0;
+const WM_HINTS_INPUT_FIELD: usize = 1;
+const WM_HINTS_LONG_LENGTH: u32   = 9; // flags + 8 fields
+
+const MAX_PROPERTY_LENGTH: u32 = 256;
+const PROPERTY_NO_DELETE:  u8  = 0; // `delete` arg to xcb_get_property; 0 = do not consume
+
+/// Minimum window dimension; windows thinner or shorter than this are considered invalid.
+const MIN_WINDOW_DIM = constants.MIN_WINDOW_DIM;
+/// Maximum depth when walking the X11 window tree in findManagedWindow.
+const MAX_WINDOW_TREE_DEPTH = constants.MAX_WINDOW_TREE_DEPTH;
+
 // ---------------------------------------------------------------------------
 // Spawn queue
 // ---------------------------------------------------------------------------
@@ -16375,6 +15987,431 @@ pub fn evictWindowGeom(win: u32) void {
 }
 
 
+// ---------------------------------------------------------------------------
+// Geometry helpers
+// ---------------------------------------------------------------------------
+
+/// Screen-space position of a window's top-left corner.
+pub const Pos = struct { x: u32, y: u32 };
+
+/// Returns the default floating window position
+/// (one quarter of the screen in from the top-left).
+pub inline fn floatDefaultPos() Pos {
+    return .{
+        .x = @intCast(core.screen.width_in_pixels  / 4),
+        .y = @intCast(core.screen.height_in_pixels / 4),
+    };
+}
+
+/// Moves, resizes, and sets border_width atomically,
+/// preventing a one-frame flash on fullscreen enter/exit or workspace switch.
+pub inline fn configureWindowGeom(conn: *xcb.xcb_connection_t, win: u32, geom: core.WindowGeometry) void {
+    _ = xcb.xcb_configure_window(
+        conn, win,
+        xcb.XCB_CONFIG_WINDOW_X     | xcb.XCB_CONFIG_WINDOW_Y     |
+        xcb.XCB_CONFIG_WINDOW_WIDTH | xcb.XCB_CONFIG_WINDOW_HEIGHT |
+        xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH,
+        &[_]u32{
+            @bitCast(@as(i32, geom.x)),
+            @bitCast(@as(i32, geom.y)),
+            geom.width,
+            geom.height,
+            geom.border_width,
+        },
+    );
+}
+
+/// Queries the current geometry of `win`.
+/// Returns null if the window does not exist or is not yet mapped.
+pub fn getGeometry(conn: *xcb.xcb_connection_t, win: u32) ?utils.Rect {
+    const reply = xcb.xcb_get_geometry_reply(conn, xcb.xcb_get_geometry(conn, win), null) orelse return null;
+    defer std.c.free(reply);
+    return utils.Rect.fromXcb(reply);
+}
+
+// ---------------------------------------------------------------------------
+// ICCCM focus property cache
+//
+// Keyed by window ID; populated at map time via `populateFocusCacheFromCookies`.
+// Invalidated on WM_PROTOCOLS/WM_HINTS `PropertyNotify` and on window destruction.
+// Keeps the `setFocus` hot path and close-window path free of blocking X11 round-trips
+// for all windows that were seen at map time.
+//
+// `InputModel` (focus routing) and `wm_delete` (close protocol) are both derived from
+// WM_PROTOCOLS, so they are populated together in a single scan.
+// See the flat-array implementation below for rationale over AutoHashMap.
+// ---------------------------------------------------------------------------
+
+/// The four ICCCM focus delivery modes (§4.1.7), determined by the combination of
+/// WM_HINTS.input and WM_TAKE_FOCUS presence in WM_PROTOCOLS.
+pub const InputModel = enum {
+    no_input,        // input=False, no WM_TAKE_FOCUS: window doesn't want focus
+    passive,         // input=True,  no WM_TAKE_FOCUS: set focus via `XSetInputFocus`
+    locally_active,  // input=True,  WM_TAKE_FOCUS:    set focus + send protocol
+    globally_active, // input=False, WM_TAKE_FOCUS:    only send protocol
+};
+
+/// Per-window focus properties derived from WM_PROTOCOLS and WM_HINTS,
+/// stored together since both are populated in a single WM_PROTOCOLS scan.
+const CachedProps = struct {
+    model:     InputModel,
+    wm_delete: bool,
+};
+
+// Flat-array window focus property cache.
+//
+// At realistic open-window counts (≤100 in any real session, ≤300 in the most
+// extreme case) a linear scan over 32-bit IDs beats a hash table: cache-local,
+// branch-predictor-friendly, zero heap allocation, one initialization path, one
+// teardown path, and no OOM error surface at all.
+//
+// Windows beyond MAX_WINDOW_CACHE still work correctly — they fall through to
+// the live X11 query path, which is always the safe fallback.
+const MAX_WINDOW_CACHE: usize = 512;
+
+const CacheSlot = struct {
+    id:    u32,
+    props: CachedProps,
+};
+
+var cache_slots: [MAX_WINDOW_CACHE]CacheSlot = undefined;
+var cache_len:   usize = 0;
+var cache_ready: bool  = false;
+
+/// Initializes the per-window focus property cache.
+/// No allocator required — the backing store is a module-level static array.
+pub fn initInputModelCache() void {
+    cache_len   = 0;
+    cache_ready = true;
+}
+
+/// Cleans up the per-window focus property cache.
+pub fn deinitInputModelCache() void {
+    cache_len   = 0;
+    cache_ready = false;
+}
+
+/// Consumes pre-fired WM_PROTOCOLS and WM_HINTS cookies and stores the result.
+/// The caller fires the cookies immediately after xcb_map_window so the server
+/// processes property requests in parallel with the map.
+pub fn populateFocusCacheFromCookies(
+    conn: *xcb.xcb_connection_t,
+    win:  u32,
+    protocols_cookie: xcb.xcb_get_property_cookie_t,
+    hints_cookie:     xcb.xcb_get_property_cookie_t,
+) void {
+    // Resolve both atoms upfront so a failure on either can discard both cookies
+    // together along a single cleanup path.
+    const focus_atoms = resolveFocusAtoms() orelse {
+        xcb.xcb_discard_reply(conn, protocols_cookie.sequence);
+        xcb.xcb_discard_reply(conn, hints_cookie.sequence);
+        return;
+    };
+
+    // Scan WM_PROTOCOLS once for both atoms (no second round-trip).
+    var take_focus = false;
+    var wm_delete  = false;
+
+    protocols: {
+        const r = xcb.xcb_get_property_reply(conn, protocols_cookie, null) orelse break :protocols;
+        defer std.c.free(r);
+        if (r.*.format != 32 or r.*.value_len == 0) break :protocols;
+        const raw: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(r)));
+        const result = scanProtocolAtoms(raw[0..@intCast(r.*.value_len)], focus_atoms.take_focus, focus_atoms.wm_delete);
+        take_focus = result.take_focus;
+        wm_delete  = result.wm_delete;
+    }
+
+    const accepts_input = extractWMHintsInput(conn, hints_cookie);
+
+    putCachedProps(win, .{
+        .model     = inputModelFrom(take_focus, accepts_input),
+        .wm_delete = wm_delete,
+    });
+}
+
+/// Resolves WM_TAKE_FOCUS and WM_DELETE_WINDOW atoms from cache.
+/// Returns null if either atom is not cached (should not happen after initAtomCache).
+inline fn resolveFocusAtoms() ?struct { take_focus: u32, wm_delete: u32 } {
+    const take_focus = utils.getAtomCached("WM_TAKE_FOCUS")    catch return null;
+    const wm_delete  = utils.getAtomCached("WM_DELETE_WINDOW") catch return null;
+    return .{ .take_focus = take_focus, .wm_delete = wm_delete };
+}
+
+/// Extracts the WM_HINTS input field from a pre-fired cookie reply.
+/// Returns true when absent (assume True per ICCCM) or explicitly True.
+fn extractWMHintsInput(
+    conn: *xcb.xcb_connection_t,
+    hints_cookie: xcb.xcb_get_property_cookie_t,
+) bool {
+    const r = xcb.xcb_get_property_reply(conn, hints_cookie, null) orelse return true;
+    defer std.c.free(r);
+    if (r.*.format != 32 or r.*.value_len < 1) return true;
+    const hints: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(r)));
+    const input_flag_set  = (hints[WM_HINTS_FLAGS_FIELD] & WM_HINTS_INPUT_FLAG) != 0;
+    const has_input_field = r.*.value_len > WM_HINTS_INPUT_FIELD;
+    if (!input_flag_set or !has_input_field) return true;
+    return hints[WM_HINTS_INPUT_FIELD] != 0;
+}
+
+/// Recomputes and caches the focus properties after a WM_PROTOCOLS or WM_HINTS
+/// PropertyNotify. Two round-trips; called only on rare property change events.
+pub fn recacheInputModel(conn: *xcb.xcb_connection_t, win: u32) void {
+    _ = queryAndCacheProps(conn, win);
+}
+
+/// Removes `win` from the focus property cache — called on window destruction
+/// to prevent stale entries from accumulating over the session.
+/// Swap-remove keeps the live region dense so subsequent scans stay short.
+pub inline fn uncacheWindowFocusProps(win: u32) void {
+    if (!cache_ready) return;
+    for (cache_slots[0..cache_len], 0..) |slot, i| {
+        if (slot.id == win) {
+            cache_len -= 1;
+            cache_slots[i] = cache_slots[cache_len];
+            return;
+        }
+    }
+}
+
+/// Returns the cached focus properties for `win`, or null on a cache miss.
+inline fn getCachedProps(win: u32) ?CachedProps {
+    if (!cache_ready) return null;
+    for (cache_slots[0..cache_len]) |slot| {
+        if (slot.id == win) return slot.props;
+    }
+    return null;
+}
+
+/// Inserts or updates the cache entry for `win`.
+/// Updates in place when the entry already exists (single write path, no branching).
+/// Silently drops the entry when the cache is full — the live-query fallback is always correct.
+fn putCachedProps(win: u32, props: CachedProps) void {
+    if (!cache_ready) return;
+    for (cache_slots[0..cache_len]) |*slot| {
+        if (slot.id == win) { slot.props = props; return; }
+    }
+    if (cache_len < MAX_WINDOW_CACHE) {
+        cache_slots[cache_len] = .{ .id = win, .props = props };
+        cache_len += 1;
+    } else {
+        debug.warn("Focus cache full, falling back to live queries", .{});
+    }
+}
+
+/// Runs both WM_PROTOCOLS and WM_HINTS queries, stores the result, and returns it.
+/// Used by cache-miss paths so the populate logic lives in exactly one place.
+fn queryAndCacheProps(conn: *xcb.xcb_connection_t, win: u32) CachedProps {
+    const protocols_props = queryWMProtocolsProps(conn, win);
+    const props = CachedProps{
+        .model     = inputModelFrom(protocols_props.take_focus, queryWMHintsAcceptsInput(conn, win)),
+        .wm_delete = protocols_props.wm_delete,
+    };
+    putCachedProps(win, props);
+    return props;
+}
+
+/// Returns the cached InputModel, falling back to a live query on miss.
+/// On the hover-focus hot path this should always be a cache hit.
+pub fn getInputModelCached(conn: *xcb.xcb_connection_t, win: u32) InputModel {
+    if (getCachedProps(win)) |props| return props.model;
+    return queryAndCacheProps(conn, win).model;
+}
+
+/// Returns true if `win` declared WM_DELETE_WINDOW support at map time.
+/// Falls back to a live query only on a genuine cache miss (extremely rare).
+pub fn supportsWMDeleteCached(conn: *xcb.xcb_connection_t, win: u32) bool {
+    if (getCachedProps(win)) |props| return props.wm_delete;
+    return queryAndCacheProps(conn, win).wm_delete;
+}
+
+/// Sends a WM_TAKE_FOCUS client message (ICCCM §4.1.7) if and only if the
+/// window actually advertises WM_TAKE_FOCUS support in its WM_PROTOCOLS.
+///
+/// The check is performed live against the X server on every call — matching
+/// DWM's sendevent(c, wmatom[WMTakeFocus]) exactly:
+///
+///   int sendevent(Client *c, Atom proto) {
+///       if (XGetWMProtocols(dpy, c->win, &protocols, &n)) {
+///           while (!exists && n--)
+///               exists = protocols[n] == proto;
+///           XFree(protocols);
+///       }
+///       if (exists) { ... XSendEvent ... }
+///   }
+///
+/// Why live instead of cached:
+///   Electron (Discord, VS Code, Equibop, etc.) and many GTK/Qt apps set
+///   WM_PROTOCOLS BEFORE or around the time they call XMapWindow.  The WM
+///   reads WM_PROTOCOLS at MapRequest time and caches the result.  If Electron
+///   sets WM_PROTOCOLS before the WM subscribes to PropertyNotify (i.e. before
+///   the MapRequest fires and handleMapRequest sets the event mask), the
+///   PropertyNotify is lost and the cache remains stale forever, recording the
+///   window as `passive` even though it actually advertises WM_TAKE_FOCUS.
+///
+///   Without WM_TAKE_FOCUS the app's Electron/Chromium renderer widget never
+///   activates its internal focus state (text caret, keyboard routing), even
+///   though XSetInputFocus technically succeeds on the top-level window.  DWM
+///   works around this by never trusting a cache — it re-reads WM_PROTOCOLS
+///   on every call.  We do the same here.
+///
+///   The XCB round-trip cost is one xcb_get_property per focus change event,
+///   which is imperceptible at human interaction speed and is pipelined on the
+///   same Unix-domain socket as xcb_set_input_focus.
+pub fn sendWMTakeFocus(conn: *xcb.xcb_connection_t, win: u32, time: u32) void {
+    const protocols_atom  = utils.getAtomCached("WM_PROTOCOLS")  catch return;
+    const take_focus_atom = utils.getAtomCached("WM_TAKE_FOCUS") catch return;
+
+    // Live WM_PROTOCOLS scan — same logic as DWM's sendevent.
+    const proto_reply = xcb.xcb_get_property_reply(conn,
+        xcb.xcb_get_property(conn, 0, win, protocols_atom, xcb.XCB_ATOM_ATOM, 0, MAX_PROPERTY_LENGTH),
+        null,
+    ) orelse return;
+    defer std.c.free(proto_reply);
+    if (proto_reply.*.format != 32 or proto_reply.*.value_len == 0) return;
+    const proto_list: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(proto_reply)));
+    var has_take_focus = false;
+    for (proto_list[0..@intCast(proto_reply.*.value_len)]) |a| {
+        if (a == take_focus_atom) { has_take_focus = true; break; }
+    }
+    if (!has_take_focus) return;
+
+    var event = std.mem.zeroes(xcb.xcb_client_message_event_t);
+    event.response_type  = xcb.XCB_CLIENT_MESSAGE;
+    event.window         = win;
+    event.type           = protocols_atom;
+    event.format         = 32;
+    event.data.data32[0] = take_focus_atom;
+    event.data.data32[1] = time;
+
+    _ = xcb.xcb_send_event(conn, 0, win, xcb.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&event));
+}
+
+// Private ICCCM helpers
+
+/// Maps the two ICCCM boolean focus properties to the four InputModel variants.
+/// See ICCCM §4.1.7: the matrix of (accepts_input × supports_take_focus)
+/// determines which focus delivery mechanism the WM must use.
+inline fn inputModelFrom(supports_take_focus: bool, accepts_input: bool) InputModel {
+    return if (supports_take_focus)
+        (if (accepts_input) .locally_active else .globally_active)
+    else
+        (if (accepts_input) .passive else .no_input);
+}
+
+/// Flags extracted from a single WM_PROTOCOLS scan.
+const WMProtocolsProps = struct { take_focus: bool = false, wm_delete: bool = false };
+
+/// Scans a slice of protocol atoms and returns all WM_PROTOCOLS flags in one pass.
+/// Shared by queryWMProtocolsProps (live query) and populateFocusCacheFromCookies (cookie path).
+inline fn scanProtocolAtoms(protocol_atoms: []const u32, take_focus_atom: u32, wm_delete_atom: u32) WMProtocolsProps {
+    var props: WMProtocolsProps = .{};
+    for (protocol_atoms) |atom| {
+        if (atom == take_focus_atom) props.take_focus = true;
+        if (atom == wm_delete_atom)  props.wm_delete  = true;
+        if (props.take_focus and props.wm_delete) break;
+    }
+    return props;
+}
+
+/// Scans WM_PROTOCOLS once and returns all flags the WM cares about.
+fn queryWMProtocolsProps(conn: *xcb.xcb_connection_t, win: u32) WMProtocolsProps {
+    const protocols_atom  = utils.getAtomCached("WM_PROTOCOLS")    catch return .{};
+    const take_focus_atom = utils.getAtomCached("WM_TAKE_FOCUS")   catch return .{};
+    const wm_delete_atom  = utils.getAtomCached("WM_DELETE_WINDOW") catch return .{};
+
+    const reply = xcb.xcb_get_property_reply(conn,
+        xcb.xcb_get_property(conn, PROPERTY_NO_DELETE, win, protocols_atom, xcb.XCB_ATOM_ATOM, 0, MAX_PROPERTY_LENGTH), null,
+    ) orelse return .{};
+    defer std.c.free(reply);
+    if (reply.*.format != 32 or reply.*.value_len == 0) return .{};
+
+    const raw: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    return scanProtocolAtoms(raw[0..@intCast(reply.*.value_len)], take_focus_atom, wm_delete_atom);
+}
+
+/// Queries the WM_HINTS input field. Returns true when absent (assume True) or explicitly True.
+fn queryWMHintsAcceptsInput(conn: *xcb.xcb_connection_t, win: u32) bool {
+    const reply = xcb.xcb_get_property_reply(conn,
+        xcb.xcb_get_property(conn, PROPERTY_NO_DELETE, win, xcb.XCB_ATOM_WM_HINTS, xcb.XCB_ATOM_WM_HINTS, 0, WM_HINTS_LONG_LENGTH),
+        null,
+    ) orelse return true;
+    defer std.c.free(reply);
+
+    if (reply.*.format != 32 or reply.*.value_len < 1) return true;
+
+    const hints: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(reply)));
+    const input_flag_set  = (hints[WM_HINTS_FLAGS_FIELD] & WM_HINTS_INPUT_FLAG) != 0;
+    const has_input_field = reply.*.value_len > WM_HINTS_INPUT_FIELD;
+    if (!input_flag_set or !has_input_field) return true;
+    return hints[WM_HINTS_INPUT_FIELD] != 0;
+}
+
+// ---------------------------------------------------------------------------
+// WM_CLASS
+// ---------------------------------------------------------------------------
+
+/// The two components of the X11 WM_CLASS property (ICCCM §4.1.2.5).
+/// Both slices are heap-allocated and must be freed via deinit.
+pub const WMClass = struct {
+    instance: []const u8,
+    class:    []const u8,
+
+    pub fn deinit(self: WMClass, allocator: std.mem.Allocator) void {
+        allocator.free(self.instance);
+        allocator.free(self.class);
+    }
+};
+
+/// Reads and parses the WM_CLASS property for `win`. The raw value is two
+/// null-terminated strings concatenated: instance name then class name.
+/// Returns null if the property is absent, malformed, or allocation fails.
+pub fn getWMClass(conn: *xcb.xcb_connection_t, win: u32, allocator: std.mem.Allocator) ?WMClass {
+    const class_atom = utils.getAtomCached("WM_CLASS") catch return null;
+    const reply = xcb.xcb_get_property_reply(conn,
+        xcb.xcb_get_property(conn, PROPERTY_NO_DELETE, win, class_atom, xcb.XCB_ATOM_STRING, 0, MAX_PROPERTY_LENGTH), null,
+    ) orelse return null;
+    defer std.c.free(reply);
+    if (reply.*.format != 8 or reply.*.value_len == 0) return null;
+
+    const data: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(reply));
+    const len: usize = @intCast(reply.*.value_len);
+
+    const sep = std.mem.indexOfScalar(u8, data[0..len], 0) orelse return null;
+    if (sep + 1 >= len) return null;
+
+    const instance  = allocator.dupe(u8, data[0..sep]) catch return null;
+    const class_str = std.mem.sliceTo(data[sep + 1 .. len], 0);
+    const class     = allocator.dupe(u8, class_str) catch {
+        allocator.free(instance);
+        return null;
+    };
+    return .{ .instance = instance, .class = class };
+}
+
+// ---------------------------------------------------------------------------
+// Child window resolution
+// ---------------------------------------------------------------------------
+
+/// Walks up the X11 window tree from `win` to find the top-level window the WM
+/// manages. Electron apps and other toolkits often use child windows for
+/// rendering, so button events may arrive on a child rather than the managed parent.
+pub fn findManagedWindow(conn: *xcb.xcb_connection_t, win: u32, is_managed: *const fn (u32) bool) u32 {
+    var current = win;
+    for (0..MAX_WINDOW_TREE_DEPTH) |_| {
+        if (is_managed(current)) return current;
+
+        const tree_reply = xcb.xcb_query_tree_reply(
+            conn, xcb.xcb_query_tree(conn, current), null,
+        ) orelse return win;
+        defer std.c.free(tree_reply);
+
+        if (tree_reply.*.parent == tree_reply.*.root or tree_reply.*.parent == 0) return win;
+        current = tree_reply.*.parent;
+    }
+    return win;
+}
+
 fn populateAtomCache() void {
     inline for (.{
         .{ .field = "wm_protocols",            .atom = "WM_PROTOCOLS"              },
@@ -16402,6 +16439,7 @@ pub fn init(alloc: std.mem.Allocator) !void {
         };
     }
     populateAtomCache();
+    initInputModelCache();
 }
 
 pub fn deinit() void {
@@ -16416,6 +16454,7 @@ pub fn deinit() void {
     }
     focus.deinit();
     tracking.deinit();
+    deinitInputModelCache();
 }
 
 /// Returns true when tiling is both compiled in and enabled at runtime.
@@ -16744,7 +16783,7 @@ pub fn handleMapRequest(event: *const xcb.xcb_map_request_event_t) void {
 
     parseSizeHintsIntoCache(win, cookies.normal_hints);
 
-    utils.populateFocusCacheFromCookies(core.conn, win, cookies.protocols, cookies.hints);
+    populateFocusCacheFromCookies(core.conn, win, cookies.protocols, cookies.hints);
 
     if (on_current) mapWindowToScreen(win) else registerWindowOffscreen(win);
 }
@@ -16763,7 +16802,7 @@ fn unmanageWindow(win: u32) void {
     const window_workspace = tracking.getWorkspaceForWindow(win);
     const current_ws       = tracking.getCurrentWorkspace();
 
-    utils.uncacheWindowFocusProps(win);
+    uncacheWindowFocusProps(win);
 
     focus.removeFromHistory(win);
 
@@ -16972,7 +17011,7 @@ pub fn handleEnterNotify(event: *const xcb.xcb_enter_notify_event_t) void {
         debug.info("[ENTER] -> filtered: focus suppressed for hover", .{});
         return;
     }
-    const managed = utils.findManagedWindow(core.conn, event.event, tracking.isManaged);
+    const managed = findManagedWindow(core.conn, event.event, tracking.isManaged);
     debug.info("[ENTER] -> resolved managed=0x{x}", .{managed});
     maybeFocusWindow(managed);
 }
