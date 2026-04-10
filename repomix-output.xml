@@ -274,40 +274,6 @@ pub fn getIndicator(s: anytype) []const u8 {
 }
 </file>
 
-<file path="src/bar/modules/layout/layout.zig">
-//! Layout icon segment — shows the current tiling layout symbol.
-//! For the variants indicator see variants.zig.
-
-const core    = @import("core");
-const types   = @import("types");
-const drawing = @import("drawing");
-const build   = @import("build_options");
-const tiling  = if (build.has_tiling) @import("tiling") else struct {};
-
-/// Returns the icon string for the given layout.
-/// Uses anytype so this function is only instantiated when tiling is present,
-/// keeping the no-tiling build from trying to resolve tiling.Layout.
-pub fn getIcon(layout: anytype) []const u8 {
-    return switch (layout) {
-        .master    => "[]=",
-        .monocle   => "[M]",
-        .grid      => "[+]",
-        .fibonacci => "[@]",
-        .floating  => "><>",
-    };
-}
-
-pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
-    // Without tiling all windows are floating by definition.
-    if (comptime !build.has_tiling)
-        return dc.drawSegment(start_x, height, "><>", config.scaledSegmentPadding(height), config.bg, config.fg);
-
-    const t_state = tiling.getStateOpt() orelse return start_x;
-    const icon    = getIcon(t_state.layout);
-    return dc.drawSegment(start_x, height, icon, config.scaledSegmentPadding(height), config.bg, config.fg);
-}
-</file>
-
 <file path="src/bar/render.zig">
 //! Manual C bindings for the bar's rendering stack: Cairo, Pango, and GLib.
 //!
@@ -466,6 +432,41 @@ pub extern fn pango_font_metrics_unref(metrics: *PangoFontMetrics) void;
 /// Decrements the GObject reference count of `object`, freeing it when it
 /// reaches zero.  Used to release PangoLayout and other GObject-based types.
 pub extern fn g_object_unref(object: *anyopaque) void;
+</file>
+
+<file path="src/bar/modules/layout/layout.zig">
+//! Layout icon segment — shows the current tiling layout symbol.
+//! For the variants indicator see variants.zig.
+
+const core    = @import("core");
+const types   = @import("types");
+const drawing = @import("drawing");
+const build   = @import("build_options");
+const tiling  = if (build.has_tiling) @import("tiling") else struct {};
+
+/// Returns the icon string for the given layout.
+/// Uses anytype so this function is only instantiated when tiling is present,
+/// keeping the no-tiling build from trying to resolve tiling.Layout.
+pub fn getIcon(layout: anytype) []const u8 {
+    return switch (layout) {
+        .master    => "[]=",
+        .monocle   => "[M]",
+        .grid      => "[+]",
+        .fibonacci => "[@]",
+        .floating  => "><>",
+    };
+}
+
+/// Draws the layout icon on the bar. Returns the x position after the drawn segment.
+pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
+    // Without tiling all windows are floating by definition.
+    if (comptime !build.has_tiling)
+        return dc.drawSegment(start_x, height, "><>", config.scaledSegmentPadding(height), config.bg, config.fg);
+
+    const t_state = tiling.getStateOpt() orelse return start_x;
+    const icon    = getIcon(t_state.layout);
+    return dc.drawSegment(start_x, height, icon, config.scaledSegmentPadding(height), config.bg, config.fg);
+}
 </file>
 
 <file path="src/config/parser.zig">
@@ -730,6 +731,7 @@ pub fn parseColor(value: []const u8) !u32 {
     return color;
 }
 
+/// Frees all key strings and recursively deinits all values in `pairs`, then deinits the map.
 fn cleanPairs(alloc: std.mem.Allocator, pairs: *std.StringHashMap(Value)) void {
     var iter = pairs.iterator();
     while (iter.next()) |entry| {
@@ -935,13 +937,14 @@ const Parser = struct {
         }
     }
 
-    // Bare keys (no `=`) are treated as `key = true`, which is the only call
-    // site's expectation. Workspace rule entries like `Navigator` use this.
+    /// Advances past a trailing newline or comment character at line end.
     fn skipLineEnd(self: *Parser, c: ?u8) void {
         if (c == '\n') _ = self.consume();
         if (c == '#') self.skipToNewline();
     }
 
+    /// Parses one `key = value` pair, or a bare `key` (treated as `key = true`).
+    /// Workspace rule entries like `Navigator` rely on the bare-key shorthand.
     fn parseKeyValuePair(self: *Parser) ParseError!struct { []const u8, Value } {
         const key = try self.parseKey();
         errdefer self.allocator.free(key);
@@ -1073,10 +1076,13 @@ var timer_enabled:       bool    = false;
 var last_formatted_time: [20]u8  = undefined;
 var last_formatted_sec:  i64     = -1;
 
+/// Returns true when the bar is visible and has a clock segment configured.
 fn shouldClockRun() bool {
     return bar.isVisible() and bar.hasClockSegment();
 }
 
+/// Enables or disables the clock timer based on whether the clock segment is active.
+/// Called whenever bar visibility or segment configuration changes.
 pub fn updateTimerState() void {
     const enable = shouldClockRun();
     if (enable != timer_enabled) {
@@ -1099,6 +1105,7 @@ pub fn pollTimeoutMs() i32 {
     return @intCast((ns_remaining + 999_999) / 1_000_000);
 }
 
+/// Draws the current time string on the bar. Returns the x position after the segment.
 pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
     // Derive seconds from clock_gettime(REALTIME); sub-second precision is not needed for display.
     var now_ts: std.os.linux.timespec = undefined;
@@ -1116,11 +1123,10 @@ pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, star
     return dc.drawSegment(start_x, height, time_str, config.scaledSegmentPadding(height), config.bg, config.fg);
 }
 
-// localtime_r() is tried first; if it returns null we fall back to inline UTC arithmetic.
-// Parameter is plain i64 seconds since the epoch — derived from std.time.nanoTimestamp()
-// by the callers above.
-// localtime_r is POSIX-guaranteed reentrant (output goes into caller-supplied tm_buf),
-// making this function safe to call from the bar render thread.
+/// Formats `sec` (seconds since the Unix epoch) into `buf` as "YYYY-MM-DD HH:MM:SS".
+/// Tries localtime_r first for local timezone; falls back to inline UTC arithmetic if it
+/// returns null (e.g. timezone data unavailable). localtime_r is POSIX-guaranteed reentrant,
+/// making this safe to call from the bar render thread.
 fn formatTime(buf: []u8, sec: i64) ![]const u8 {
     const TIME_FMT = "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}";
     var raw_sec: c.time_t = @intCast(sec);
@@ -1165,6 +1171,7 @@ const std   = @import("std");
 const build = @import("build_options");
 
 
+/// Strips the directory and ".zig" extension from a source file path, returning a short module tag.
 fn moduleFromSrc(src: std.builtin.SourceLocation) []const u8 {
     const basename = std.fs.path.basename(src.file);
     return if (std.mem.endsWith(u8, basename, ".zig"))
@@ -1203,18 +1210,21 @@ pub inline fn warnIf (condition: bool, comptime fmt: []const u8, args: anytype) 
 pub inline fn infoIf (condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .info,      fmt, args); }
 pub inline fn debugIf(condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .debug_log, fmt, args); }
 
+/// Panics with a module-tagged message when `condition` is false, in debug builds only.
 pub inline fn assert(condition: bool, comptime message: []const u8) void {
     if (!debugEnabled() or condition) return;
     const module = moduleFromSrc(@src());
     std.debug.panic("[{s}] Assertion failed: {s}", .{ module, message });
 }
 
+/// Emits a debug-level trace line showing the caller module and function name.
 pub inline fn trace(comptime func_name: []const u8) void {
     if (!debugEnabled()) return;
     const module = moduleFromSrc(@src());
     std.log.debug("[{s}] -> {s}", .{ module, func_name });
 }
 
+/// Emits a debug-level line showing `label = value` with the caller's module tag.
 pub inline fn print(comptime label: []const u8, value: anytype) void {
     if (!debugEnabled()) return;
     const module = moduleFromSrc(@src());
@@ -1291,6 +1301,8 @@ const COMMON_DPI_TABLE = [_]f32{ 96.0, 120.0, 144.0, 192.0 };
 /// Re-exported from core so callers that only import scale still get the type.
 pub const DpiInfo = core.DpiInfo;
 
+/// Reads the Xft.dpi value from the X RESOURCE_MANAGER property, if present.
+/// Returns null when the property is absent, empty, or does not contain an Xft.dpi entry.
 fn readXftDpi(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) ?f32 {
     const atom_cookie = xcb.xcb_intern_atom(conn, 0, "RESOURCE_MANAGER".len, "RESOURCE_MANAGER");
     const atom_reply  = xcb.xcb_intern_atom_reply(conn, atom_cookie, null) orelse return null;
@@ -1325,6 +1337,8 @@ fn readXftDpi(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) ?f32 {
     return null;
 }
 
+/// Computes DPI from the screen's physical dimensions reported by X.
+/// Returns BASELINE_DPI if the screen reports 0mm dimensions (e.g. virtual displays).
 fn calcDpiFromGeometry(screen: *xcb.xcb_screen_t) f32 {
     const width_px:  f32 = @floatFromInt(screen.width_in_pixels);
     const height_px: f32 = @floatFromInt(screen.height_in_pixels);
@@ -1355,6 +1369,8 @@ fn snapToCommonDpi(dpi: f32) f32 {
     return dpi;
 }
 
+/// Computes a scale factor from the screen's pixel diagonal relative to the baseline display.
+/// Used as a fallback when geometry-based DPI is out of a plausible range.
 fn calcScaleFromResolution(screen: *xcb.xcb_screen_t) f32 {
     const width_px:  f32 = @floatFromInt(screen.width_in_pixels);
     const height_px: f32 = @floatFromInt(screen.height_in_pixels);
@@ -1380,6 +1396,7 @@ pub fn detectDpi(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) DpiInfo
     return result;
 }
 
+/// Performs the actual DPI detection without consulting or updating the cache.
 fn detectDpiUncached(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) DpiInfo {
     if (readXftDpi(conn, screen)) |xft_dpi| {
         debug.info("Using DPI from X resources (Xft.dpi): {d:.1}", .{xft_dpi});
@@ -1398,6 +1415,7 @@ fn detectDpiUncached(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) Dpi
     return DpiInfo.fromDpi(snapToCommonDpi(geometry_dpi));
 }
 
+/// Scales an integer value by `scale_factor`, rounding to the nearest integer.
 pub fn scaleInt(base_value: anytype, scale_factor: f32) @TypeOf(base_value) {
     const T = @TypeOf(base_value);
     return switch (@typeInfo(T)) {
@@ -1406,6 +1424,7 @@ pub fn scaleInt(base_value: anytype, scale_factor: f32) @TypeOf(base_value) {
     };
 }
 
+/// Scales a float value by `scale_factor` and rounds to the nearest integer of type `T`.
 pub fn scaleToInt(comptime T: type, base_value: f32, scale_factor: f32) T {
     return @intFromFloat(@round(base_value * scale_factor));
 }
@@ -1432,6 +1451,9 @@ pub fn scaleMasterWidth(value: parser.ScalableValue) f32 {
     return if (value.is_percentage) value.value / 100.0 else -value.value;
 }
 
+/// Scales a font size value against the screen height, clamped to a minimum of 1px.
+/// Percentage values are relative to FONT_BASELINE_HEIGHT (1080px) rather than the
+/// screen baseline, so font sizes degrade more gracefully on smaller screens.
 pub fn scaleFontSize(value: parser.ScalableValue, screen: *xcb.xcb_screen_t) u16 {
     if (value.is_percentage) {
         const screen_height: f32 = @floatFromInt(screen.height_in_pixels);
@@ -1440,6 +1462,7 @@ pub fn scaleFontSize(value: parser.ScalableValue, screen: *xcb.xcb_screen_t) u16
     return @intFromFloat(@max(1.0, @round(value.value)));
 }
 
+/// Converts a scalable bar height value to pixels, clamped to BAR_MIN_HEIGHT_PX.
 pub fn scaleBarHeight(value: parser.ScalableValue, screen_height: u16) u16 {
     const screen_height_f: f32 = @floatFromInt(screen_height);
     const scaled_px: f32 = if (value.is_percentage)
@@ -1477,6 +1500,7 @@ pub fn ensureRefreshRateDetected(conn: *xcb.xcb_connection_t) void {
 /// hotplug or mode switch is picked up on the next draw cycle.
 pub fn invalidateRefreshRate() void { hz_cache.is_ready = false; }
 
+/// Returns the root window ID of the first screen, or 0 if no screens are available.
 fn xcbRootWindow(conn: *xcb.xcb_connection_t) u32 {
     const setup = xcb.xcb_get_setup(conn);
     var it      = xcb.xcb_setup_roots_iterator(setup);
@@ -2282,6 +2306,7 @@ pub fn drawSegmentedCarousel(
 
 // Private helpers — Hz detection
 
+/// Returns the root window ID of the first screen, or 0 if no screens are available.
 fn xcbRootWindow(conn: *xcb.xcb_connection_t) u32 {
     const setup = xcb.xcb_get_setup(conn);
     var it      = xcb.xcb_setup_roots_iterator(setup);
@@ -2455,6 +2480,7 @@ pub const FontState = struct {
     current_font_desc: ?*c.PangoFontDescription         = null,
     cached_metrics:    ?struct { ascent: i16, descent: i16 } = null,
 
+    /// Frees the current Pango font description, if one has been loaded.
     fn deinit(self: *FontState) void {
         if (self.current_font_desc) |desc| c.pango_font_description_free(desc);
     }
@@ -2488,6 +2514,8 @@ pub const FontState = struct {
         try self.loadFont(font_list);
     }
 
+    /// Returns (ascent, descent) in pixels for the current font. Cached after the first call;
+    /// invalidated by loadFont. Result is in pixels, converted from Pango units via PANGO_SCALE.
     pub fn getMetrics(self: *FontState) struct { i16, i16 } {
         if (self.cached_metrics) |m| return .{ m.ascent, m.descent };
         const metrics = c.pango_context_get_metrics(
@@ -2635,6 +2663,7 @@ pub const DrawContext = struct {
         return dc;
     }
 
+    /// Frees all Cairo/Pango resources and the pixmap, then deallocates the DrawContext itself.
     pub fn deinit(self: *DrawContext) void {
         self.font.deinit();
         if (self.cached_sized_desc) |desc| c.pango_font_description_free(desc);
@@ -2648,6 +2677,7 @@ pub const DrawContext = struct {
         self.font.allocator.destroy(self);
     }
 
+    /// Loads a single font and clears the sized-font cache. Delegates to FontState.loadFont.
     pub fn loadFont(self: *DrawContext, font_name: []const u8) !void {
         try self.font.loadFont(font_name);
         if (self.cached_sized_desc) |old| c.pango_font_description_free(old);
@@ -2655,6 +2685,7 @@ pub const DrawContext = struct {
         debug.info("Cairo/Pango font loaded: {s}", .{font_name});
     }
 
+    /// Loads a comma-separated Pango font fallback list. Delegates to FontState.loadFonts.
     pub fn loadFonts(self: *DrawContext, font_names: []const []const u8) !void {
         try self.font.loadFonts(font_names);
         if (font_names.len > 1) debug.info("Loaded {} fonts with fallback support", .{font_names.len});
@@ -2683,12 +2714,14 @@ pub const DrawContext = struct {
     // baseline changes when font fallback is active (different scripts trigger
     // different fonts with different ascents), so caching it would silently
     // misalign text in multi-font configurations.
+    /// Positions the Cairo cursor so that Pango text rendered at (x, y_top) lands on its baseline.
     inline fn moveToTextBaseline(self: *DrawContext, x: u16, y: u16) void {
         const baseline = @as(f64, @floatFromInt(c.pango_layout_get_baseline(self.font.pango_layout)))
             / @as(f64, @floatFromInt(c.PANGO_SCALE));
         c.cairo_move_to(self.ctx, @floatFromInt(x), @as(f64, @floatFromInt(y)) - baseline);
     }
 
+    /// Clears the offscreen pixmap to fully transparent. No-op on non-ARGB surfaces.
     pub fn clearToTransparent(self: *DrawContext) void {
         if (!self.is_argb) return;
         // Skip cairo_save/cairo_restore: we only change the operator temporarily
@@ -2891,6 +2924,7 @@ pub const MeasureContext = struct {
         return .{ .font = .{ .allocator = allocator, .pango_layout = layout }, .surface = surface, .ctx = ctx };
     }
 
+    /// Frees all Cairo/Pango resources owned by this MeasureContext.
     pub fn deinit(self: *MeasureContext) void {
         self.font.deinit();
         c.g_object_unref(self.font.pango_layout);
@@ -2903,18 +2937,14 @@ pub const MeasureContext = struct {
     pub fn getMetrics(self: *MeasureContext) struct { i16, i16 }                  { return self.font.getMetrics(); }
 };
 
-// CarouselPixmap 
-//
-// Pre-renders a window title (background + glyphs) into a dedicated XCB pixmap
-// exactly once. Every subsequent carousel tick is two xcb_copy_area calls —
-// raw pixel blits with zero Pango/Cairo involvement.
-//
-// Leapfrog model: two logical copies of the pixmap exist side-by-side,
-// `cycle_w` pixels apart (cycle_w = text_w + gap). As `offset` advances from
-// 0 to cycle_w the first copy scrolls out of the left edge while the second
-// enters from the right. At offset == cycle_w the state is identical to
-// offset == 0, giving a perfectly seamless loop.
-
+/// Pre-renders a window title (background + glyphs) into a dedicated XCB pixmap exactly once.
+/// Every subsequent carousel tick is two xcb_copy_area calls — raw pixel blits with zero
+/// Pango/Cairo involvement.
+///
+/// Leapfrog model: two logical copies of the pixmap exist side-by-side, `cycle_w` pixels apart
+/// (cycle_w = text_w + gap). As `offset` advances from 0 to cycle_w the first copy scrolls out
+/// of the left edge while the second enters from the right. At offset == cycle_w the state is
+/// identical to offset == 0, giving a perfectly seamless loop.
 pub const CarouselPixmap = struct {
     conn:    *core.xcb.xcb_connection_t,
     pixmap:  u32,
@@ -2923,6 +2953,8 @@ pub const CarouselPixmap = struct {
     text_w:  u16,
     height:  u16,
 
+    /// Allocates an XCB pixmap of size (text_w × bar_height) and a Cairo surface over it.
+    /// The pixmap is uninitialised until render() is called.
     pub fn init(dc: *const DrawContext, text_w: u16) !CarouselPixmap {
         const pixmap = core.xcb.xcb_generate_id(dc.conn);
         _ = core.xcb.xcb_create_pixmap(dc.conn, dc.depth, pixmap, dc.offscreen_pixmap, text_w, dc.height);
@@ -2945,6 +2977,7 @@ pub const CarouselPixmap = struct {
                    .surface = surface, .text_w = text_w, .height = dc.height };
     }
 
+    /// Frees the GC, Cairo surface, and XCB pixmap.
     pub fn deinit(self: *CarouselPixmap) void {
         _ = core.xcb.xcb_free_gc(self.conn, self.gc);
         c.cairo_surface_destroy(self.surface);
@@ -3771,6 +3804,7 @@ pub const CacheMap = struct {
         return null;
     }
 
+    /// Returns a mutable pointer to the cached WindowData for `win`, or null if absent.
     pub fn getPtr(self: *CacheMap, win: u32) ?*WindowData {
         return if (findEntry(self, win)) |e| &e.data else null;
     }
@@ -3906,6 +3940,7 @@ inline fn snapDimToIncrement(dim: u16, base: u16, inc: u16) u16 {
     return base + (excess / inc) * inc;
 }
 
+/// Returns true when all hint fields are zero, indicating the client published no constraints.
 inline fn isEmptySizeHints(h: SizeHints) bool {
     return h.min_width == 0 and h.min_height == 0 and
            h.max_width == 0 and h.max_height == 0 and
@@ -3944,16 +3979,20 @@ var cached_ind_x_off:  u16     = 0;
 /// Cached vertical top position of the indicator glyph. Constant for all cells.
 var cached_ind_y:      u16     = 0;
 
+/// Returns the display label for workspace `i`, falling back through icons, labels, and "?".
 inline fn getLabel(i: usize, config: types.BarConfig) []const u8 {
     if (i < config.workspace_icons.items.len) return config.workspace_icons.items[i];
     if (i < tracking.WORKSPACE_LABELS.len)    return tracking.WORKSPACE_LABELS[i];
     return "?";
 }
 
+/// Invalidates the segment cache; next draw() call will remeasure labels and cell widths.
 pub fn invalidate() void { cache_valid = false; }
 
+/// Returns the last-computed workspace cell width in pixels (0 until first draw).
 pub fn getCachedWorkspaceWidth() u16 { return ws_width; }
 
+/// Rebuilds the label-width and geometry cache if stale. No-op if cache_valid is true.
 fn ensureCache(dc: *drawing.DrawContext, config: types.BarConfig, height: u16) void {
     if (cache_valid) return;
     for (&label_widths, 0..) |*w, i| w.* = dc.measureTextWidth(getLabel(i, config));
@@ -4341,8 +4380,8 @@ pub const BarConfig = struct {
     fonts:             std.ArrayList([]const u8)  = .empty,
     font_size:         parser.ScalableValue   = parser.ScalableValue.percentage(10.0),
     // Resolved pixel value cached after DPI scaling; derived from font_size at startup.
-    // NOTE: this is runtime state, not a raw config value — consider moving it to a
-    // separate resolved-config struct if BarConfig is ever serialised or diffed.
+    // Mixed into BarConfig for convenience; keep in mind it is runtime state, not a raw
+    // config value — separate it if BarConfig is ever serialised or structurally diffed.
     scaled_font_size:  u16                    = 10, // Can exceed 255 on high DPI - u16 is correct
     spacing:           parser.ScalableValue   = parser.ScalableValue.absolute(12.0),
 
@@ -4833,6 +4872,7 @@ pub fn handleCtrl(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     return .none;
 }
 
+/// Handles a key press in insert mode. Returns the Action the caller should take.
 pub fn handleInsert(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     switch (sym) {
         XK_Escape => {
@@ -4871,6 +4911,7 @@ pub fn handleInsert(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     return .none;
 }
 
+/// Handles a key press in normal mode. Returns the Action the caller should take.
 pub fn handleNormal(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     // Pending r{c}: replace `count` chars with a single character.
     if (vs.pending.is_awaiting_replace_char) {
@@ -5109,6 +5150,7 @@ pub fn handleNormal(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     return .none;
 }
 
+/// Handles a key press in visual mode. Returns the Action the caller should take.
 pub fn handleVisual(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     // Shared: pending find/g, digits, ;/,, simple motions, prefix arming.
     if (resolveMotionKey(vs, sym)) |mkr| {
@@ -5163,6 +5205,7 @@ pub fn handleVisual(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     return .none;
 }
 
+/// Handles a key press in replace mode. Returns the Action the caller should take.
 pub fn handleReplace(vs: *VimState, sym: xcb.xcb_keysym_t) Action {
     switch (sym) {
         XK_Escape => {
@@ -5929,6 +5972,8 @@ pub const XkbState = struct {
     /// No allocator needed — 256 × 4 bytes = 1 KiB, lives inside XkbState.
     keysym_by_keycode: [256]u32,
 
+    /// Initialises an XKB context, keymap, and state from the live X connection.
+    /// Retries up to MAX_ATTEMPTS times to handle early-startup races.
     pub fn init(xcb_conn: *anyopaque) !XkbState {
         const ctx = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
             return error.XkbContextFailed;
@@ -5961,6 +6006,7 @@ pub const XkbState = struct {
         };
     }
 
+    /// Releases the XKB state, keymap, and context in reverse-init order.
     pub fn deinit(self: *XkbState) void {
         xkb.xkb_state_unref(self.state);
         xkb.xkb_keymap_unref(self.keymap);
@@ -6003,6 +6049,8 @@ inline fn retryDelay(attempt: u8) void {
     _ = std.os.linux.nanosleep(&req, &rem);
 }
 
+/// Calls xkb_x11_setup_xkb_extension, retrying up to MAX_ATTEMPTS times with a brief delay.
+/// The extension may not be ready immediately at WM startup.
 fn retrySetup(xcb_conn: *anyopaque) !void {
     for (0..MAX_ATTEMPTS) |i| {
         const ok = xkb.xkb_x11_setup_xkb_extension(
@@ -6200,6 +6248,8 @@ var g_state: State = .{};
 
 // Public API 
 
+/// Begins a move (button 1) or resize (button 3) drag on `win` at pointer position (x, y).
+/// No-op when a drag is already active, or for bar/fullscreen windows.
 pub fn startDrag(win: u32, button: u8, x: i16, y: i16) void {
     if (g_state.drag.active) return;
     if (bar.isBarWindow(win)) return;
@@ -6269,6 +6319,8 @@ pub fn startDrag(win: u32, button: u8, x: i16, y: i16) void {
     _ = xcb.xcb_flush(core.conn);
 }
 
+/// Applies pointer motion to the active drag, updating window position or size.
+/// No-op when no drag is active.
 pub fn updateDrag(x: i16, y: i16) void {
     if (!g_state.drag.active) return;
     const drag = &g_state.drag;
@@ -6395,6 +6447,7 @@ pub fn updateDrag(x: i16, y: i16) void {
     _ = xcb.xcb_flush(core.conn);
 }
 
+/// Ends the active drag and resets all drag state.
 pub fn stopDrag() void {
     // No flush needed: the last updateDrag call already flushed all pending
     // geometry changes before this function is reached.
@@ -6437,6 +6490,7 @@ pub const Tracking = struct {
     /// the invariant is enforced by prepareAdd rather than the type alone.
     len: u8 = 0,
 
+    /// Returns true if `win` is present in the list.
     pub fn contains(self: *const Tracking, win: u32) bool {
         return std.mem.indexOfScalar(u32, self.buf[0..self.len], win) != null;
     }
@@ -6538,6 +6592,7 @@ pub const Tracking = struct {
         @memcpy(self.buf[0..self.len], new_order);
     }
 
+    /// Returns a slice of the live entries in insertion order.
     pub fn items(self: *const Tracking) []const u32 {
         return self.buf[0..self.len];
     }
@@ -6549,6 +6604,7 @@ var g_map:             ?std.AutoHashMap(u32, u64) = null;
 var g_current:         u8                         = 0;
 var g_workspace_count: usize                      = 1;
 
+/// Initialises the global window-tracking map. Must be called once at startup before any windows are managed.
 pub fn init(allocator: std.mem.Allocator) void {
     var map = std.AutoHashMap(u32, u64).init(allocator);
     // Pre-allocate to avoid early growth under normal workloads.  Failure is
@@ -6560,6 +6616,7 @@ pub fn init(allocator: std.mem.Allocator) void {
     g_map = map;
 }
 
+/// Frees the global window-tracking map and resets all state.
 pub fn deinit() void {
     if (g_map) |*m| m.deinit();
     g_map             = null;
@@ -6739,8 +6796,8 @@ const std = @import("std");
 
 const constants = @import("constants");
 
-// On every @cImport, C code has to be translated to Zig on every compilation.
-// Importing xcb here, and then making other files import it through this file is a tiny bit more efficient.
+// Importing xcb centrally and re-exporting it avoids repeated @cImport translation
+// on every compilation unit that needs XCB types.
 pub const xcb = @cImport(@cInclude("xcb/xcb.h"));
 
 
@@ -6786,11 +6843,13 @@ pub const DpiInfo = struct {
     dpi:          f32,
     scale_factor: f32,
 
+    /// Constructs a DpiInfo from a raw DPI value, computing scale_factor relative to BASELINE_DPI.
     pub fn fromDpi(dpi: f32) DpiInfo {
         return .{ .dpi = dpi, .scale_factor = dpi / @import("constants").BASELINE_DPI };
     }
 };
 
+// Process-wide singletons, initialised in main before any other module runs.
 pub var conn:     *xcb.xcb_connection_t   = undefined;
 pub var screen:   *xcb.xcb_screen_t       = undefined;
 pub var root:     WindowId                = undefined;
@@ -6977,6 +7036,8 @@ fn handleSignalPipe(fd: std.posix.fd_t) void {
 
 // Keybindings
 
+/// Ungrabs all keys, then re-grabs every configured keybinding across all LOCK_MODIFIERS combinations.
+/// Fires all xcb_grab_key cookies before reading any reply to reduce round-trips.
 pub fn grabKeybindings() !void {
     _ = xcb.xcb_ungrab_key(core.conn, xcb.XCB_GRAB_ANY, core.root, xcb.XCB_MOD_MASK_ANY);
     const CookieEntry = struct { cookie: xcb.xcb_void_cookie_t, keycode: u8 };
@@ -7013,6 +7074,7 @@ pub fn grabKeybindings() !void {
 
 // Config reload
 
+/// Triggers a config reload if one has been requested via the signal pipe. No-op otherwise.
 inline fn maybeReload() void {
     if (utils.consumeReload())
         handleConfigReload() catch |err| debug.err("Reload failed: {}", .{err});
@@ -7022,25 +7084,20 @@ inline fn maybeReload() void {
 /// On failure, the old config remains active.
 fn handleConfigReload() !void {
     debug.info("Reload requested", .{});
-    
-    // Load new config
+
     var new_config = config.loadConfigDefault(core.alloc) catch |err| {
         debug.err("Failed to load: {}, keeping old", .{err});
         return err;
     };
     errdefer new_config.deinit(core.alloc);
-    
-    // Validate
+
     try validateConfig(&new_config);
-    
-    // Apply atomically
     try applyConfig(&new_config);
-    
-    // Clean up old config
+
     var old_config = core.config;
     core.config = new_config;
     old_config.deinit(core.alloc);
-    
+
     debug.info("Reload complete", .{});
 }
 
@@ -7192,10 +7249,12 @@ pub const Rect = struct {
     width:  u16,
     height: u16,
 
+    /// Constructs a Rect from an XCB geometry reply.
     pub inline fn fromXcb(geom: *const xcb.xcb_get_geometry_reply_t) Rect {
         return .{ .x = geom.x, .y = geom.y, .width = geom.width, .height = geom.height };
     }
 
+    /// Returns true when both dimensions meet the minimum window size requirement.
     pub inline fn isValid(self: Rect) bool {
         return self.width >= constants.MIN_WINDOW_DIM and self.height >= constants.MIN_WINDOW_DIM;
     }
@@ -7683,6 +7742,8 @@ fn drawSingleWindow(
 
 // Private — split-view segmented titles
 
+/// Renders one title segment per window in a horizontal split-view layout.
+/// Windows are sorted spatially so each segment position is stable across focus changes.
 fn drawSegmentedTitles(
     ctx:               TitleRenderContext,
     snapshot:          TitleSnapshot,
@@ -8997,11 +9058,8 @@ pub fn main() !void {
     const x = try connectToX();
     defer xcb.xcb_disconnect(x.conn);
 
-    // TODO: can we pass conn/screen/root directly as function args instead of
-    // writing to core globals here?
-    // These globals are written once at startup and then read-only for the
-    // lifetime of the process. They're stored on core so every module can
-    // access them without threading them through every call site.
+    // Written once at startup and then read-only for the lifetime of the process.
+    // Stored on core so every module can access them without threading them through every call site.
     core.conn   = x.conn;
     core.screen = x.screen;
     core.root   = x.root;
@@ -9110,7 +9168,7 @@ fn deinitModules() void {
 
 /// Initializes global WM state: X atom cache.
 fn initGlobalState(conn: *xcb.xcb_connection_t) !void {
-    try utils.initAtomCache(conn);  // Intern frequently used X atoms
+    try utils.initAtomCache(conn);
 }
 
 /// Tears down global WM state initialized by initGlobalState.
@@ -9146,8 +9204,6 @@ fn deinitGlobalState() void {}
 //! NOTE: init() is now infallible (void return).  Callers that previously did
 //! `try minimize.init()` should change the call to `minimize.init()`.
 
-// [#10] build moved to the top of the import block — it is referenced
-// by several declarations below and must be visible before those lines.
 const std   = @import("std");
 const build = @import("build_options");
 
@@ -9224,8 +9280,8 @@ const MinimizedRecord = struct {
 
 const MAX_MINIMIZED: usize = 32;
 
-// [#16] Zero-initialize the buffer so slots beyond g_len never contain
-// garbage values, making any accidental out-of-bounds read predictable.
+// Zero-initialised so slots beyond g_len never contain garbage, making any
+// accidental out-of-bounds read produce a predictable zero record.
 var g_buf:            [MAX_MINIMIZED]MinimizedRecord = std.mem.zeroes([MAX_MINIMIZED]MinimizedRecord);
 var g_len:            u8  = 0;
 var g_next_timestamp: u64 = 0;
@@ -9237,8 +9293,7 @@ pub fn init() void {
     g_next_timestamp = 0;
 }
 
-// [#14] deinit now resets g_next_timestamp to mirror init(), making a
-// deinit->init sequence fully idempotent.
+/// Resets all minimize state. Mirrors init() exactly, making deinit→init idempotent.
 pub fn deinit() void {
     g_len            = 0;
     g_next_timestamp = 0;
@@ -9248,15 +9303,13 @@ pub fn deinit() void {
 
 /// Reinterpret a signed screen coordinate as the u32 value XCB expects on its
 /// wire format.  XCB takes geometry arguments as u32 but interprets them as i32
-/// internally; @bitCast is the correct conversion and this wrapper names the
-/// intent at every call site.
-// [#18]
+/// Reinterprets a signed screen coordinate as the u32 XCB expects on the wire.
+/// XCB takes geometry arguments as u32 but interprets them as i32 internally;
+/// @bitCast is the correct conversion and this wrapper names the intent at every call site.
 inline fn toXcbCoord(v: i32) u32 { return @bitCast(v); }
 
-/// Return the index into g_buf[0..g_len] of the slot whose .win field matches,
-/// or null if not found.  All buffer scans are centralised here to give a single
-/// implementation that is easy to audit and covers all search paths.
-// [#5]
+/// Returns the index into g_buf[0..g_len] of the slot whose .win field matches,
+/// or null if not found. Centralised so all buffer scans share one auditable implementation.
 fn findInBuf(win: u32) ?usize {
     for (g_buf[0..g_len], 0..) |rec, i| {
         if (rec.win == win) return i;
@@ -9268,8 +9321,6 @@ fn findInBuf(win: u32) ?usize {
 /// Buffer order is not semantically significant — LIFO/FIFO ordering is
 /// encoded in each entry's timestamp, not its position in the buffer.
 /// Returns true if the window was found and removed, false if absent (no-op).
-// [#5] single scan via findInBuf; [#returnbool] return value lets callers
-// distinguish "was tracked" from "was not tracked" without a second lookup.
 fn removeFromBuf(win: u32) bool {
     if (findInBuf(win)) |i| {
         g_len   -= 1;
@@ -9279,13 +9330,11 @@ fn removeFromBuf(win: u32) bool {
     return false;
 }
 
-// Public queries 
+// Public queries
 
-// [#15] `inline` removed — the function contains a loop and force-inlining it
-// at every call site would bloat the binary.  The compiler inlines trivial
-// callers on its own.
+/// Returns true when `win` is currently minimized.
 pub fn isMinimized(win: u32) bool {
-    return findInBuf(win) != null; // [#5] single centralised scan
+    return findInBuf(win) != null;
 }
 
 /// Returns a read-only view of the current minimize buffer.
@@ -9293,8 +9342,7 @@ pub fn isMinimized(win: u32) bool {
 ///
 /// Prefer this over collectMinimizedIntoSet() — it lets the caller (e.g. bar.zig) build
 /// whatever secondary structure it needs without introducing an allocator
-/// dependency into this module.  See collectMinimizedIntoSet() for migration notes.
-// [#8]
+/// dependency into this module.
 pub fn minimizedSlice() []const MinimizedRecord {
     return g_buf[0..g_len];
 }
@@ -9313,9 +9361,9 @@ pub fn minimizedSlice() []const MinimizedRecord {
 /// history with a caller-supplied visibility predicate.  This function uses
 /// workspace insertion order, which is not MRU, and is specifically suited
 /// to tiling fallback (master or first slave).
-// [#6] `pub` removed — this is an internal fallback, not part of the module's
-// public contract.  External callers should use focus.focusBestAvailable()
-// directly.
+///
+/// Internal fallback only — not part of the public contract. External callers
+/// should use focus.focusBestAvailable() directly.
 pub fn focusMasterOrFirst() void {
     found: {
         if (comptime build.has_workspaces) {
@@ -9336,11 +9384,6 @@ pub fn focusMasterOrFirst() void {
 ///
 /// tiling_index is the slot captured before the failed tiling.removeWindow so
 /// the window is re-inserted at its original position rather than appended.
-// [#15] `inline` removed — the function has branching conditional logic and
-// is called only on the rare buffer-full error path; bloating callers with an
-// inlined copy is not justified.
-// [#1] tiling_index parameter added so rollback uses addWindowAtFilteredIndex
-// instead of addWindow, preserving the window's original tiling position.
 fn rollbackMinimize(win: u32, tiling_index: ?usize, fs_ws: ?u8, saved_fs: ?core.WindowGeometry) void {
     if (core.config.tiling.enabled) {
         if (tiling_index) |ti|
@@ -9378,15 +9421,14 @@ pub fn minimizeWindow() void {
     if (g_len >= MAX_MINIMIZED) {
         debug.err("minimize: buffer full ({d} entries), cannot minimize 0x{x} -- rolling back",
             .{ MAX_MINIMIZED, win });
-        // [#1] pass tiling_index so rollback re-inserts at the original slot.
+        // Pass tiling_index so rollback re-inserts at the original slot.
         rollbackMinimize(win, tiling_index, fs_ws_for_rollback, saved_fs);
         return;
     }
 
-    // [#12] Timestamp overflow guard.  g_next_timestamp is u64; wrapping to 0
-    // would silently corrupt LIFO/FIFO ordering.  In a WM session this is
-    // unreachable (~1.8e19 minimize operations), but an assertion makes any
-    // future regression loud rather than silent.
+    // Timestamp overflow guard: g_next_timestamp is u64; wrapping to 0 would silently
+    // corrupt LIFO/FIFO ordering. In a WM session this is unreachable (~1.8e19 operations),
+    // but the assertion makes any future regression loud rather than silent.
     std.debug.assert(g_next_timestamp != std.math.maxInt(u64));
 
     const ts = g_next_timestamp;
@@ -9402,10 +9444,10 @@ pub fn minimizeWindow() void {
     _ = xcb.xcb_grab_server(core.conn);
     utils.pushWindowOffscreen(core.conn, win);
 
-    // [#9] Try MRU history first so focus returns to the previously active
-    // window.  focusBestAvailable() walks the MRU list and focuses the first
-    // window for which the predicate returns true (i.e. not minimized).
-    // Only fall back to workspace insertion order when history is exhausted.
+    // Try MRU history first so focus returns to the previously active window.
+    // focusBestAvailable() walks the MRU list and focuses the first window for
+    // which the predicate returns true (i.e. not minimized). Falls back to
+    // workspace insertion order when history is exhausted.
     focus.focusBestAvailable(.tiling_operation, struct {
         fn visible(w: u32) bool { return !isMinimized(w); }
     }.visible, focusMasterOrFirst);
@@ -9426,12 +9468,8 @@ pub fn minimizeWindow() void {
 /// Precondition: the caller MUST remove the window's record from g_buf before
 /// calling this function.  This invariant is verified by assertion so any
 /// future call site that forgets the removal is caught immediately.
-// [#7] The former `restoreWindow` wrapper (inline fn, never called) has been
-// deleted.  All call sites either do the swap-remove inline (unminimize) or
-// batch-remove up-front (unminimizeAll) and then call this directly.
 fn restoreWindowImpl(win: u32, saved_fs: ?core.WindowGeometry, tiling_index: ?usize) void {
-    // [#3] Precondition check: the entry must have been removed before restore.
-    std.debug.assert(!isMinimized(win));
+    std.debug.assert(!isMinimized(win)); // enforce precondition: must be removed from g_buf first
 
     if (saved_fs) |geom| {
         // Fullscreen restore path: enterFullscreen owns its own server grab
@@ -9502,12 +9540,8 @@ pub fn unminimizeAll() void {
     const ws_idx = tracking.getCurrentWorkspace() orelse return;
 
     // Snapshot all records for this workspace before mutating the buffer.
-    // [#20] MinimizedRecord is used directly — a parallel local Entry struct
-    //       that duplicated its fields has been removed.
-    // [#4]  The snapshot array is sized to MAX_MINIMIZED, which is also the
-    //       buffer cap, so the snapshot can never overflow and no entries are
-    //       silently dropped.  The former local MAX = 128 constant has been
-    //       removed; it was larger than needed and lacked an overflow log.
+    // Uses MinimizedRecord directly — no parallel struct needed.
+    // Sized to MAX_MINIMIZED (the buffer cap) so the snapshot can never overflow.
     comptime std.debug.assert(MAX_MINIMIZED <= 256); // sanity: fits on the stack
     var snapshot: [MAX_MINIMIZED]MinimizedRecord = undefined;
     var count: usize = 0;
@@ -9543,10 +9577,9 @@ pub fn unminimizeAll() void {
     const fs_wins    = snapshot[plain_end..count];
 
     if (plain_wins.len > 0) {
-        // [#19] Focus target: the window with the highest timestamp (most
-        // recently minimized).  This gives unminimizeAll the same focus
-        // semantic as repeated LIFO unminimize calls.  Captured here because
-        // plain_wins is re-sorted below for tiling insertion order.
+        // Focus the most recently minimized window (highest timestamp) so
+        // unminimizeAll has the same focus semantics as repeated LIFO unminimize calls.
+        // Captured here because plain_wins is re-sorted below for tiling insertion order.
         var focus_target = plain_wins[0].win;
         var focus_ts     = plain_wins[0].entry.timestamp;
         for (plain_wins[1..]) |rec| {
@@ -9559,11 +9592,10 @@ pub fn unminimizeAll() void {
         _ = xcb.xcb_grab_server(core.conn);
 
         if (core.config.tiling.enabled) {
-            // [#2] Re-sort plain_wins by tiling_index ascending (nulls last)
-            // before inserting.  This is required for correctness: inserting a
-            // window at index i shifts every slot > i by 1, so lower-index
-            // windows must be inserted first to avoid displacing the target
-            // positions of higher-index windows.
+            // Re-sort plain_wins by tiling_index ascending (nulls last) before
+            // inserting. Required for correctness: inserting a window at index i
+            // shifts every slot > i by 1, so lower-index windows must be inserted
+            // first to avoid displacing the target positions of higher-index windows.
             //
             // Example (original list [X, A, B, Z], A at ti=1, B at ti=2):
             //   after minimizing: [X, Z]
@@ -9588,7 +9620,7 @@ pub fn unminimizeAll() void {
             for (plain_wins) |rec| window.restoreFloatGeom(rec.win);
         }
 
-        // [#19] Focus the most recently minimized plain window (see comment above).
+        // Focus the most recently minimized plain window (highest timestamp, as captured above).
         focus.setFocus(focus_target, .window_spawn);
 
         bar.redrawInsideGrab();
@@ -9611,7 +9643,6 @@ pub fn unminimizeAll() void {
 /// only allocator-dependent (!void) function from this module and lets bar.zig
 /// control its own memory strategy.  This function can be deleted once bar.zig
 /// has been migrated.
-// [#8]
 pub fn collectMinimizedIntoSet(
     set:       *std.AutoHashMapUnmanaged(u32, void),
     allocator: std.mem.Allocator,
@@ -9629,7 +9660,6 @@ pub fn untrackWindow(win: u32) void {
 }
 
 /// Called by workspaces.zig when a minimized window is moved to another workspace.
-// [#5] findInBuf replaces an open-coded scan.
 pub fn moveToWorkspace(win: u32, new_ws: u8) void {
     if (findInBuf(win)) |i| {
         g_buf[i].entry.workspace_idx = new_ws;
@@ -9746,6 +9776,7 @@ var g: PromptState = .{};
 
 // Public API
 
+/// Returns true when the prompt is currently active and accepting key input.
 pub fn isActive() bool { return g.is_active; }
 
 /// Returns true when the prompt is active in insert mode, signalling that
@@ -9775,6 +9806,8 @@ pub fn consumeRedrawRequest() bool {
     return pending;
 }
 
+/// Initialises all prompt state: vim engine, key-symbol table, completions, and history buffers.
+/// No-op if already initialised (idempotent).
 pub fn init(allocator: std.mem.Allocator, conn: *xcb.xcb_connection_t) !void {
     if (g.vim_state.buf.len != 0) return; // already initialised
     g.allocator   = allocator;
@@ -9787,6 +9820,7 @@ pub fn init(allocator: std.mem.Allocator, conn: *xcb.xcb_connection_t) !void {
         debug.warn("prompt: xcb_key_symbols_alloc failed — key input will not work", .{});
 }
 
+/// Frees all prompt resources and resets state to zero. Safe to call multiple times.
 pub fn deinit() void {
     if (g.key_syms) |ks| {
         xcb_key_symbols_free(ks);
@@ -9799,6 +9833,7 @@ pub fn deinit() void {
     g = .{};
 }
 
+/// Activates the prompt if inactive, or deactivates it if active.
 pub fn toggle() void {
     if (g.is_active) deactivate() else activate();
 }
@@ -9977,6 +10012,8 @@ pub fn draw(
 
 // Private — action handling
 
+/// Dispatches a vim.Action returned by a mode handler: executes/closes on spawn,
+/// resets and keeps open on spawn_keep, deactivates on deactivate, no-ops on none.
 fn handleAction(action: vim.Action) void {
     switch (action) {
         .none       => {},
@@ -10030,6 +10067,7 @@ fn resetVimEditing(vs: *vim.VimState) void {
     };
 }
 
+/// Grabs the keyboard, resets editing state, and marks the prompt active.
 fn activate() void {
     resetVimEditing(&g.vim_state); // reset editing state, preserve heap allocations
     g.ghost_len = 0;
@@ -10058,6 +10096,7 @@ fn activate() void {
     _ = xcb.xcb_flush(core.conn);
 }
 
+/// Ungrabs the keyboard and marks the prompt inactive.
 fn deactivate() void {
     g.is_active                   = false;
     g.vim_state.is_replaying_dot  = false;
@@ -10118,6 +10157,8 @@ fn loadCompletions() void {
 /// Binary search for the first `comp_names` entry >= prefix.
 /// Used as the starting point for prefix scanning in `updateGhost`,
 /// and as the basis for `compExistsExact`.
+/// Binary searches the sorted completion table for the first entry ≥ `prefix`.
+/// Returns the insertion index (0..comp_count) — use with compExistsExact for lookup.
 fn compLowerBound(prefix: []const u8) usize {
     var lo: usize = 0;
     var hi: usize = g.comp_count;
@@ -10193,6 +10234,8 @@ fn updateGhost() void {
 // Private — history
 
 /// Prepend `cmd` to the in-memory history ring (newest at index 0).
+/// Shifts all history entries right by one slot and inserts `cmd` at index 0 (newest first).
+/// Silently no-ops when cmd is empty or exceeds max_history_line.
 fn histPrepend(cmd: []const u8) void {
     if (cmd.len == 0 or cmd.len > max_history_line) return;
 
@@ -10387,6 +10430,8 @@ fn spawnCommand(cmd: []const u8) void {
 
 /// Binary search: first byte offset where `measureTextWidth(text[0..offset])
 /// >= target_px`.  Returns `text.len` if the whole string is narrower.
+/// Binary-searches `text` for the byte offset whose rendered width first reaches `target_px`.
+/// Used to map a pixel scroll offset back to a character boundary.
 fn textOffsetAtPx(dc: *drawing.DrawContext, text: []const u8, target_px: u16) usize {
     var lo: usize = 0;
     var hi: usize = text.len;
@@ -10815,8 +10860,7 @@ var g_slots: [MAX_WORKSPACES]?FullscreenInfo = @splat(null);
 const FloatSave = struct { win: u32, rect: utils.Rect };
 /// Floating window positions saved just before a fullscreen enter. Populated
 /// by saveFloatingWindowGeoms, consumed and cleared by restoreFloatingWindows.
-// Improvement #7: zero-initialised instead of `undefined` — eliminates the
-// footgun where a length-tracking bug would silently yield garbage data.
+/// Zero-initialised so a length-tracking bug never silently yields garbage data.
 var g_float_saves:     [MAX_FLOAT_SAVES]FloatSave = std.mem.zeroes([MAX_FLOAT_SAVES]FloatSave);
 var g_float_saves_len: usize = 0;
 
@@ -10824,9 +10868,7 @@ var g_float_saves_len: usize = 0;
 var g_net_wm_state:            xcb.xcb_atom_t = xcb.XCB_ATOM_NONE;
 var g_net_wm_state_fullscreen: xcb.xcb_atom_t = xcb.XCB_ATOM_NONE;
 
-// Improvement #6: single source of truth for the reset sequence shared by
-// init() and deinit(), so adding a new state field can never cause one to
-// fall out of sync with the other.
+/// Shared reset sequence used by both init() and deinit() to keep them in sync.
 fn resetState() void {
     g_slots           = @splat(null);
     g_float_saves_len = 0;
@@ -10864,8 +10906,6 @@ pub fn getForWorkspace(ws: u8) ?FullscreenInfo {
 }
 
 /// Returns the workspace index that `win` is fullscreen on, or null.
-// Improvement #14: reworded from "scans only the live slots, not the full
-// 256-entry array" — that claim is only true for typical workspace counts.
 /// Scans up to getWorkspaceCount() slots; O(workspace_count).
 pub fn workspaceFor(win: u32) ?u8 {
     const count = tracking.getWorkspaceCount();
@@ -10893,9 +10933,7 @@ pub fn moveRecord(src_ws: u8, dst_ws: u8) void {
     g_slots[dst_ws] = info;
 }
 
-// Improvement #13: clear() previously only zeroed g_slots, leaving a stale
-// g_float_saves_len that could cause restoreFloatingWindows to act on data
-// from a prior session if clear() was called mid-session.
+/// Resets all fullscreen state, including float saves. Safe to call mid-session.
 pub fn clear() void {
     g_slots           = @splat(null);
     g_float_saves_len = 0;
@@ -10909,9 +10947,7 @@ pub fn hasAnyFullscreen() bool {
 
 /// Iterate over occupied slots. Diagnostics only.
 /// Calls `cb` with (workspace_index, FullscreenInfo) for every non-null slot.
-// Improvement #9: accepts anytype instead of a bare fn pointer so the caller
-// can pass a struct with a `call` method that captures local state, or any
-// other callable — all resolved and inlined at compile time, zero cost.
+/// `cb` may be any callable — resolved and inlined at compile time, zero runtime cost.
 pub fn forEachFullscreen(cb: anytype) void {
     const count = tracking.getWorkspaceCount();
     for (g_slots[0..count], 0..) |slot, i|
@@ -10976,9 +11012,7 @@ fn fetchWindowGeom(win: u32) core.WindowGeometry {
         }
     }
 
-    // Improvement #10: screen dimensions are u16; dividing by a power of two
-    // on an unsigned value is unambiguous — the former @as(i32, ...) cast and
-    // @divTrunc were unnecessary and misleading.
+    // Screen dimensions are u16; dividing by a power of two is unambiguous on unsigned values.
     const default: core.WindowGeometry = .{
         .x            = @intCast(core.screen.width_in_pixels  / 4),
         .y            = @intCast(core.screen.height_in_pixels / 4),
@@ -10992,9 +11026,8 @@ fn fetchWindowGeom(win: u32) core.WindowGeometry {
     ) orelse return default;
     defer std.c.free(reply);
 
-    // Improvement #11: also reject zero-size geometry.  A window that has
-    // been mapped but not yet sized reports width=0/height=0; saving those
-    // dimensions and restoring them on exit would leave the window invisible.
+    // Also reject zero-size geometry: a window mapped but not yet sized reports
+    // width=0/height=0; saving and restoring those dimensions would leave it invisible.
     if (reply.*.x < constants.OFFSCREEN_SENTINEL_MIN or
         reply.*.y < constants.OFFSCREEN_SENTINEL_MIN or
         reply.*.width  == 0 or
@@ -11026,10 +11059,8 @@ fn saveFloatingWindowGeoms(skip_win: u32) void {
     var n:         usize = 0;
     var truncated: bool  = false;
 
-    // Improvement #3 (iteration) + #8 (truncation log):
-    // The collection step now uses forEachWindowOnCurrentWorkspace so the
-    // has_workspaces dispatch is not repeated here.  Overflow past
-    // MAX_FLOAT_SAVES is logged rather than silently dropped.
+    // Uses forEachWindowOnCurrentWorkspace for workspace dispatch.
+    // Overflow past MAX_FLOAT_SAVES is logged rather than silently dropped.
     const CollectCtx = struct {
         n:         *usize,
         truncated: *bool,
@@ -11093,10 +11124,7 @@ fn getSavedFloatGeom(win: u32) ?utils.Rect {
 fn restoreFloatingWindows(skip_win: u32) void {
     const pos = window.floatDefaultPos();
 
-    // Improvement #3: the has_workspaces dispatch now lives only in
-    // forEachWindowOnCurrentWorkspace.  We capture pos by its component
-    // values (x, y as u32) to avoid needing to know its concrete type inside
-    // the context struct declaration.
+    // Workspace dispatch is handled by forEachWindowOnCurrentWorkspace.
     const RestoreCtx = struct {
         pos_x: u32,
         pos_y: u32,
@@ -11141,13 +11169,6 @@ fn setEwmhFullscreenState(win: u32, is_fullscreen: bool) void {
 }
 
 // Commit helpers (XCB-only; caller owns grab/ungrab/flush)
-//
-// Improvement #4: `inline` removed from both helpers.  These functions contain
-// array loops, multiple conditional branches, several XCB calls, and a bar
-// state update (which may trigger a tiling retile).  Forcing inlining at every
-// call site produces larger binary output and misleads readers into thinking
-// these are trivial leaf functions.  The compiler will inline them on its own
-// if it determines the trade-off is worthwhile.
 
 fn enterFullscreenCommit(win: u32, ws: u8, geom: core.WindowGeometry) void {
     setForWorkspace(ws, .{
@@ -11155,8 +11176,7 @@ fn enterFullscreenCommit(win: u32, ws: u8, geom: core.WindowGeometry) void {
         .saved_geometry = geom,
     });
 
-    // Push every other window offscreen.
-    // Improvement #3: iteration dispatched through the shared helper.
+    // Push every other window offscreen; workspace dispatch is through the shared helper.
     const PushCtx = struct {
         fn call(_: @This(), w: u32) void {
             utils.pushWindowOffscreen(core.conn, w);
@@ -11271,24 +11291,13 @@ pub fn enterFullscreen(win: u32, saved_geom: ?core.WindowGeometry) void {
     utils.ungrabAndFlush(core.conn);
 }
 
-// Improvement #1 (bug fix) + #5 (uniform grab ownership):
+// toggle() design note:
 //
-// Former toggle() had two problems:
-//
-//   1. In the "switch fullscreen to a different window" branch,
-//      saveFloatingWindowGeoms() and fetchWindowGeom() were called INSIDE
-//      xcb_grab_server/xcb_ungrab_server.  Both functions issue
-//      xcb_get_geometry requests and then read their replies.  Those replies
-//      cannot be delivered while the same client holds the server grab —
-//      xcb_get_geometry_reply blocks indefinitely, hanging the WM.
-//      (saveFloatingWindowGeoms' own doc comment says "must be called BEFORE
-//      xcb_grab_server".)  Fix: hoist all round-trip work before the grab.
-//
-//   2. The not-fullscreen branch delegated to enterFullscreen(), which owns
-//      its own grab internally.  This made toggle() partly an orchestrator
-//      and partly a thin wrapper depending on runtime state.  All three
-//      branches now own the grab uniformly, calling enterFullscreenCommit
-//      (rather than enterFullscreen) in the not-fullscreen case.
+// All round-trip work (saveFloatingWindowGeoms, fetchWindowGeom) is hoisted
+// before xcb_grab_server because replies cannot be delivered while the same
+// client holds the server grab — xcb_get_geometry_reply would block indefinitely.
+// All three branches own the grab uniformly via enterFullscreenCommit /
+// exitFullscreenCommit rather than delegating to enterFullscreen().
 pub fn toggle() void {
     const win        = focus.getFocused() orelse return;
     const current_ws = tracking.getCurrentWorkspace() orelse return;
@@ -11337,7 +11346,7 @@ pub fn toggle() void {
 const std   = @import("std");
 const build = @import("build_options");
 
-// No Zig stdlibs wrap these AFAIK due to them being so low-level
+// libc bindings for fork/exec/wait — no Zig stdlib wrappers exist for these low-level syscalls.
 const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("sys/wait.h");
@@ -11377,6 +11386,7 @@ const prompt = if (build.has_bar and build.has_prompt) @import("prompt") else st
     pub fn toggle() void {}
 };
 
+/// Returns the workspaces.State pointer, or null when workspaces are compiled out.
 fn getWsState() ?*workspaces.State {
     return if (comptime build.has_workspaces) workspaces.getState() else null;
 }
@@ -11543,11 +11553,13 @@ pub fn handleButtonPress(event: *const xcb.xcb_button_press_event_t) void {
     releaseGrab(event.time);
 }
 
+/// Stops any active drag and updates the last event timestamp.
 pub fn handleButtonRelease(event: *const xcb.xcb_button_release_event_t) void {
     focus.setLastEventTime(event.time);
     if (drag.isDragging()) drag.stopDrag();
 }
 
+/// Forwards motion to the drag engine, clears focus suppression, and re-arms POINTER_MOTION_HINT.
 pub fn handleMotionNotify(event: *const xcb.xcb_motion_notify_event_t) void {
     focus.setLastEventTime(event.time);
 
@@ -11713,6 +11725,7 @@ fn forkIntermediate(exec_pipe_write: c_int, pid_pipe_write: c_int, cmd_z: [*:0]c
     std.process.exit(0);
 }
 
+/// Spawns `cmd` as a detached grandchild (double-fork) so the WM never accumulates zombie processes.
 fn executeShellCommand(cmd: []const u8) !void {
     // Snapshot the target workspace before any blocking syscalls.  In a
     // single-threaded WM the value cannot change while we are blocked in
@@ -11787,6 +11800,7 @@ fn executeShellCommand(cmd: []const u8) !void {
 
 // Diagnostics 
 
+/// Logs a full WM state snapshot at info level. Used for diagnostics only.
 fn dumpState() void {
     debug.info("========== STATE DUMP ==========", .{});
     debug.info("Focused:        {?x}", .{focus.getFocused()});
@@ -12479,6 +12493,7 @@ const State = struct {
 
 // Bar thread 
 
+/// Entry point for the bar render thread. Runs until a .quit work item is received.
 fn runBarThread(s: *State) void {
     var next_carousel_ns: u64 = 0;
 
@@ -12548,6 +12563,7 @@ inline fn spawnBarThread(s: *State) void {
     };
 }
 
+/// Signals the bar thread to quit and waits for it to exit.
 fn joinBarThread() void {
     gBar.channel.mutex.lock();
     gBar.channel.work = .{ .kind = .quit };
@@ -12575,6 +12591,8 @@ fn hasMinimizedSetChanged(
 /// `forced` must be read from `gBar.channel.pending_force_full_redraw` (and
 /// that flag cleared) by the caller before invoking this function, so that
 /// `captureStateIntoSlot` has no dependency on global channel state.
+/// Captures main-thread WM state into `snap`, diffing against `prev` to set dirty flags.
+/// `forced` overrides dirty checks and requests a full redraw.
 fn captureStateIntoSlot(s: *State, snap: *BarSnapshot, prev: *const BarSnapshot, forced: bool) !void {
     const allocator = s.render.allocator;
     snap.minimized_windows.clearRetainingCapacity();
