@@ -276,7 +276,7 @@ pub fn getIndicator(s: anytype) []const u8 {
 
 <file path="src/bar/modules/layout/layout.zig">
 //! Layout icon segment — shows the current tiling layout symbol.
-//! For the variants indicator see variantss.zig.
+//! For the variants indicator see variants.zig.
 
 const core    = @import("core");
 const types   = @import("types");
@@ -3767,12 +3767,12 @@ pub const CacheMap = struct {
 
     /// Returns a copy of the cached WindowData for `win`, or null if absent.
     pub fn get(self: *const CacheMap, win: u32) ?WindowData {
-        for (self.buf[0..self.len]) |e| if (e.win == win) return e.data;
+        for (self.buf[0..self.len]) |*e| if (e.win == win) return e.data;
         return null;
     }
 
     pub fn getPtr(self: *CacheMap, win: u32) ?*WindowData {
-        return if (self.findEntry(win)) |e| &e.data else null;
+        return if (findEntry(self, win)) |e| &e.data else null;
     }
 
     /// Swap-and-decrement removal: O(1), order-independent.
@@ -3785,11 +3785,8 @@ pub const CacheMap = struct {
         }
     }
 
-    /// Reset the cache to empty. The backing buffer is left untouched;
-    /// only the fill counter is zeroed. O(1).
-    pub fn clearRetainingCapacity(self: *CacheMap) void {
-        self.len = 0;
-    }
+    /// Reset the cache to empty: single counter write, O(1).
+    pub fn clearRetainingCapacity(self: *CacheMap) void { self.len = 0; }
 
     fn findEntry(self: *CacheMap, win: u32) ?*Entry {
         for (self.buf[0..self.len]) |*e| if (e.win == win) return e;
@@ -6181,26 +6178,14 @@ inline fn snapAxis(pos: i32, dim: i32, near: i32, far: i32, snap: i32) i32 {
     return pos;
 }
 
-/// Snap a single edge position toward one far boundary only.
-///
-/// Used during resize to snap the trailing (right / bottom) edge without
-/// also snapping toward the near boundary — near-edge snap during resize
-/// would collapse the window toward zero width / height, which is
-/// unintuitive and handled separately by the MIN_WINDOW_DIM clamp.
-inline fn snapFarEdge(edge: i32, boundary: i32, snap: i32) i32 {
+/// Snap a single edge position toward `boundary` if within `snap` pixels of it.
+/// Used for both near (left/top) and far (right/bottom) edges during resize.
+inline fn snapEdge(edge: i32, boundary: i32, snap: i32) i32 {
     if (snap > 0 and @abs(edge - boundary) < snap) return boundary;
     return edge;
 }
 
-/// Snap a single edge position toward one near boundary only.
-///
-/// Mirror of snapFarEdge, used when resizing from the left or top edge so
-/// that the leading edge snaps to the near work-area boundary without also
-/// snapping toward the far boundary.
-inline fn snapNearEdge(edge: i32, boundary: i32, snap: i32) i32 {
-    if (snap > 0 and @abs(edge - boundary) < snap) return boundary;
-    return edge;
-}
+// snapNearEdge and snapFarEdge are identical in implementation; use snapEdge directly.
 
 // Module state 
 
@@ -6371,17 +6356,17 @@ pub fn updateDrag(x: i16, y: i16) void {
             // Resolve which x/y origin and width/height to use.
             const new_left: i32 = switch (drag.resize_corner) {
                 .top_left, .bottom_left =>
-                    snapNearEdge(raw_left_m, wa.left, snap),
+                    snapEdge(raw_left_m, wa.left, snap),
                 .top_right, .bottom_right => raw_left,
             };
             const new_top: i32 = switch (drag.resize_corner) {
                 .top_left, .top_right =>
-                    snapNearEdge(raw_top_m, wa.top, snap),
+                    snapEdge(raw_top_m, wa.top, snap),
                 .bottom_left, .bottom_right => raw_top,
             };
             const new_right: i32 = switch (drag.resize_corner) {
                 .top_right, .bottom_right =>
-                    snapFarEdge(raw_right, wa.right, snap),
+                    snapEdge(raw_right, wa.right, snap),
                 .top_left, .bottom_left =>
                     // Right edge is fixed; derive from start so width shrinks
                     // correctly when the left edge moves right.
@@ -6389,7 +6374,7 @@ pub fn updateDrag(x: i16, y: i16) void {
             };
             const new_bottom: i32 = switch (drag.resize_corner) {
                 .bottom_left, .bottom_right =>
-                    snapFarEdge(raw_bottom, wa.bottom, snap),
+                    snapEdge(raw_bottom, wa.bottom, snap),
                 .top_left, .top_right =>
                     // Bottom edge is fixed.
                     start_y + start_h,
@@ -7338,18 +7323,23 @@ pub const scale_fallback = struct {
     }
 };
 
-/// Returns the current monotonic clock time in milliseconds.
+/// Returns the raw CLOCK_MONOTONIC timespec.
 /// Uses the VDSO-accelerated clock_gettime on supported kernels.
-pub fn monotonicMs() i64 {
+inline fn monotonicTs() std.os.linux.timespec {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return ts;
+}
+
+/// Returns the current monotonic clock time in milliseconds.
+pub fn monotonicMs() i64 {
+    const ts = monotonicTs();
     return ts.sec * 1000 + @divTrunc(ts.nsec, 1_000_000);
 }
 
 /// Returns the current monotonic clock time in nanoseconds.
 pub fn monotonicNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const ts = monotonicTs();
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
@@ -7911,21 +7901,6 @@ fn fetchProperty(
     if (len <= 0) return null;
     const value: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(reply));
     return try allocator.dupe(u8, value[0..@intCast(len)]);
-}
-
-/// Fetch the title of `window`, trying `_NET_WM_NAME` then `WM_NAME`.
-/// Makes blocking X11 round-trips — MAIN THREAD ONLY.
-fn fetchWindowTitle(
-    conn:      *xcb.xcb_connection_t,
-    window:    u32,
-    allocator: std.mem.Allocator,
-) !?[]const u8 {
-    atoms.ensureResolved();
-    if (atoms.net_wm_name) |na| {
-        if (try fetchProperty(conn, window, na, atoms.utf8AtomType(), allocator)) |t|
-            return t;
-    }
-    return try fetchProperty(conn, window, xcb.XCB_ATOM_WM_NAME, xcb.XCB_ATOM_STRING, allocator);
 }
 </file>
 
@@ -8991,8 +8966,7 @@ fn parseRules(allocator: std.mem.Allocator, doc: *const parser.Document, cfg: *t
 </file>
 
 <file path="src/core/main.zig">
-//! Hana's main loop.
-//! Entry point and orchestrator of all hana's module sub-systems //TODO: can this line description be improved?
+//! Hana's main loop — entry point and orchestrator of all subsystems.
 
 const std   = @import("std");
 const build = @import("build_options");
@@ -9140,8 +9114,7 @@ fn initGlobalState(conn: *xcb.xcb_connection_t) !void {
 }
 
 /// Tears down global WM state initialized by initGlobalState.
-fn deinitGlobalState() void {
-}
+fn deinitGlobalState() void {}
 </file>
 
 <file path="src/window/modules/minimize.zig">
@@ -12508,6 +12481,15 @@ const State = struct {
 
 fn runBarThread(s: *State) void {
     var next_carousel_ns: u64 = 0;
+
+    // Advance the carousel wake deadline by one frame interval.
+    const advanceCarouselTimer = struct {
+        inline fn f(next: *u64) void {
+            const now = utils.monotonicNs();
+            next.* = if (now >= next.*) now + carouselWakeNs else next.* +% carouselWakeNs;
+        }
+    }.f;
+
     while (true) {
         gBar.channel.mutex.lock();
 
@@ -12544,26 +12526,14 @@ fn runBarThread(s: *State) void {
             },
             .focusOnly => {
                 s.drawTitleOnly(work.focused_window);
-                if (carousel.isCarouselActive()) {
-                    const now_ns = utils.monotonicNs();
-                    if (now_ns >= next_carousel_ns) {
-                        next_carousel_ns = now_ns + carouselWakeNs;
-                    } else {
-                        next_carousel_ns +%= carouselWakeNs;
-                    }
-                }
+                if (carousel.isCarouselActive()) advanceCarouselTimer(&next_carousel_ns);
                 if (work.has_clock_tick) s.drawClockOnly();
             },
             .idle => {
                 // Carousel tick or clock-only wakeup with no focus change.
                 if (carousel.isCarouselActive()) {
                     s.drawTitleOnly(s.title_cache.focused_window);
-                    const now_ns = utils.monotonicNs();
-                    if (now_ns >= next_carousel_ns) {
-                        next_carousel_ns = now_ns + carouselWakeNs;
-                    } else {
-                        next_carousel_ns +%= carouselWakeNs;
-                    }
+                    advanceCarouselTimer(&next_carousel_ns);
                 }
                 if (work.has_clock_tick) s.drawClockOnly();
             },
@@ -12708,19 +12678,18 @@ fn prepareSnapshot() ?u1 {
 
 /// Posts a snapshot to the bar thread and returns immediately.
 pub fn submitDraw() void {
-    const idx = prepareSnapshot() orelse return;
+    if (prepareSnapshot() == null) return;
     gBar.channel.mutex.lock();
     defer gBar.channel.mutex.unlock();
     gBar.channel.write_index  ^= 1;
     gBar.channel.work.kind     = .snapReady;
     gBar.channel.work_ready.signal();
-    _ = idx;
 }
 
 /// Posts a snapshot to the bar thread and blocks until the draw completes.
 /// Use only inside or immediately before xcb_ungrab_server.
 pub fn submitDrawBlocking() void {
-    const idx = prepareSnapshot() orelse return;
+    if (prepareSnapshot() == null) return;
     gBar.channel.mutex.lock();
     defer gBar.channel.mutex.unlock();
     gBar.channel.write_index ^= 1;
@@ -12729,7 +12698,6 @@ pub fn submitDrawBlocking() void {
     gBar.channel.work_ready.signal();
     while (gBar.channel.draw_generation == gen_before)
         gBar.channel.draw_done.wait(&gBar.channel.mutex);
-    _ = idx;
 }
 
 // Window and atom setup 
@@ -13154,7 +13122,6 @@ fn retileAllWorkspaces() void {
 <file path="src/window/modules/tiling/tiling.zig">
 //! Tiling window manager
 //! Orchestrates layout, window tracking, and geometry/border cache. Delegates pixel arithmetic to the per-layout modules.
-//TODO: maybe pixel arithmetic could be centralized within tiling.zig?
 
 const std   = @import("std");
 const build = @import("build_options");
@@ -14095,17 +14062,20 @@ fn retile(screen: utils.Rect, for_ws: ?u8) void {
 
     const ctx = makeLayoutCtx(s);
 
+    // Hoist getState() once — used by resolve* and selectLayout below.
+    const wss = workspaces.getState();
+
     const saved_width = s.master_width;
     const saved_count = s.master_count;
     if (for_ws != null) {
-        s.master_width = resolveMasterWidth(s, workspaces.getState(), target_ws);
-        s.master_count = resolveMasterCount(s, workspaces.getState(), target_ws);
+        s.master_width = resolveMasterWidth(s, wss, target_ws);
+        s.master_count = resolveMasterCount(s, wss, target_ws);
     }
     defer s.master_width = saved_width;
     defer s.master_count = saved_count;
 
     invokeLayout(
-        selectLayout(s, workspaces.getState(), target_ws, core.config.tiling.global_layout),
+        selectLayout(s, wss, target_ws, core.config.tiling.global_layout),
         &ctx, s, ws_windows, screen,
     );
 
@@ -14337,7 +14307,7 @@ const fullscreen = if (build.has_fullscreen) @import("fullscreen") else struct {
 const minimize   = if (build.has_minimize) @import("minimize") else struct {};
 
 const tiling       = if (build.has_tiling) @import("tiling") else struct {};
-const TilingLayout = if (build.has_tiling) tiling.Layout else u0; //TODO: this and the previous line is confusing
+const TilingLayout = if (build.has_tiling) tiling.Layout else u0; // u0 sentinel when tiling is absent: zero-size, never stored
 
 const bar = if (build.has_bar) @import("bar") else struct {
     pub fn scheduleRedraw() void {}
@@ -14805,13 +14775,8 @@ pub fn moveWindowToAll(win: u32) void {
     pinToAllWorkspacesToggle(s, win);
 }
 
-/// `toggle_tag_all` action — Mod+Alt+5.
-/// Flips between "pinned to every workspace" and "current workspace only".
-pub fn tagToggleAll(win: u32) void {
-    const s = getState() orelse return;
-    if (isMinimized(win)) return;
-    pinToAllWorkspacesToggle(s, win);
-}
+/// `toggle_tag_all` action — Mod+Alt+5.  Identical semantics to moveWindowToAll.
+pub fn tagToggleAll(win: u32) void { moveWindowToAll(win); }
 
 /// Returns the workspace bitmask for `win`, or null if unmanaged.
 /// Delegates to tracking which owns the map.
@@ -15580,16 +15545,13 @@ pub fn setFocus(win: u32, reason: Reason) void {
 /// Safe to call when no confirm is pending (returns immediately).
 pub fn drainPendingConfirm() void {
     const cookie = state.confirm_cookie orelse return;
-    const win_opt = state.confirm_win;
+    const win    = state.confirm_win.?;  // invariant: always set/cleared together with confirm_cookie
     state.confirm_cookie = null;
     state.confirm_win    = null;
 
     // Reply must be consumed before any return to drain the XCB queue.
     const focus_reply = xcb.xcb_get_input_focus_reply(core.conn, cookie, null);
     defer if (focus_reply) |r| std.c.free(r);
-
-    std.debug.assert(win_opt != null);
-    const win = win_opt orelse return;
 
     if (!window.isValidManagedWindow(win)) return;
 
@@ -15954,7 +15916,7 @@ pub fn moveWindowPrev() void { moveWindowCycle(false); }
 
 <file path="src/window/window.zig">
 //! Window lifecycle
-//! Handles window mapping operations Map/unmap/destroy, configure, enter/button events, and per-window property caching.%
+//! Handles window mapping/unmapping/destroy, configure, enter/button events, and per-window property caching.
 
 const std   = @import("std");
 const build = @import("build_options");
@@ -16418,9 +16380,8 @@ pub fn supportsWMDeleteCached(conn: *xcb.xcb_connection_t, win: u32) bool {
 ///   which is imperceptible at human interaction speed and is pipelined on the
 ///   same Unix-domain socket as xcb_set_input_focus.
 pub fn sendWMTakeFocus(conn: *xcb.xcb_connection_t, win: u32, time: u32) void {
-    const protocols_atom  = utils.getAtomCached("WM_PROTOCOLS")    catch return;
-    const take_focus_atom = utils.getAtomCached("WM_TAKE_FOCUS")   catch return;
-    const wm_delete_atom  = utils.getAtomCached("WM_DELETE_WINDOW") catch return;
+    const protocols_atom  = utils.getAtomCached("WM_PROTOCOLS")  catch return;
+    const take_focus_atom = utils.getAtomCached("WM_TAKE_FOCUS") catch return;
 
     // Live WM_PROTOCOLS scan — same logic as DWM's sendevent.
     const proto_reply = xcb.xcb_get_property_reply(conn,
@@ -16430,12 +16391,14 @@ pub fn sendWMTakeFocus(conn: *xcb.xcb_connection_t, win: u32, time: u32) void {
     defer std.c.free(proto_reply);
     if (proto_reply.*.format != 32 or proto_reply.*.value_len == 0) return;
     const proto_list: [*]const u32 = @ptrCast(@alignCast(xcb.xcb_get_property_value(proto_reply)));
-    const props = scanProtocolAtoms(
-        proto_list[0..@intCast(proto_reply.*.value_len)],
-        take_focus_atom,
-        wm_delete_atom,
-    );
-    if (!props.take_focus) return;
+    const len: usize = @intCast(proto_reply.*.value_len);
+
+    // Only take_focus matters here — skip building the full WMProtocolsProps.
+    var has_take_focus = false;
+    for (proto_list[0..len]) |atom| {
+        if (atom == take_focus_atom) { has_take_focus = true; break; }
+    }
+    if (!has_take_focus) return;
 
     var event = std.mem.zeroes(xcb.xcb_client_message_event_t);
     event.response_type  = xcb.XCB_CLIENT_MESSAGE;
