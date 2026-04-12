@@ -1273,6 +1273,105 @@ pub fn parse(allocator: std.mem.Allocator, content: []const u8) !Document {
 }
 </file>
 
+<file path="src/core/modules/debug.zig">
+//! Debug logging and error helpers.
+//!
+//! All functions are no-ops in non-debug builds (controlled by the
+//! `enable_debug_logging` build option). Because they are `inline`, @src()
+//! inside each function captures the *call site* source location, so the
+//! module tag printed in log output is always the caller's file, not debug.zig.
+
+const std   = @import("std");
+const build = @import("build_options");
+
+
+/// Strips the directory and ".zig" extension from a source file path, returning a short module tag.
+fn moduleFromSrc(src: std.builtin.SourceLocation) []const u8 {
+    const basename = std.fs.path.basename(src.file);
+    return if (std.mem.endsWith(u8, basename, ".zig"))
+        basename[0 .. basename.len - 4]
+    else
+        basename;
+}
+
+inline fn debugEnabled() bool {
+    return build.enable_debug_logging;
+}
+
+/// Log output target — controls which std.log level (or print) to use.
+const LogKind = enum { err, warn, info, debug_log };
+
+/// Shared log emitter. `src` must come from @src() in the caller's inline
+/// wrapper so it reflects the actual call site, not this function's location.
+fn emitLog(src: std.builtin.SourceLocation, comptime kind: LogKind, comptime fmt: []const u8, args: anytype) void {
+    if (!debugEnabled()) return;
+    const module = moduleFromSrc(src);
+    switch (kind) {
+        .err       => std.log.err  ("[{s}] " ++ fmt, .{module} ++ args),
+        .warn      => std.log.warn ("[{s}] " ++ fmt, .{module} ++ args),
+        .debug_log => std.log.debug("[{s}] " ++ fmt, .{module} ++ args),
+        .info      => std.debug.print("\x1b[32m[{s}]\x1b[0m " ++ fmt ++ "\n", .{module} ++ args),
+    }
+}
+
+pub inline fn err  (comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .err,       fmt, args); }
+pub inline fn warn (comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .warn,      fmt, args); }
+pub inline fn info (comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .info,      fmt, args); }
+pub inline fn debug(comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .debug_log, fmt, args); }
+
+pub inline fn errIf  (condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .err,       fmt, args); }
+pub inline fn warnIf (condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .warn,      fmt, args); }
+pub inline fn infoIf (condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .info,      fmt, args); }
+pub inline fn debugIf(condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .debug_log, fmt, args); }
+
+/// Panics with a module-tagged message when `condition` is false, in debug builds only.
+pub inline fn assert(condition: bool, comptime message: []const u8) void {
+    if (!debugEnabled() or condition) return;
+    const module = moduleFromSrc(@src());
+    std.debug.panic("[{s}] Assertion failed: {s}", .{ module, message });
+}
+
+/// Emits a debug-level trace line showing the caller module and function name.
+pub inline fn trace(comptime func_name: []const u8) void {
+    if (!debugEnabled()) return;
+    const module = moduleFromSrc(@src());
+    std.log.debug("[{s}] -> {s}", .{ module, func_name });
+}
+
+/// Emits a debug-level line showing `label = value` with the caller's module tag.
+pub inline fn print(comptime label: []const u8, value: anytype) void {
+    if (!debugEnabled()) return;
+    const module = moduleFromSrc(@src());
+    std.log.debug("[{s}] {s} = {any}", .{ module, label, value });
+}
+
+/// Log a structured error with an optional window ID for context.
+/// Use this as the canonical pattern for operation failures:
+///
+///   s.windows.add(win) catch |e| { debug.logError(e, win); return; };
+///   StateManager.init(...) catch |e| { debug.logError(e, null); return; };
+pub inline fn logError(e: anyerror, window: ?u32) void {
+    if (!debugEnabled()) return;
+    if (window) |win| {
+        std.log.err("[error] Failed: {} (window: 0x{x})", .{ e, win });
+    } else {
+        std.log.err("[error] Failed: {}", .{e});
+    }
+}
+
+/// Log a warning for a best-effort operation whose failure is non-fatal.
+/// Use instead of bare `catch {}` when visibility in debug builds is useful:
+///
+///   self.geometry_cache.put(win, rect) catch |e| debug.warnOnErr(e, "geometry cache");
+///
+/// Truly inconsequential capacity hints (ensureTotalCapacity etc.) may keep
+/// bare `catch {}` — they produce no actionable diagnostic information.
+pub inline fn warnOnErr(e: anyerror, comptime context: []const u8) void {
+    if (!debugEnabled()) return;
+    std.log.warn("[warn] Best-effort op failed (" ++ context ++ "): {}", .{e});
+}
+</file>
+
 <file path="src/core/modules/scale.zig">
 //! DPI detection and scaling utilities for consistent bar appearance across display resolutions.
 
@@ -2047,105 +2146,6 @@ fn formatTime(buf: []u8, sec: i64) ![]const u8 {
 }
 </file>
 
-<file path="src/core/modules/debug.zig">
-//! Debug logging and error helpers.
-//!
-//! All functions are no-ops in non-debug builds (controlled by the
-//! `enable_debug_logging` build option). Because they are `inline`, @src()
-//! inside each function captures the *call site* source location, so the
-//! module tag printed in log output is always the caller's file, not debug.zig.
-
-const std   = @import("std");
-const build = @import("build_options");
-
-
-/// Strips the directory and ".zig" extension from a source file path, returning a short module tag.
-fn moduleFromSrc(src: std.builtin.SourceLocation) []const u8 {
-    const basename = std.fs.path.basename(src.file);
-    return if (std.mem.endsWith(u8, basename, ".zig"))
-        basename[0 .. basename.len - 4]
-    else
-        basename;
-}
-
-inline fn debugEnabled() bool {
-    return build.enable_debug_logging;
-}
-
-/// Log output target — controls which std.log level (or print) to use.
-const LogKind = enum { err, warn, info, debug_log };
-
-/// Shared log emitter. `src` must come from @src() in the caller's inline
-/// wrapper so it reflects the actual call site, not this function's location.
-fn emitLog(src: std.builtin.SourceLocation, comptime kind: LogKind, comptime fmt: []const u8, args: anytype) void {
-    if (!debugEnabled()) return;
-    const module = moduleFromSrc(src);
-    switch (kind) {
-        .err       => std.log.err  ("[{s}] " ++ fmt, .{module} ++ args),
-        .warn      => std.log.warn ("[{s}] " ++ fmt, .{module} ++ args),
-        .debug_log => std.log.debug("[{s}] " ++ fmt, .{module} ++ args),
-        .info      => std.debug.print("\x1b[32m[{s}]\x1b[0m " ++ fmt ++ "\n", .{module} ++ args),
-    }
-}
-
-pub inline fn err  (comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .err,       fmt, args); }
-pub inline fn warn (comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .warn,      fmt, args); }
-pub inline fn info (comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .info,      fmt, args); }
-pub inline fn debug(comptime fmt: []const u8, args: anytype) void { emitLog(@src(), .debug_log, fmt, args); }
-
-pub inline fn errIf  (condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .err,       fmt, args); }
-pub inline fn warnIf (condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .warn,      fmt, args); }
-pub inline fn infoIf (condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .info,      fmt, args); }
-pub inline fn debugIf(condition: bool, comptime fmt: []const u8, args: anytype) void { if (condition) emitLog(@src(), .debug_log, fmt, args); }
-
-/// Panics with a module-tagged message when `condition` is false, in debug builds only.
-pub inline fn assert(condition: bool, comptime message: []const u8) void {
-    if (!debugEnabled() or condition) return;
-    const module = moduleFromSrc(@src());
-    std.debug.panic("[{s}] Assertion failed: {s}", .{ module, message });
-}
-
-/// Emits a debug-level trace line showing the caller module and function name.
-pub inline fn trace(comptime func_name: []const u8) void {
-    if (!debugEnabled()) return;
-    const module = moduleFromSrc(@src());
-    std.log.debug("[{s}] -> {s}", .{ module, func_name });
-}
-
-/// Emits a debug-level line showing `label = value` with the caller's module tag.
-pub inline fn print(comptime label: []const u8, value: anytype) void {
-    if (!debugEnabled()) return;
-    const module = moduleFromSrc(@src());
-    std.log.debug("[{s}] {s} = {any}", .{ module, label, value });
-}
-
-/// Log a structured error with an optional window ID for context.
-/// Use this as the canonical pattern for operation failures:
-///
-///   s.windows.add(win) catch |e| { debug.logError(e, win); return; };
-///   StateManager.init(...) catch |e| { debug.logError(e, null); return; };
-pub inline fn logError(e: anyerror, window: ?u32) void {
-    if (!debugEnabled()) return;
-    if (window) |win| {
-        std.log.err("[error] Failed: {} (window: 0x{x})", .{ e, win });
-    } else {
-        std.log.err("[error] Failed: {}", .{e});
-    }
-}
-
-/// Log a warning for a best-effort operation whose failure is non-fatal.
-/// Use instead of bare `catch {}` when visibility in debug builds is useful:
-///
-///   self.geometry_cache.put(win, rect) catch |e| debug.warnOnErr(e, "geometry cache");
-///
-/// Truly inconsequential capacity hints (ensureTotalCapacity etc.) may keep
-/// bare `catch {}` — they produce no actionable diagnostic information.
-pub inline fn warnOnErr(e: anyerror, comptime context: []const u8) void {
-    if (!debugEnabled()) return;
-    std.log.warn("[warn] Best-effort op failed (" ++ context ++ "): {}", .{e});
-}
-</file>
-
 <file path="src/window/modules/tiling/modules/master.zig">
 //! Master-stack tiling layout.
 //!
@@ -2344,6 +2344,337 @@ inline fn calcInnerWidth(full_w: u16, left_margin: u16, right_margin: u16) u16 {
         full_w - left_margin - right_margin
     else
         constants.MIN_WINDOW_DIM;
+}
+</file>
+
+<file path="src/window/tracking.zig">
+//! Core window tracking
+//! Tracks windows' focus eligibility through workspaces.
+
+const std   = @import("std");
+const build = @import("build_options");
+
+const minimize = if (build.has_minimize) @import("minimize") else struct {};
+
+
+// Fixed-size ordered window list.
+// Used by Workspace in workspaces.zig; kept here so it can be imported from
+// the always-present tracking module rather than the optional workspaces module.
+
+pub const Tracking = struct {
+    /// Maximum windows tracked per workspace.
+    ///
+    /// This is a hard compile-time cap, not a tuneable.  Power users with many
+    /// terminal instances or IDE popups can hit it; windows beyond the cap are
+    /// silently dropped from tiling and workspace membership with an error log.
+    ///
+    /// If 64 is regularly too small for your workflow, increase this value and
+    /// rebuild.  The struct is stack-allocated, so the cost is 4 × capacity bytes
+    /// per Workspace instance — 256 bytes at capacity = 64, 512 bytes at 128.
+    const capacity = 64;
+
+    buf: [capacity]u32 = undefined,
+
+    /// Number of live entries in buf[0..len].  Never exceeds `capacity`.
+    /// The type u8 is wider than strictly necessary for a maximum of 64;
+    /// the invariant is enforced by prepareAdd rather than the type alone.
+    len: u8 = 0,
+
+    /// Returns true if `win` is present in the list.
+    pub fn contains(self: *const Tracking, win: u32) bool {
+        return std.mem.indexOfScalar(u32, self.buf[0..self.len], win) != null;
+    }
+
+    /// Returns true if `win` may be safely appended or prepended.
+    ///
+    /// When the list is already at capacity, logs an error and returns false.
+    /// The window is NOT tracked — it becomes invisible to tiling, workspace
+    /// membership queries, and focus history with no further diagnostic output.
+    ///
+    /// NOTE: reaching capacity is a runtime condition that can happen in
+    /// production (many terminal windows, browser instances, etc.).  It is
+    /// handled with a log message and graceful degradation rather than an
+    /// assertion, so ReleaseFast builds remain safe.
+    fn prepareAdd(self: *Tracking, win: u32) bool {
+        if (self.contains(win)) return false;
+        if (self.len >= capacity) {
+            std.log.err(
+                "tracking: workspace capacity ({d}) reached; window 0x{x} will not be tracked",
+                .{ capacity, win },
+            );
+            return false;
+        }
+        return true;
+    }
+
+    /// Append `win` to the back of the list.
+    /// No-op if `win` is already present or the list is at capacity (see prepareAdd).
+    pub fn add(self: *Tracking, win: u32) void {
+        if (!self.prepareAdd(win)) return;
+        self.buf[self.len] = win;
+        self.len += 1;
+    }
+
+    /// Prepend `win` to the front of the list, shifting all existing entries right.
+    /// No-op if `win` is already present or the list is at capacity (see prepareAdd).
+    pub fn addFront(self: *Tracking, win: u32) void {
+        if (!self.prepareAdd(win)) return;
+        std.mem.copyBackwards(u32, self.buf[1 .. self.len + 1], self.buf[0..self.len]);
+        self.buf[0] = win;
+        self.len += 1;
+    }
+
+    /// Remove `win`, preserving the relative order of all other entries.
+    ///
+    /// Use this variant when window order is semantically meaningful — e.g.
+    /// tiling layouts that derive master/slave assignment from positional index.
+    /// O(n) due to the left-shift of the tail.
+    ///
+    /// Returns true if `win` was found and removed, false if it was not present.
+    pub fn remove(self: *Tracking, win: u32) bool {
+        const i = std.mem.indexOfScalar(u32, self.buf[0..self.len], win) orelse return false;
+        std.mem.copyForwards(u32, self.buf[i .. self.len - 1], self.buf[i + 1 .. self.len]);
+        self.len -= 1;
+        return true;
+    }
+
+    /// Remove `win` by swapping it with the last entry.
+    ///
+    /// Use this variant only when window order is irrelevant — e.g. tag cleanup
+    /// where the workspace is being emptied, or when the tiling layout will be
+    /// fully recomputed immediately after.  Calling this when order matters will
+    /// silently corrupt positional semantics.
+    /// O(1) after the initial scan.
+    ///
+    /// Returns true if `win` was found and removed, false if it was not present.
+    pub fn removeUnordered(self: *Tracking, win: u32) bool {
+        const i = std.mem.indexOfScalar(u32, self.buf[0..self.len], win) orelse return false;
+        self.buf[i] = self.buf[self.len - 1];
+        self.len   -= 1;
+        return true;
+    }
+
+    /// Replace the current window order with `new_order`.
+    ///
+    /// Asserts (in debug/releaseSafe builds) that `new_order` contains exactly
+    /// the same set of windows as the current list — no additions, no removals,
+    /// no duplicates.
+    ///
+    /// Validation is O(n²) in debug/releaseSafe builds: each entry in new_order
+    /// requires an O(n) linear scan (indexOfScalar) to locate its slot in
+    /// self.buf, and the resulting slot index is marked in a stack-allocated
+    /// bitset to detect duplicates.  For capacity = 64 this is at most 4,096
+    /// operations — acceptable for debug-only code.  The bitset operations
+    /// themselves are O(1) per entry; the dominant cost is the linear scan.
+    pub fn reorder(self: *Tracking, new_order: []const u32) void {
+        std.debug.assert(new_order.len == self.len);
+
+        var seen = std.StaticBitSet(capacity).initEmpty();
+        for (new_order) |w| {
+            const slot = std.mem.indexOfScalar(u32, self.buf[0..self.len], w);
+            // Every entry in new_order must exist in the current list.
+            std.debug.assert(slot != null);
+            const idx = slot.?;
+            // No duplicates in new_order.
+            std.debug.assert(!seen.isSet(idx));
+            seen.set(idx);
+        }
+        @memcpy(self.buf[0..self.len], new_order);
+    }
+
+    /// Returns a slice of the live entries in insertion order.
+    pub fn items(self: *const Tracking) []const u32 {
+        return self.buf[0..self.len];
+    }
+};
+
+// Global tracking state
+
+var g_map:             ?std.AutoHashMap(u32, u64) = null;
+var g_current:         u8                         = 0;
+var g_workspace_count: usize                      = 1;
+
+/// Initialises the global window-tracking map. Must be called once at startup before any windows are managed.
+pub fn init(allocator: std.mem.Allocator) void {
+    var map = std.AutoHashMap(u32, u64).init(allocator);
+    // Pre-allocate to avoid early growth under normal workloads.  Failure is
+    // non-fatal: the map still works correctly, just with more incremental
+    // allocations as windows are added.
+    map.ensureTotalCapacity(32) catch |err| {
+        std.log.warn("tracking: initial map pre-allocation failed ({s}); map will grow on demand", .{@errorName(err)});
+    };
+    g_map = map;
+}
+
+/// Frees the global window-tracking map and resets all state.
+pub fn deinit() void {
+    if (g_map) |*m| m.deinit();
+    g_map             = null;
+    g_current         = 0;
+    g_workspace_count = 1;
+}
+
+/// Called by workspaces.init — tells tracking how many workspaces exist.
+pub fn setWorkspaceCount(count: usize) void { g_workspace_count = count; }
+
+/// Called by workspaces.switchTo so getCurrentWorkspace() stays correct
+/// even when code queries tracking directly.
+///
+/// Asserts that `ws` is within the valid range [0, g_workspace_count).
+/// An out-of-range value (e.g. from a config reload that reduces the workspace
+/// count) would cause isOnCurrentWorkspace to return false for all windows,
+/// making every window appear off-workspace and silently breaking focus.
+pub fn setCurrentWorkspace(ws: u8) void {
+    std.debug.assert(ws < g_workspace_count);
+    g_current = ws;
+}
+
+// Window registration
+
+/// Register `win` on workspace `ws`. No-op if already tracked.
+/// Called directly when workspaces.zig is absent; workspaces.moveWindowTo
+/// handles the full registration path (screen effects etc.) when present.
+pub fn registerWindow(win: u32, ws: u8) !void {
+    const map = &(g_map orelse return);
+    const gop = try map.getOrPut(win);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = @as(u64, 1) << @intCast(ws);
+    }
+}
+
+/// Remove `win` from the tracking map.
+/// When workspaces.zig is present it calls this after cleaning up workspace
+/// Tracking arrays; when absent, window.zig calls this directly.
+pub fn removeWindow(win: u32) void {
+    if (g_map) |*m| _ = m.remove(win);
+}
+
+/// Update the workspace bitmask for `win`.
+///
+/// Called by workspaces.zig for tag and move operations; keeps the hashmap in
+/// sync with workspace arrays.
+///
+/// Logs an error and returns (rather than asserting) if `win` is not in the map,
+/// because this is a runtime condition that can occur in production (e.g. a
+/// race between removeWindow and a delayed mask update), not a programmer
+/// invariant that can be checked at compile time.
+pub fn setWindowMask(win: u32, mask: u64) void {
+    std.debug.assert(mask != 0);
+    const m = &(g_map orelse return);
+    const p = m.getPtr(win) orelse {
+        std.log.err(
+            "tracking: setWindowMask called on unregistered window 0x{x}; registerWindow must precede any mask update",
+            .{win},
+        );
+        return;
+    };
+    p.* = mask;
+}
+
+// Query predicates
+
+/// Returns the workspace bitmask for `win`, or null if not tracked.
+///
+/// Uses a pointer capture (`|*m|`) to avoid copying the AutoHashMap header
+/// on every call, which would be unnecessary given that .get() only reads.
+pub inline fn getWindowWorkspaceMask(win: u32) ?u64 {
+    if (g_map) |*m| return m.get(win);
+    return null;
+}
+
+pub fn isManaged(win: u32) bool {
+    return getWindowWorkspaceMask(win) != null;
+}
+
+pub inline fn windowCount() usize {
+    return if (g_map) |m| m.count() else 0;
+}
+
+pub inline fn getCurrentWorkspace() ?u8 {
+    return if (g_map != null) g_current else null;
+}
+
+pub inline fn getWorkspaceCount() usize {
+    return g_workspace_count;
+}
+
+// Workspace bitmask helpers
+
+/// Returns a u64 bitmask with only the bit for `ws_idx` set.
+/// `ws_idx` may be any integer type; the cast is checked in debug builds.
+pub inline fn workspaceBit(ws_idx: anytype) u64 {
+    return @as(u64, 1) << @intCast(ws_idx);
+}
+
+/// Returns a bitmask with bits set for every workspace in [0, count).
+/// Returns all-ones for count ≥ 64 (saturating at the u64 width).
+pub inline fn allWorkspacesMask(count: usize) u64 {
+    if (count >= 64) return ~@as(u64, 0);
+    return (@as(u64, 1) << @intCast(count)) - 1;
+}
+
+// Comptime workspace label table
+
+/// Comptime-generated number strings "1".."20" for workspace display labels.
+/// Never heap-allocated; slices remain valid for the lifetime of the program.
+pub const WORKSPACE_LABELS: [20][]const u8 = blk: {
+    var labels: [20][]const u8 = undefined;
+    for (&labels, 1..) |*label, i| label.* = std.fmt.comptimePrint("{d}", .{i});
+    break :blk labels;
+};
+
+/// Returns the lowest-indexed workspace this window belongs to, or null if
+/// the window is not tracked.
+///
+/// For windows on exactly one workspace (the common case) this is the
+/// definitive workspace index.  For tag-based multi-workspace windows the
+/// bitmask may have several bits set; this function returns the lowest set bit,
+/// which is not necessarily the *current* workspace.  Callers that need
+/// "is this window on the current workspace?" should use
+/// isOnCurrentWorkspace(win) instead.
+pub inline fn getWorkspaceForWindow(win: u32) ?u8 {
+    const mask = getWindowWorkspaceMask(win) orelse return null;
+    return @intCast(@ctz(mask));
+}
+
+/// Returns a key iterator over every tracked window ID, or null if uninitialised.
+/// The map must not be modified while the iterator is live.
+pub fn allWindowsIterator() ?std.AutoHashMap(u32, u64).KeyIterator {
+    if (g_map) |*m| return m.keyIterator();
+    return null;
+}
+
+pub inline fn isWindowOnWorkspace(win: u32, ws_idx: u8) bool {
+    const mask = getWindowWorkspaceMask(win) orelse return false;
+    return (mask >> @intCast(ws_idx)) & 1 != 0;
+}
+
+pub inline fn isOnCurrentWorkspace(win: u32) bool {
+    return isWindowOnWorkspace(win, g_current);
+}
+
+/// Combined predicate for focus recovery: on current workspace and not minimized.
+/// Declared as a plain fn (not inline) so it can be passed as a *const fn(u32)bool.
+pub fn isOnCurrentWorkspaceAndVisible(win: u32) bool {
+    if (!isOnCurrentWorkspace(win)) return false;
+    return if (comptime build.has_minimize) !minimize.isMinimized(win) else true;
+}
+
+/// Returns the first non-minimized window in `windows`, or null if all are minimized.
+///
+/// This function lives in tracking.zig rather than minimize.zig because
+/// tracking.zig is always compiled in, making it safely importable by modules
+/// such as focus.zig that need to store a *const fn pointer without a comptime
+/// gate at every storage site.  minimize.zig is optional and cannot be
+/// unconditionally imported.
+///
+/// Declared as a plain fn so minimize.zig can store it as a function pointer.
+pub fn firstNonMinimized(windows: []const u32) ?u32 {
+    for (windows) |win| {
+        const is_min = if (comptime build.has_minimize) minimize.isMinimized(win) else false;
+        if (!is_min) return win;
+    }
+    return null;
 }
 </file>
 
@@ -2840,337 +3171,6 @@ pub fn run() !void {
 }
 </file>
 
-<file path="src/window/tracking.zig">
-//! Core window tracking
-//! Tracks windows' focus eligibility through workspaces.
-
-const std   = @import("std");
-const build = @import("build_options");
-
-const minimize = if (build.has_minimize) @import("minimize") else struct {};
-
-
-// Fixed-size ordered window list.
-// Used by Workspace in workspaces.zig; kept here so it can be imported from
-// the always-present tracking module rather than the optional workspaces module.
-
-pub const Tracking = struct {
-    /// Maximum windows tracked per workspace.
-    ///
-    /// This is a hard compile-time cap, not a tuneable.  Power users with many
-    /// terminal instances or IDE popups can hit it; windows beyond the cap are
-    /// silently dropped from tiling and workspace membership with an error log.
-    ///
-    /// If 64 is regularly too small for your workflow, increase this value and
-    /// rebuild.  The struct is stack-allocated, so the cost is 4 × capacity bytes
-    /// per Workspace instance — 256 bytes at capacity = 64, 512 bytes at 128.
-    const capacity = 64;
-
-    buf: [capacity]u32 = undefined,
-
-    /// Number of live entries in buf[0..len].  Never exceeds `capacity`.
-    /// The type u8 is wider than strictly necessary for a maximum of 64;
-    /// the invariant is enforced by prepareAdd rather than the type alone.
-    len: u8 = 0,
-
-    /// Returns true if `win` is present in the list.
-    pub fn contains(self: *const Tracking, win: u32) bool {
-        return std.mem.indexOfScalar(u32, self.buf[0..self.len], win) != null;
-    }
-
-    /// Returns true if `win` may be safely appended or prepended.
-    ///
-    /// When the list is already at capacity, logs an error and returns false.
-    /// The window is NOT tracked — it becomes invisible to tiling, workspace
-    /// membership queries, and focus history with no further diagnostic output.
-    ///
-    /// NOTE: reaching capacity is a runtime condition that can happen in
-    /// production (many terminal windows, browser instances, etc.).  It is
-    /// handled with a log message and graceful degradation rather than an
-    /// assertion, so ReleaseFast builds remain safe.
-    fn prepareAdd(self: *Tracking, win: u32) bool {
-        if (self.contains(win)) return false;
-        if (self.len >= capacity) {
-            std.log.err(
-                "tracking: workspace capacity ({d}) reached; window 0x{x} will not be tracked",
-                .{ capacity, win },
-            );
-            return false;
-        }
-        return true;
-    }
-
-    /// Append `win` to the back of the list.
-    /// No-op if `win` is already present or the list is at capacity (see prepareAdd).
-    pub fn add(self: *Tracking, win: u32) void {
-        if (!self.prepareAdd(win)) return;
-        self.buf[self.len] = win;
-        self.len += 1;
-    }
-
-    /// Prepend `win` to the front of the list, shifting all existing entries right.
-    /// No-op if `win` is already present or the list is at capacity (see prepareAdd).
-    pub fn addFront(self: *Tracking, win: u32) void {
-        if (!self.prepareAdd(win)) return;
-        std.mem.copyBackwards(u32, self.buf[1 .. self.len + 1], self.buf[0..self.len]);
-        self.buf[0] = win;
-        self.len += 1;
-    }
-
-    /// Remove `win`, preserving the relative order of all other entries.
-    ///
-    /// Use this variant when window order is semantically meaningful — e.g.
-    /// tiling layouts that derive master/slave assignment from positional index.
-    /// O(n) due to the left-shift of the tail.
-    ///
-    /// Returns true if `win` was found and removed, false if it was not present.
-    pub fn remove(self: *Tracking, win: u32) bool {
-        const i = std.mem.indexOfScalar(u32, self.buf[0..self.len], win) orelse return false;
-        std.mem.copyForwards(u32, self.buf[i .. self.len - 1], self.buf[i + 1 .. self.len]);
-        self.len -= 1;
-        return true;
-    }
-
-    /// Remove `win` by swapping it with the last entry.
-    ///
-    /// Use this variant only when window order is irrelevant — e.g. tag cleanup
-    /// where the workspace is being emptied, or when the tiling layout will be
-    /// fully recomputed immediately after.  Calling this when order matters will
-    /// silently corrupt positional semantics.
-    /// O(1) after the initial scan.
-    ///
-    /// Returns true if `win` was found and removed, false if it was not present.
-    pub fn removeUnordered(self: *Tracking, win: u32) bool {
-        const i = std.mem.indexOfScalar(u32, self.buf[0..self.len], win) orelse return false;
-        self.buf[i] = self.buf[self.len - 1];
-        self.len   -= 1;
-        return true;
-    }
-
-    /// Replace the current window order with `new_order`.
-    ///
-    /// Asserts (in debug/releaseSafe builds) that `new_order` contains exactly
-    /// the same set of windows as the current list — no additions, no removals,
-    /// no duplicates.
-    ///
-    /// Validation is O(n²) in debug/releaseSafe builds: each entry in new_order
-    /// requires an O(n) linear scan (indexOfScalar) to locate its slot in
-    /// self.buf, and the resulting slot index is marked in a stack-allocated
-    /// bitset to detect duplicates.  For capacity = 64 this is at most 4,096
-    /// operations — acceptable for debug-only code.  The bitset operations
-    /// themselves are O(1) per entry; the dominant cost is the linear scan.
-    pub fn reorder(self: *Tracking, new_order: []const u32) void {
-        std.debug.assert(new_order.len == self.len);
-
-        var seen = std.StaticBitSet(capacity).initEmpty();
-        for (new_order) |w| {
-            const slot = std.mem.indexOfScalar(u32, self.buf[0..self.len], w);
-            // Every entry in new_order must exist in the current list.
-            std.debug.assert(slot != null);
-            const idx = slot.?;
-            // No duplicates in new_order.
-            std.debug.assert(!seen.isSet(idx));
-            seen.set(idx);
-        }
-        @memcpy(self.buf[0..self.len], new_order);
-    }
-
-    /// Returns a slice of the live entries in insertion order.
-    pub fn items(self: *const Tracking) []const u32 {
-        return self.buf[0..self.len];
-    }
-};
-
-// Global tracking state
-
-var g_map:             ?std.AutoHashMap(u32, u64) = null;
-var g_current:         u8                         = 0;
-var g_workspace_count: usize                      = 1;
-
-/// Initialises the global window-tracking map. Must be called once at startup before any windows are managed.
-pub fn init(allocator: std.mem.Allocator) void {
-    var map = std.AutoHashMap(u32, u64).init(allocator);
-    // Pre-allocate to avoid early growth under normal workloads.  Failure is
-    // non-fatal: the map still works correctly, just with more incremental
-    // allocations as windows are added.
-    map.ensureTotalCapacity(32) catch |err| {
-        std.log.warn("tracking: initial map pre-allocation failed ({s}); map will grow on demand", .{@errorName(err)});
-    };
-    g_map = map;
-}
-
-/// Frees the global window-tracking map and resets all state.
-pub fn deinit() void {
-    if (g_map) |*m| m.deinit();
-    g_map             = null;
-    g_current         = 0;
-    g_workspace_count = 1;
-}
-
-/// Called by workspaces.init — tells tracking how many workspaces exist.
-pub fn setWorkspaceCount(count: usize) void { g_workspace_count = count; }
-
-/// Called by workspaces.switchTo so getCurrentWorkspace() stays correct
-/// even when code queries tracking directly.
-///
-/// Asserts that `ws` is within the valid range [0, g_workspace_count).
-/// An out-of-range value (e.g. from a config reload that reduces the workspace
-/// count) would cause isOnCurrentWorkspace to return false for all windows,
-/// making every window appear off-workspace and silently breaking focus.
-pub fn setCurrentWorkspace(ws: u8) void {
-    std.debug.assert(ws < g_workspace_count);
-    g_current = ws;
-}
-
-// Window registration
-
-/// Register `win` on workspace `ws`. No-op if already tracked.
-/// Called directly when workspaces.zig is absent; workspaces.moveWindowTo
-/// handles the full registration path (screen effects etc.) when present.
-pub fn registerWindow(win: u32, ws: u8) !void {
-    const map = &(g_map orelse return);
-    const gop = try map.getOrPut(win);
-    if (!gop.found_existing) {
-        gop.value_ptr.* = @as(u64, 1) << @intCast(ws);
-    }
-}
-
-/// Remove `win` from the tracking map.
-/// When workspaces.zig is present it calls this after cleaning up workspace
-/// Tracking arrays; when absent, window.zig calls this directly.
-pub fn removeWindow(win: u32) void {
-    if (g_map) |*m| _ = m.remove(win);
-}
-
-/// Update the workspace bitmask for `win`.
-///
-/// Called by workspaces.zig for tag and move operations; keeps the hashmap in
-/// sync with workspace arrays.
-///
-/// Logs an error and returns (rather than asserting) if `win` is not in the map,
-/// because this is a runtime condition that can occur in production (e.g. a
-/// race between removeWindow and a delayed mask update), not a programmer
-/// invariant that can be checked at compile time.
-pub fn setWindowMask(win: u32, mask: u64) void {
-    std.debug.assert(mask != 0);
-    const m = &(g_map orelse return);
-    const p = m.getPtr(win) orelse {
-        std.log.err(
-            "tracking: setWindowMask called on unregistered window 0x{x}; registerWindow must precede any mask update",
-            .{win},
-        );
-        return;
-    };
-    p.* = mask;
-}
-
-// Query predicates
-
-/// Returns the workspace bitmask for `win`, or null if not tracked.
-///
-/// Uses a pointer capture (`|*m|`) to avoid copying the AutoHashMap header
-/// on every call, which would be unnecessary given that .get() only reads.
-pub inline fn getWindowWorkspaceMask(win: u32) ?u64 {
-    if (g_map) |*m| return m.get(win);
-    return null;
-}
-
-pub fn isManaged(win: u32) bool {
-    return getWindowWorkspaceMask(win) != null;
-}
-
-pub inline fn windowCount() usize {
-    return if (g_map) |m| m.count() else 0;
-}
-
-pub inline fn getCurrentWorkspace() ?u8 {
-    return if (g_map != null) g_current else null;
-}
-
-pub inline fn getWorkspaceCount() usize {
-    return g_workspace_count;
-}
-
-// Workspace bitmask helpers
-
-/// Returns a u64 bitmask with only the bit for `ws_idx` set.
-/// `ws_idx` may be any integer type; the cast is checked in debug builds.
-pub inline fn workspaceBit(ws_idx: anytype) u64 {
-    return @as(u64, 1) << @intCast(ws_idx);
-}
-
-/// Returns a bitmask with bits set for every workspace in [0, count).
-/// Returns all-ones for count ≥ 64 (saturating at the u64 width).
-pub inline fn allWorkspacesMask(count: usize) u64 {
-    if (count >= 64) return ~@as(u64, 0);
-    return (@as(u64, 1) << @intCast(count)) - 1;
-}
-
-// Comptime workspace label table
-
-/// Comptime-generated number strings "1".."20" for workspace display labels.
-/// Never heap-allocated; slices remain valid for the lifetime of the program.
-pub const WORKSPACE_LABELS: [20][]const u8 = blk: {
-    var labels: [20][]const u8 = undefined;
-    for (&labels, 1..) |*label, i| label.* = std.fmt.comptimePrint("{d}", .{i});
-    break :blk labels;
-};
-
-/// Returns the lowest-indexed workspace this window belongs to, or null if
-/// the window is not tracked.
-///
-/// For windows on exactly one workspace (the common case) this is the
-/// definitive workspace index.  For tag-based multi-workspace windows the
-/// bitmask may have several bits set; this function returns the lowest set bit,
-/// which is not necessarily the *current* workspace.  Callers that need
-/// "is this window on the current workspace?" should use
-/// isOnCurrentWorkspace(win) instead.
-pub inline fn getWorkspaceForWindow(win: u32) ?u8 {
-    const mask = getWindowWorkspaceMask(win) orelse return null;
-    return @intCast(@ctz(mask));
-}
-
-/// Returns a key iterator over every tracked window ID, or null if uninitialised.
-/// The map must not be modified while the iterator is live.
-pub fn allWindowsIterator() ?std.AutoHashMap(u32, u64).KeyIterator {
-    if (g_map) |*m| return m.keyIterator();
-    return null;
-}
-
-pub inline fn isWindowOnWorkspace(win: u32, ws_idx: u8) bool {
-    const mask = getWindowWorkspaceMask(win) orelse return false;
-    return (mask >> @intCast(ws_idx)) & 1 != 0;
-}
-
-pub inline fn isOnCurrentWorkspace(win: u32) bool {
-    return isWindowOnWorkspace(win, g_current);
-}
-
-/// Combined predicate for focus recovery: on current workspace and not minimized.
-/// Declared as a plain fn (not inline) so it can be passed as a *const fn(u32)bool.
-pub fn isOnCurrentWorkspaceAndVisible(win: u32) bool {
-    if (!isOnCurrentWorkspace(win)) return false;
-    return if (comptime build.has_minimize) !minimize.isMinimized(win) else true;
-}
-
-/// Returns the first non-minimized window in `windows`, or null if all are minimized.
-///
-/// This function lives in tracking.zig rather than minimize.zig because
-/// tracking.zig is always compiled in, making it safely importable by modules
-/// such as focus.zig that need to store a *const fn pointer without a comptime
-/// gate at every storage site.  minimize.zig is optional and cannot be
-/// unconditionally imported.
-///
-/// Declared as a plain fn so minimize.zig can store it as a function pointer.
-pub fn firstNonMinimized(windows: []const u32) ?u32 {
-    for (windows) |win| {
-        const is_min = if (comptime build.has_minimize) minimize.isMinimized(win) else false;
-        if (!is_min) return win;
-    }
-    return null;
-}
-</file>
-
 <file path="src/config/types.zig">
 //! Config type definitions — structs, enums, and unions that model the WM configuration schema.
 //!
@@ -3624,6 +3624,76 @@ pub const Config = struct {
         }) |field| if (@field(self, field)) |s| a.free(s);
     }
 };
+</file>
+
+<file path="src/core/core.zig">
+//! Shared type definitions
+//! Includes XCB handles, geometry, input state, DPI info, and process-wide globals.
+
+const std = @import("std");
+
+const constants = @import("constants");
+
+// Importing xcb centrally and re-exporting it avoids repeated @cImport translation
+// on every compilation unit that needs XCB types.
+pub const xcb = @cImport(@cInclude("xcb/xcb.h"));
+
+
+// X11 keysym constants
+//
+// Centralised here so key-handling modules reference a single definition and cannot drift.
+// Values match <X11/keysymdef.h> (stable since X11R1).
+pub const XK_BackSpace : xcb.xcb_keysym_t = 0xff08;
+pub const XK_Tab       : xcb.xcb_keysym_t = 0xff09;
+pub const XK_Return    : xcb.xcb_keysym_t = 0xff0d;
+pub const XK_Escape    : xcb.xcb_keysym_t = 0xff1b;
+pub const XK_Delete    : xcb.xcb_keysym_t = 0xffff;
+pub const XK_Left      : xcb.xcb_keysym_t = 0xff51;
+pub const XK_Right     : xcb.xcb_keysym_t = 0xff53;
+pub const XK_Home      : xcb.xcb_keysym_t = 0xff50;
+pub const XK_End       : xcb.xcb_keysym_t = 0xff57;
+
+/// Type alias for XCB window identifiers.
+pub const WindowId = u32;
+
+// Core geometric type
+
+/// Geometry snapshot used by both fullscreen and minimize.
+pub const WindowGeometry = struct {
+    x:            i16,
+    y:            i16,
+    width:        u16,
+    height:       u16,
+    border_width: u16,
+};
+
+/// Focus suppression reason for context-aware behavior.
+pub const FocusSuppressReason = enum {
+    none,             // normal operation: focus follows mouse
+    window_spawn,     // just spawned a window: don't let cursor steal focus
+    tiling_operation, // currently tiling: don't let cursor steal focus
+};
+
+/// DPI and scale factor detected at startup.
+/// Defined here so all modules can reference the type via core without
+/// importing scale. scale.zig re-exports this and populates it via detect().
+pub const DpiInfo = struct {
+    dpi:          f32,
+    scale_factor: f32,
+
+    /// Constructs a DpiInfo from a raw DPI value, computing scale_factor relative to BASELINE_DPI.
+    pub fn fromDpi(dpi: f32) DpiInfo {
+        return .{ .dpi = dpi, .scale_factor = dpi / @import("constants").BASELINE_DPI };
+    }
+};
+
+// Process-wide singletons, initialised in main before any other module runs.
+pub var conn:     *xcb.xcb_connection_t   = undefined;
+pub var screen:   *xcb.xcb_screen_t       = undefined;
+pub var root:     WindowId                = undefined;
+pub var alloc:    std.mem.Allocator       = undefined;
+pub var config:   @import("types").Config = undefined;
+pub var dpi_info: DpiInfo                 = .{ .dpi = 96.0, .scale_factor = 1.0 };
 </file>
 
 <file path="src/bar/modules/prompt/vim.zig">
@@ -5823,76 +5893,6 @@ pub fn deinitFontCache(allocator: std.mem.Allocator) void {
 }
 </file>
 
-<file path="src/core/core.zig">
-//! Shared type definitions
-//! Includes XCB handles, geometry, input state, DPI info, and process-wide globals.
-
-const std = @import("std");
-
-const constants = @import("constants");
-
-// Importing xcb centrally and re-exporting it avoids repeated @cImport translation
-// on every compilation unit that needs XCB types.
-pub const xcb = @cImport(@cInclude("xcb/xcb.h"));
-
-
-// X11 keysym constants
-//
-// Centralised here so key-handling modules reference a single definition and cannot drift.
-// Values match <X11/keysymdef.h> (stable since X11R1).
-pub const XK_BackSpace : xcb.xcb_keysym_t = 0xff08;
-pub const XK_Tab       : xcb.xcb_keysym_t = 0xff09;
-pub const XK_Return    : xcb.xcb_keysym_t = 0xff0d;
-pub const XK_Escape    : xcb.xcb_keysym_t = 0xff1b;
-pub const XK_Delete    : xcb.xcb_keysym_t = 0xffff;
-pub const XK_Left      : xcb.xcb_keysym_t = 0xff51;
-pub const XK_Right     : xcb.xcb_keysym_t = 0xff53;
-pub const XK_Home      : xcb.xcb_keysym_t = 0xff50;
-pub const XK_End       : xcb.xcb_keysym_t = 0xff57;
-
-/// Type alias for XCB window identifiers.
-pub const WindowId = u32;
-
-// Core geometric type
-
-/// Geometry snapshot used by both fullscreen and minimize.
-pub const WindowGeometry = struct {
-    x:            i16,
-    y:            i16,
-    width:        u16,
-    height:       u16,
-    border_width: u16,
-};
-
-/// Focus suppression reason for context-aware behavior.
-pub const FocusSuppressReason = enum {
-    none,             // normal operation: focus follows mouse
-    window_spawn,     // just spawned a window: don't let cursor steal focus
-    tiling_operation, // currently tiling: don't let cursor steal focus
-};
-
-/// DPI and scale factor detected at startup.
-/// Defined here so all modules can reference the type via core without
-/// importing scale. scale.zig re-exports this and populates it via detect().
-pub const DpiInfo = struct {
-    dpi:          f32,
-    scale_factor: f32,
-
-    /// Constructs a DpiInfo from a raw DPI value, computing scale_factor relative to BASELINE_DPI.
-    pub fn fromDpi(dpi: f32) DpiInfo {
-        return .{ .dpi = dpi, .scale_factor = dpi / @import("constants").BASELINE_DPI };
-    }
-};
-
-// Process-wide singletons, initialised in main before any other module runs.
-pub var conn:     *xcb.xcb_connection_t   = undefined;
-pub var screen:   *xcb.xcb_screen_t       = undefined;
-pub var root:     WindowId                = undefined;
-pub var alloc:    std.mem.Allocator       = undefined;
-pub var config:   @import("types").Config = undefined;
-pub var dpi_info: DpiInfo                 = .{ .dpi = 96.0, .scale_factor = 1.0 };
-</file>
-
 <file path="src/core/main.zig">
 //! Hana's main loop — entry point and orchestrator of all subsystems.
 
@@ -6576,6 +6576,498 @@ pub fn stopDrag() void {
 }
 
 pub inline fn isDragging() bool { return g_state.drag.active; }
+</file>
+
+<file path="src/window/modules/minimize.zig">
+//! Window minimization: hide/restore with LIFO, FIFO, or bulk restore.
+//!
+//! Minimized windows remain in their workspace's window list so the bar
+//! keeps rendering them, but they are moved offscreen and removed from
+//! tiling so remaining windows fill the freed space.
+//!
+//! Three restore operations are provided, all scoped to the current workspace:
+//!   unminimize(.lifo): restore the most recently minimized window (stack pop)
+//!   unminimize(.fifo): restore the least recently minimized window (queue dequeue)
+//!   unminimizeAll:     restore every minimized window on the current workspace
+//!
+//! Ordering is tracked via a monotonic per-entry timestamp — no separate
+//! per-workspace ordered lists are maintained.  Scanning the fixed buffer for
+//! the LIFO/FIFO candidate is O(n), but n is always tiny in practice (typically
+//! < 10 minimized windows), the entire buffer fits in cache, and there is no
+//! hashing cost, no heap pointer chase, and no allocator dependency.
+//!
+//! Fullscreen interaction: minimizing a fullscreen window tears down the
+//! fullscreen state but saves the pre-fullscreen geometry. Restoring such
+//! a window puts it back into fullscreen exactly as it was.
+//!
+//! Thread safety: this module is NOT thread-safe.  All callers are assumed to
+//! run on the single WM event-loop thread.  No internal synchronization is
+//! performed; adding concurrent callers requires external locking.
+//!
+//! NOTE: init() is now infallible (void return).  Callers that previously did
+//! `try minimize.init()` should change the call to `minimize.init()`.
+
+const std   = @import("std");
+const build = @import("build_options");
+
+const core      = @import("core");
+    const xcb   = core.xcb;
+const utils     = @import("utils");
+const constants = @import("constants");
+
+const debug = @import("debug");
+
+const window   = @import("window");
+const tracking = @import("tracking");
+const focus    = @import("focus");
+
+const fullscreen  = if (build.has_fullscreen) @import("fullscreen") else struct {};
+const workspaces  = if (build.has_workspaces) @import("workspaces") else struct {
+    pub const Workspace = struct {};
+    pub fn getCurrentWorkspaceObject() ?*Workspace { return null; }
+};
+const WsWorkspace = workspaces.Workspace;
+
+const tiling = if (build.has_tiling) @import("tiling") else struct {
+    pub fn addWindow(_: u32) void {}
+    pub fn addWindowAtFilteredIndex(_: u32, _: usize) void {}
+    pub fn removeWindow(_: u32) void {}
+    pub fn retileCurrentWorkspace() void {}
+    pub fn getWindowFilteredIndex(_: u32) ?usize { return null; }
+};
+
+const bar = if (build.has_bar) @import("bar") else struct {
+    pub fn setBarState(_: anytype) void {}
+    pub fn redrawInsideGrab() void {}
+    pub fn scheduleRedraw() void {}
+};
+
+// Types 
+
+/// Per-window minimize record.
+const MinimizedEntry = struct {
+    saved_fs:      ?core.WindowGeometry, // non-null iff the window was fullscreen when minimized
+    /// The workspace this window belongs to.  A minimized window always lives
+    /// on exactly one workspace (multi-workspace tagging is handled by the
+    /// tagging system before minimize is called), so a simple index is clearer
+    /// and cheaper than a u64 bitmask that would only ever have one bit set.
+    workspace_idx: u8,
+    /// Monotonic counter assigned at minimize time. Higher = more recently minimized.
+    /// Used to implement LIFO (pop highest) and FIFO (pop lowest) without
+    /// maintaining a separate ordered list per workspace.
+    timestamp:     u64,
+    /// Position of this window in the workspace-filtered tiling list at the
+    /// moment it was minimized (index 0 = master).  Null when tiling was
+    /// disabled or the window was not tracked.  Used by restoreWindowImpl to
+    /// reinsert the window at its original layout slot instead of appending it.
+    tiling_index:  ?usize,
+};
+
+/// One slot in the fixed minimize buffer.
+const MinimizedRecord = struct {
+    win:   u32,
+    entry: MinimizedEntry,
+};
+
+// Module state 
+//
+// A fixed buffer replaces the former AutoHashMap(u32, MinimizedEntry).
+// Rationale: the realistic population is 0-10 minimized windows at any time.
+// For that range a HashMap costs more than it saves: hash computation on every
+// probe, a heap allocation up-front, a pointer chase to the backing store on
+// every access, and a failure path in init() that required callers to propagate
+// !void.  A flat array of MinimizedRecords is smaller, stays entirely in cache,
+// and has zero allocator involvement.  MAX_MINIMIZED = 32 is deliberately more
+// than any real session needs; hitting the cap produces a clear error message
+// and a rollback rather than silent corruption.
+
+const MAX_MINIMIZED: usize = 32;
+
+// Zero-initialised so slots beyond g_len never contain garbage, making any
+// accidental out-of-bounds read produce a predictable zero record.
+var g_buf:            [MAX_MINIMIZED]MinimizedRecord = std.mem.zeroes([MAX_MINIMIZED]MinimizedRecord);
+var g_len:            u8  = 0;
+var g_next_timestamp: u64 = 0;
+
+// Lifecycle 
+
+pub fn init() void {
+    g_len            = 0;
+    g_next_timestamp = 0;
+}
+
+/// Resets all minimize state. Mirrors init() exactly, making deinit→init idempotent.
+pub fn deinit() void {
+    g_len            = 0;
+    g_next_timestamp = 0;
+}
+
+// Low-level buffer helpers 
+
+/// Reinterpret a signed screen coordinate as the u32 value XCB expects on its
+/// wire format.  XCB takes geometry arguments as u32 but interprets them as i32
+/// Reinterprets a signed screen coordinate as the u32 XCB expects on the wire.
+/// XCB takes geometry arguments as u32 but interprets them as i32 internally;
+/// @bitCast is the correct conversion and this wrapper names the intent at every call site.
+inline fn toXcbCoord(v: i32) u32 { return @bitCast(v); }
+
+/// Returns the index into g_buf[0..g_len] of the slot whose .win field matches,
+/// or null if not found. Centralised so all buffer scans share one auditable implementation.
+fn findInBuf(win: u32) ?usize {
+    for (g_buf[0..g_len], 0..) |rec, i| {
+        if (rec.win == win) return i;
+    }
+    return null;
+}
+
+/// O(1) removal by swapping the target slot with the last entry.
+/// Buffer order is not semantically significant — LIFO/FIFO ordering is
+/// encoded in each entry's timestamp, not its position in the buffer.
+/// Returns true if the window was found and removed, false if absent (no-op).
+fn removeFromBuf(win: u32) bool {
+    if (findInBuf(win)) |i| {
+        g_len   -= 1;
+        g_buf[i] = g_buf[g_len];
+        return true;
+    }
+    return false;
+}
+
+// Public queries
+
+/// Returns true when `win` is currently minimized.
+pub fn isMinimized(win: u32) bool {
+    return findInBuf(win) != null;
+}
+
+/// Returns a read-only view of the current minimize buffer.
+/// Valid until the next minimizeWindow / unminimize / untrackWindow call.
+///
+/// Prefer this over collectMinimizedIntoSet() — it lets the caller (e.g. bar.zig) build
+/// whatever secondary structure it needs without introducing an allocator
+/// dependency into this module.
+pub fn minimizedSlice() []const MinimizedRecord {
+    return g_buf[0..g_len];
+}
+
+// Private helpers 
+
+/// Focus the first non-minimized window on the current workspace in insertion
+/// order, falling back to clearFocus() if none exists.
+///
+/// This is a last-resort fallback used after minimizeWindow has tried MRU
+/// history via focus.focusBestAvailable() and found nothing focusable.  It
+/// intentionally does not consult focus history — that is the caller's
+/// responsibility.
+///
+/// Named to distinguish it from focus.focusBestAvailable(), which walks MRU
+/// history with a caller-supplied visibility predicate.  This function uses
+/// workspace insertion order, which is not MRU, and is specifically suited
+/// to tiling fallback (master or first slave).
+///
+/// Internal fallback only — not part of the public contract. External callers
+/// should use focus.focusBestAvailable() directly.
+pub fn focusMasterOrFirst() void {
+    found: {
+        if (comptime build.has_workspaces) {
+            const ws  = workspaces.getCurrentWorkspaceObject() orelse break :found;
+            const win = tracking.firstNonMinimized(ws.windows.items()) orelse break :found;
+            focus.setFocus(win, .tiling_operation);
+            return;
+        }
+    }
+    focus.clearFocus();
+}
+
+// Minimize 
+
+/// Undo a partially-completed minimizeWindow call.
+/// Called only on buffer-full failure; restores tiling and fullscreen state so
+/// the window remains visible and the WM stays consistent.
+///
+/// tiling_index is the slot captured before the failed tiling.removeWindow so
+/// the window is re-inserted at its original position rather than appended.
+fn rollbackMinimize(win: u32, tiling_index: ?usize, fs_ws: ?u8, saved_fs: ?core.WindowGeometry) void {
+    if (core.config.tiling.enabled) {
+        if (tiling_index) |ti|
+            tiling.addWindowAtFilteredIndex(win, ti)
+        else
+            tiling.addWindow(win);
+        tiling.retileCurrentWorkspace();
+    }
+    if (comptime build.has_fullscreen) {
+        if (saved_fs) |geom| {
+            fullscreen.setForWorkspace(fs_ws.?, .{ .window = win, .saved_geometry = geom });
+        }
+    }
+}
+
+pub fn minimizeWindow() void {
+    const win    = focus.getFocused()             orelse return;
+    const ws_idx = tracking.getCurrentWorkspace() orelse return;
+
+    if (isMinimized(win)) return;
+
+    // Tear down fullscreen state if needed, saving geometry for later restore.
+    var saved_fs: ?core.WindowGeometry = null;
+    var fs_ws_for_rollback: ?u8 = null;
+    if (comptime build.has_fullscreen) fs_blk: {
+        const fs_ws = fullscreen.workspaceFor(win) orelse break :fs_blk;
+        saved_fs = fullscreen.getForWorkspace(fs_ws).?.saved_geometry;
+        fs_ws_for_rollback = fs_ws;
+        fullscreen.removeForWorkspace(fs_ws);
+    }
+    const tiling_index = tiling.getWindowFilteredIndex(win);
+
+    if (core.config.tiling.enabled) tiling.removeWindow(win);
+
+    if (g_len >= MAX_MINIMIZED) {
+        debug.err("minimize: buffer full ({d} entries), cannot minimize 0x{x} -- rolling back",
+            .{ MAX_MINIMIZED, win });
+        // Pass tiling_index so rollback re-inserts at the original slot.
+        rollbackMinimize(win, tiling_index, fs_ws_for_rollback, saved_fs);
+        return;
+    }
+
+    // Timestamp overflow guard: g_next_timestamp is u64; wrapping to 0 would silently
+    // corrupt LIFO/FIFO ordering. In a WM session this is unreachable (~1.8e19 operations),
+    // but the assertion makes any future regression loud rather than silent.
+    std.debug.assert(g_next_timestamp != std.math.maxInt(u64));
+
+    const ts = g_next_timestamp;
+    g_buf[g_len] = .{ .win = win, .entry = .{
+        .saved_fs      = saved_fs,
+        .workspace_idx = ws_idx,
+        .timestamp     = ts,
+        .tiling_index  = tiling_index,
+    }};
+    g_len           += 1;
+    g_next_timestamp = ts + 1;
+
+    _ = xcb.xcb_grab_server(core.conn);
+    utils.pushWindowOffscreen(core.conn, win);
+
+    // Try MRU history first so focus returns to the previously active window.
+    // focusBestAvailable() walks the MRU list and focuses the first window for
+    // which the predicate returns true (i.e. not minimized). Falls back to
+    // workspace insertion order when history is exhausted.
+    focus.focusBestAvailable(.tiling_operation, struct {
+        fn visible(w: u32) bool { return !isMinimized(w); }
+    }.visible, focusMasterOrFirst);
+
+    if (saved_fs != null) {
+        bar.setBarState(.show_fullscreen);
+    } else if (core.config.tiling.enabled) {
+        tiling.retileCurrentWorkspace();
+    }
+    bar.redrawInsideGrab();
+    utils.ungrabAndFlush(core.conn);
+}
+
+// Restore helpers 
+
+/// Restore a window that has already been removed from g_buf.
+///
+/// Precondition: the caller MUST remove the window's record from g_buf before
+/// calling this function.  This invariant is verified by assertion so any
+/// future call site that forgets the removal is caught immediately.
+fn restoreWindowImpl(win: u32, saved_fs: ?core.WindowGeometry, tiling_index: ?usize) void {
+    std.debug.assert(!isMinimized(win)); // enforce precondition: must be removed from g_buf first
+
+    if (saved_fs) |geom| {
+        // Fullscreen restore path: enterFullscreen owns its own server grab
+        // internally, so there is no enclosing grab here.  redrawInsideGrab
+        // must not be called outside a grab; scheduleRedraw is the correct
+        // choice — it queues the redraw to the next event-loop iteration after
+        // the grab has been fully released.
+        focus.setFocus(win, .window_spawn);
+        if (comptime build.has_fullscreen) fullscreen.enterFullscreen(win, geom);
+        bar.scheduleRedraw();
+        return;
+    }
+
+    _ = xcb.xcb_grab_server(core.conn);
+
+    if (core.config.tiling.enabled) {
+        // Restore at the original layout slot so a former master window
+        // returns to master and a former stack window returns to its row,
+        // rather than always being appended to the end of the list.
+        if (tiling_index) |ti|
+            tiling.addWindowAtFilteredIndex(win, ti)
+        else
+            tiling.addWindow(win);
+        tiling.retileCurrentWorkspace();
+    } else {
+        window.restoreFloatGeom(win);
+    }
+
+    focus.setFocus(win, .window_spawn);
+    bar.redrawInsideGrab();
+    utils.ungrabAndFlush(core.conn);
+}
+
+// Unminimize 
+
+pub const RestoreOrder = enum { lifo, fifo };
+
+pub fn unminimize(order: RestoreOrder) void {
+    const ws_idx = tracking.getCurrentWorkspace() orelse return;
+
+    // Resolve the comparison direction once — `order` is a loop-invariant
+    // constant and the branch would otherwise be re-evaluated on every entry.
+    const want_max = (order == .lifo);
+    var best_idx: ?usize = null;
+    var best_ts:  u64    = 0;
+
+    for (g_buf[0..g_len], 0..) |rec, i| {
+        if (rec.entry.workspace_idx != ws_idx) continue;
+        const ts = rec.entry.timestamp;
+        const better = best_idx == null or
+            (if (want_max) ts > best_ts else ts < best_ts);
+        if (better) { best_idx = i; best_ts = ts; }
+    }
+
+    const idx = best_idx orelse return;
+
+    // Capture before the swap-remove.
+    const win          = g_buf[idx].win;
+    const saved_fs     = g_buf[idx].entry.saved_fs;
+    const tiling_index = g_buf[idx].entry.tiling_index;
+    g_len      -= 1;
+    g_buf[idx]  = g_buf[g_len];
+
+    restoreWindowImpl(win, saved_fs, tiling_index);
+}
+
+pub fn unminimizeAll() void {
+    const ws_idx = tracking.getCurrentWorkspace() orelse return;
+
+    // Snapshot all records for this workspace before mutating the buffer.
+    // Uses MinimizedRecord directly — no parallel struct needed.
+    // Sized to MAX_MINIMIZED (the buffer cap) so the snapshot can never overflow.
+    comptime std.debug.assert(MAX_MINIMIZED <= 256); // sanity: fits on the stack
+    var snapshot: [MAX_MINIMIZED]MinimizedRecord = undefined;
+    var count: usize = 0;
+
+    for (g_buf[0..g_len]) |rec| {
+        if (rec.entry.workspace_idx != ws_idx) continue;
+        snapshot[count] = rec;
+        count += 1;
+    }
+    if (count == 0) return;
+
+    // Remove all collected windows from the buffer up-front, before any visual
+    // work begins.  removeFromBuf uses swap-with-last; since we are working from
+    // a separate snapshot the reordering it causes is safe.
+    for (snapshot[0..count]) |rec| _ = removeFromBuf(rec.win);
+
+    // Primary sort: plain windows before fullscreen ones (each fullscreen
+    // restore needs its own server grab and must run after the batch).
+    // Secondary sort: ascending timestamp (FIFO) within each group.
+    std.sort.pdq(MinimizedRecord, snapshot[0..count], {}, struct {
+        fn lt(_: void, a: MinimizedRecord, b: MinimizedRecord) bool {
+            const a_fs = a.entry.saved_fs != null;
+            const b_fs = b.entry.saved_fs != null;
+            if (a_fs != b_fs) return !a_fs; // plain before fullscreen
+            return a.entry.timestamp < b.entry.timestamp;
+        }
+    }.lt);
+
+    // After sorting, all plain entries precede all fullscreen entries.
+    var plain_end: usize = 0;
+    while (plain_end < count and snapshot[plain_end].entry.saved_fs == null) plain_end += 1;
+    const plain_wins = snapshot[0..plain_end];
+    const fs_wins    = snapshot[plain_end..count];
+
+    if (plain_wins.len > 0) {
+        // Focus the most recently minimized window (highest timestamp) so
+        // unminimizeAll has the same focus semantics as repeated LIFO unminimize calls.
+        // Captured here because plain_wins is re-sorted below for tiling insertion order.
+        var focus_target = plain_wins[0].win;
+        var focus_ts     = plain_wins[0].entry.timestamp;
+        for (plain_wins[1..]) |rec| {
+            if (rec.entry.timestamp > focus_ts) {
+                focus_target = rec.win;
+                focus_ts     = rec.entry.timestamp;
+            }
+        }
+
+        _ = xcb.xcb_grab_server(core.conn);
+
+        if (core.config.tiling.enabled) {
+            // Re-sort plain_wins by tiling_index ascending (nulls last) before
+            // inserting. Required for correctness: inserting a window at index i
+            // shifts every slot > i by 1, so lower-index windows must be inserted
+            // first to avoid displacing the target positions of higher-index windows.
+            //
+            // Example (original list [X, A, B, Z], A at ti=1, B at ti=2):
+            //   after minimizing: [X, Z]
+            //   insert A at 1 -> [X, A, Z]
+            //   insert B at 2 -> [X, A, B, Z]  ← correct
+            //   (reversed order would mis-place A at index 2)
+            std.sort.pdq(MinimizedRecord, plain_wins, {}, struct {
+                fn lt(_: void, a: MinimizedRecord, b: MinimizedRecord) bool {
+                    if (a.entry.tiling_index == null) return false; // nulls last
+                    if (b.entry.tiling_index == null) return true;
+                    return a.entry.tiling_index.? < b.entry.tiling_index.?;
+                }
+            }.lt);
+            for (plain_wins) |rec| {
+                if (rec.entry.tiling_index) |ti|
+                    tiling.addWindowAtFilteredIndex(rec.win, ti)
+                else
+                    tiling.addWindow(rec.win);
+            }
+            tiling.retileCurrentWorkspace();
+        } else {
+            for (plain_wins) |rec| window.restoreFloatGeom(rec.win);
+        }
+
+        // Focus the most recently minimized plain window (highest timestamp, as captured above).
+        focus.setFocus(focus_target, .window_spawn);
+
+        bar.redrawInsideGrab();
+        utils.ungrabAndFlush(core.conn);
+    }
+
+    // Each fullscreen window needs its own grab (enterFullscreen owns it).
+    // Entries were already removed from g_buf above, so restoreWindowImpl is
+    // called directly — no buffer lookup needed.
+    for (fs_wins) |rec| restoreWindowImpl(rec.win, rec.entry.saved_fs, rec.entry.tiling_index);
+}
+
+// Snapshot helpers 
+
+/// Fills `set` with the window ID of every currently minimized window.
+/// Called by bar.zig to build the per-frame BarSnapshot.minimized_set.
+/// The caller is responsible for clearing the set before this call.
+///
+/// Deprecated: prefer iterating minimizedSlice() directly.  That removes the
+/// only allocator-dependent (!void) function from this module and lets bar.zig
+/// control its own memory strategy.  This function can be deleted once bar.zig
+/// has been migrated.
+pub fn collectMinimizedIntoSet(
+    set:       *std.AutoHashMapUnmanaged(u32, void),
+    allocator: std.mem.Allocator,
+) !void {
+    try set.ensureTotalCapacity(allocator, g_len);
+    for (g_buf[0..g_len]) |rec|
+        set.putAssumeCapacity(rec.win, {});
+}
+
+// State maintenance 
+
+/// Called by window.zig on unmap/destroy to keep state coherent.
+pub fn untrackWindow(win: u32) void {
+    _ = removeFromBuf(win); // return value intentionally ignored here
+}
+
+/// Called by workspaces.zig when a minimized window is moved to another workspace.
+pub fn moveToWorkspace(win: u32, new_ws: u8) void {
+    if (findInBuf(win)) |i| {
+        g_buf[i].entry.workspace_idx = new_ws;
+    }
+}
 </file>
 
 <file path="src/config/config.zig">
@@ -7911,498 +8403,6 @@ pub fn fetchPropertyToBuffer(
     const value_ptr: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(reply));
     try buffer.appendSlice(allocator, value_ptr[0..@intCast(reply.*.value_len)]);
     return buffer.items;
-}
-</file>
-
-<file path="src/window/modules/minimize.zig">
-//! Window minimization: hide/restore with LIFO, FIFO, or bulk restore.
-//!
-//! Minimized windows remain in their workspace's window list so the bar
-//! keeps rendering them, but they are moved offscreen and removed from
-//! tiling so remaining windows fill the freed space.
-//!
-//! Three restore operations are provided, all scoped to the current workspace:
-//!   unminimize(.lifo): restore the most recently minimized window (stack pop)
-//!   unminimize(.fifo): restore the least recently minimized window (queue dequeue)
-//!   unminimizeAll:     restore every minimized window on the current workspace
-//!
-//! Ordering is tracked via a monotonic per-entry timestamp — no separate
-//! per-workspace ordered lists are maintained.  Scanning the fixed buffer for
-//! the LIFO/FIFO candidate is O(n), but n is always tiny in practice (typically
-//! < 10 minimized windows), the entire buffer fits in cache, and there is no
-//! hashing cost, no heap pointer chase, and no allocator dependency.
-//!
-//! Fullscreen interaction: minimizing a fullscreen window tears down the
-//! fullscreen state but saves the pre-fullscreen geometry. Restoring such
-//! a window puts it back into fullscreen exactly as it was.
-//!
-//! Thread safety: this module is NOT thread-safe.  All callers are assumed to
-//! run on the single WM event-loop thread.  No internal synchronization is
-//! performed; adding concurrent callers requires external locking.
-//!
-//! NOTE: init() is now infallible (void return).  Callers that previously did
-//! `try minimize.init()` should change the call to `minimize.init()`.
-
-const std   = @import("std");
-const build = @import("build_options");
-
-const core      = @import("core");
-    const xcb   = core.xcb;
-const utils     = @import("utils");
-const constants = @import("constants");
-
-const debug = @import("debug");
-
-const window   = @import("window");
-const tracking = @import("tracking");
-const focus    = @import("focus");
-
-const fullscreen  = if (build.has_fullscreen) @import("fullscreen") else struct {};
-const workspaces  = if (build.has_workspaces) @import("workspaces") else struct {
-    pub const Workspace = struct {};
-    pub fn getCurrentWorkspaceObject() ?*Workspace { return null; }
-};
-const WsWorkspace = workspaces.Workspace;
-
-const tiling = if (build.has_tiling) @import("tiling") else struct {
-    pub fn addWindow(_: u32) void {}
-    pub fn addWindowAtFilteredIndex(_: u32, _: usize) void {}
-    pub fn removeWindow(_: u32) void {}
-    pub fn retileCurrentWorkspace() void {}
-    pub fn getWindowFilteredIndex(_: u32) ?usize { return null; }
-};
-
-const bar = if (build.has_bar) @import("bar") else struct {
-    pub fn setBarState(_: anytype) void {}
-    pub fn redrawInsideGrab() void {}
-    pub fn scheduleRedraw() void {}
-};
-
-// Types 
-
-/// Per-window minimize record.
-const MinimizedEntry = struct {
-    saved_fs:      ?core.WindowGeometry, // non-null iff the window was fullscreen when minimized
-    /// The workspace this window belongs to.  A minimized window always lives
-    /// on exactly one workspace (multi-workspace tagging is handled by the
-    /// tagging system before minimize is called), so a simple index is clearer
-    /// and cheaper than a u64 bitmask that would only ever have one bit set.
-    workspace_idx: u8,
-    /// Monotonic counter assigned at minimize time. Higher = more recently minimized.
-    /// Used to implement LIFO (pop highest) and FIFO (pop lowest) without
-    /// maintaining a separate ordered list per workspace.
-    timestamp:     u64,
-    /// Position of this window in the workspace-filtered tiling list at the
-    /// moment it was minimized (index 0 = master).  Null when tiling was
-    /// disabled or the window was not tracked.  Used by restoreWindowImpl to
-    /// reinsert the window at its original layout slot instead of appending it.
-    tiling_index:  ?usize,
-};
-
-/// One slot in the fixed minimize buffer.
-const MinimizedRecord = struct {
-    win:   u32,
-    entry: MinimizedEntry,
-};
-
-// Module state 
-//
-// A fixed buffer replaces the former AutoHashMap(u32, MinimizedEntry).
-// Rationale: the realistic population is 0-10 minimized windows at any time.
-// For that range a HashMap costs more than it saves: hash computation on every
-// probe, a heap allocation up-front, a pointer chase to the backing store on
-// every access, and a failure path in init() that required callers to propagate
-// !void.  A flat array of MinimizedRecords is smaller, stays entirely in cache,
-// and has zero allocator involvement.  MAX_MINIMIZED = 32 is deliberately more
-// than any real session needs; hitting the cap produces a clear error message
-// and a rollback rather than silent corruption.
-
-const MAX_MINIMIZED: usize = 32;
-
-// Zero-initialised so slots beyond g_len never contain garbage, making any
-// accidental out-of-bounds read produce a predictable zero record.
-var g_buf:            [MAX_MINIMIZED]MinimizedRecord = std.mem.zeroes([MAX_MINIMIZED]MinimizedRecord);
-var g_len:            u8  = 0;
-var g_next_timestamp: u64 = 0;
-
-// Lifecycle 
-
-pub fn init() void {
-    g_len            = 0;
-    g_next_timestamp = 0;
-}
-
-/// Resets all minimize state. Mirrors init() exactly, making deinit→init idempotent.
-pub fn deinit() void {
-    g_len            = 0;
-    g_next_timestamp = 0;
-}
-
-// Low-level buffer helpers 
-
-/// Reinterpret a signed screen coordinate as the u32 value XCB expects on its
-/// wire format.  XCB takes geometry arguments as u32 but interprets them as i32
-/// Reinterprets a signed screen coordinate as the u32 XCB expects on the wire.
-/// XCB takes geometry arguments as u32 but interprets them as i32 internally;
-/// @bitCast is the correct conversion and this wrapper names the intent at every call site.
-inline fn toXcbCoord(v: i32) u32 { return @bitCast(v); }
-
-/// Returns the index into g_buf[0..g_len] of the slot whose .win field matches,
-/// or null if not found. Centralised so all buffer scans share one auditable implementation.
-fn findInBuf(win: u32) ?usize {
-    for (g_buf[0..g_len], 0..) |rec, i| {
-        if (rec.win == win) return i;
-    }
-    return null;
-}
-
-/// O(1) removal by swapping the target slot with the last entry.
-/// Buffer order is not semantically significant — LIFO/FIFO ordering is
-/// encoded in each entry's timestamp, not its position in the buffer.
-/// Returns true if the window was found and removed, false if absent (no-op).
-fn removeFromBuf(win: u32) bool {
-    if (findInBuf(win)) |i| {
-        g_len   -= 1;
-        g_buf[i] = g_buf[g_len];
-        return true;
-    }
-    return false;
-}
-
-// Public queries
-
-/// Returns true when `win` is currently minimized.
-pub fn isMinimized(win: u32) bool {
-    return findInBuf(win) != null;
-}
-
-/// Returns a read-only view of the current minimize buffer.
-/// Valid until the next minimizeWindow / unminimize / untrackWindow call.
-///
-/// Prefer this over collectMinimizedIntoSet() — it lets the caller (e.g. bar.zig) build
-/// whatever secondary structure it needs without introducing an allocator
-/// dependency into this module.
-pub fn minimizedSlice() []const MinimizedRecord {
-    return g_buf[0..g_len];
-}
-
-// Private helpers 
-
-/// Focus the first non-minimized window on the current workspace in insertion
-/// order, falling back to clearFocus() if none exists.
-///
-/// This is a last-resort fallback used after minimizeWindow has tried MRU
-/// history via focus.focusBestAvailable() and found nothing focusable.  It
-/// intentionally does not consult focus history — that is the caller's
-/// responsibility.
-///
-/// Named to distinguish it from focus.focusBestAvailable(), which walks MRU
-/// history with a caller-supplied visibility predicate.  This function uses
-/// workspace insertion order, which is not MRU, and is specifically suited
-/// to tiling fallback (master or first slave).
-///
-/// Internal fallback only — not part of the public contract. External callers
-/// should use focus.focusBestAvailable() directly.
-pub fn focusMasterOrFirst() void {
-    found: {
-        if (comptime build.has_workspaces) {
-            const ws  = workspaces.getCurrentWorkspaceObject() orelse break :found;
-            const win = tracking.firstNonMinimized(ws.windows.items()) orelse break :found;
-            focus.setFocus(win, .tiling_operation);
-            return;
-        }
-    }
-    focus.clearFocus();
-}
-
-// Minimize 
-
-/// Undo a partially-completed minimizeWindow call.
-/// Called only on buffer-full failure; restores tiling and fullscreen state so
-/// the window remains visible and the WM stays consistent.
-///
-/// tiling_index is the slot captured before the failed tiling.removeWindow so
-/// the window is re-inserted at its original position rather than appended.
-fn rollbackMinimize(win: u32, tiling_index: ?usize, fs_ws: ?u8, saved_fs: ?core.WindowGeometry) void {
-    if (core.config.tiling.enabled) {
-        if (tiling_index) |ti|
-            tiling.addWindowAtFilteredIndex(win, ti)
-        else
-            tiling.addWindow(win);
-        tiling.retileCurrentWorkspace();
-    }
-    if (comptime build.has_fullscreen) {
-        if (saved_fs) |geom| {
-            fullscreen.setForWorkspace(fs_ws.?, .{ .window = win, .saved_geometry = geom });
-        }
-    }
-}
-
-pub fn minimizeWindow() void {
-    const win    = focus.getFocused()             orelse return;
-    const ws_idx = tracking.getCurrentWorkspace() orelse return;
-
-    if (isMinimized(win)) return;
-
-    // Tear down fullscreen state if needed, saving geometry for later restore.
-    var saved_fs: ?core.WindowGeometry = null;
-    var fs_ws_for_rollback: ?u8 = null;
-    if (comptime build.has_fullscreen) fs_blk: {
-        const fs_ws = fullscreen.workspaceFor(win) orelse break :fs_blk;
-        saved_fs = fullscreen.getForWorkspace(fs_ws).?.saved_geometry;
-        fs_ws_for_rollback = fs_ws;
-        fullscreen.removeForWorkspace(fs_ws);
-    }
-    const tiling_index = tiling.getWindowFilteredIndex(win);
-
-    if (core.config.tiling.enabled) tiling.removeWindow(win);
-
-    if (g_len >= MAX_MINIMIZED) {
-        debug.err("minimize: buffer full ({d} entries), cannot minimize 0x{x} -- rolling back",
-            .{ MAX_MINIMIZED, win });
-        // Pass tiling_index so rollback re-inserts at the original slot.
-        rollbackMinimize(win, tiling_index, fs_ws_for_rollback, saved_fs);
-        return;
-    }
-
-    // Timestamp overflow guard: g_next_timestamp is u64; wrapping to 0 would silently
-    // corrupt LIFO/FIFO ordering. In a WM session this is unreachable (~1.8e19 operations),
-    // but the assertion makes any future regression loud rather than silent.
-    std.debug.assert(g_next_timestamp != std.math.maxInt(u64));
-
-    const ts = g_next_timestamp;
-    g_buf[g_len] = .{ .win = win, .entry = .{
-        .saved_fs      = saved_fs,
-        .workspace_idx = ws_idx,
-        .timestamp     = ts,
-        .tiling_index  = tiling_index,
-    }};
-    g_len           += 1;
-    g_next_timestamp = ts + 1;
-
-    _ = xcb.xcb_grab_server(core.conn);
-    utils.pushWindowOffscreen(core.conn, win);
-
-    // Try MRU history first so focus returns to the previously active window.
-    // focusBestAvailable() walks the MRU list and focuses the first window for
-    // which the predicate returns true (i.e. not minimized). Falls back to
-    // workspace insertion order when history is exhausted.
-    focus.focusBestAvailable(.tiling_operation, struct {
-        fn visible(w: u32) bool { return !isMinimized(w); }
-    }.visible, focusMasterOrFirst);
-
-    if (saved_fs != null) {
-        bar.setBarState(.show_fullscreen);
-    } else if (core.config.tiling.enabled) {
-        tiling.retileCurrentWorkspace();
-    }
-    bar.redrawInsideGrab();
-    utils.ungrabAndFlush(core.conn);
-}
-
-// Restore helpers 
-
-/// Restore a window that has already been removed from g_buf.
-///
-/// Precondition: the caller MUST remove the window's record from g_buf before
-/// calling this function.  This invariant is verified by assertion so any
-/// future call site that forgets the removal is caught immediately.
-fn restoreWindowImpl(win: u32, saved_fs: ?core.WindowGeometry, tiling_index: ?usize) void {
-    std.debug.assert(!isMinimized(win)); // enforce precondition: must be removed from g_buf first
-
-    if (saved_fs) |geom| {
-        // Fullscreen restore path: enterFullscreen owns its own server grab
-        // internally, so there is no enclosing grab here.  redrawInsideGrab
-        // must not be called outside a grab; scheduleRedraw is the correct
-        // choice — it queues the redraw to the next event-loop iteration after
-        // the grab has been fully released.
-        focus.setFocus(win, .window_spawn);
-        if (comptime build.has_fullscreen) fullscreen.enterFullscreen(win, geom);
-        bar.scheduleRedraw();
-        return;
-    }
-
-    _ = xcb.xcb_grab_server(core.conn);
-
-    if (core.config.tiling.enabled) {
-        // Restore at the original layout slot so a former master window
-        // returns to master and a former stack window returns to its row,
-        // rather than always being appended to the end of the list.
-        if (tiling_index) |ti|
-            tiling.addWindowAtFilteredIndex(win, ti)
-        else
-            tiling.addWindow(win);
-        tiling.retileCurrentWorkspace();
-    } else {
-        window.restoreFloatGeom(win);
-    }
-
-    focus.setFocus(win, .window_spawn);
-    bar.redrawInsideGrab();
-    utils.ungrabAndFlush(core.conn);
-}
-
-// Unminimize 
-
-pub const RestoreOrder = enum { lifo, fifo };
-
-pub fn unminimize(order: RestoreOrder) void {
-    const ws_idx = tracking.getCurrentWorkspace() orelse return;
-
-    // Resolve the comparison direction once — `order` is a loop-invariant
-    // constant and the branch would otherwise be re-evaluated on every entry.
-    const want_max = (order == .lifo);
-    var best_idx: ?usize = null;
-    var best_ts:  u64    = 0;
-
-    for (g_buf[0..g_len], 0..) |rec, i| {
-        if (rec.entry.workspace_idx != ws_idx) continue;
-        const ts = rec.entry.timestamp;
-        const better = best_idx == null or
-            (if (want_max) ts > best_ts else ts < best_ts);
-        if (better) { best_idx = i; best_ts = ts; }
-    }
-
-    const idx = best_idx orelse return;
-
-    // Capture before the swap-remove.
-    const win          = g_buf[idx].win;
-    const saved_fs     = g_buf[idx].entry.saved_fs;
-    const tiling_index = g_buf[idx].entry.tiling_index;
-    g_len      -= 1;
-    g_buf[idx]  = g_buf[g_len];
-
-    restoreWindowImpl(win, saved_fs, tiling_index);
-}
-
-pub fn unminimizeAll() void {
-    const ws_idx = tracking.getCurrentWorkspace() orelse return;
-
-    // Snapshot all records for this workspace before mutating the buffer.
-    // Uses MinimizedRecord directly — no parallel struct needed.
-    // Sized to MAX_MINIMIZED (the buffer cap) so the snapshot can never overflow.
-    comptime std.debug.assert(MAX_MINIMIZED <= 256); // sanity: fits on the stack
-    var snapshot: [MAX_MINIMIZED]MinimizedRecord = undefined;
-    var count: usize = 0;
-
-    for (g_buf[0..g_len]) |rec| {
-        if (rec.entry.workspace_idx != ws_idx) continue;
-        snapshot[count] = rec;
-        count += 1;
-    }
-    if (count == 0) return;
-
-    // Remove all collected windows from the buffer up-front, before any visual
-    // work begins.  removeFromBuf uses swap-with-last; since we are working from
-    // a separate snapshot the reordering it causes is safe.
-    for (snapshot[0..count]) |rec| _ = removeFromBuf(rec.win);
-
-    // Primary sort: plain windows before fullscreen ones (each fullscreen
-    // restore needs its own server grab and must run after the batch).
-    // Secondary sort: ascending timestamp (FIFO) within each group.
-    std.sort.pdq(MinimizedRecord, snapshot[0..count], {}, struct {
-        fn lt(_: void, a: MinimizedRecord, b: MinimizedRecord) bool {
-            const a_fs = a.entry.saved_fs != null;
-            const b_fs = b.entry.saved_fs != null;
-            if (a_fs != b_fs) return !a_fs; // plain before fullscreen
-            return a.entry.timestamp < b.entry.timestamp;
-        }
-    }.lt);
-
-    // After sorting, all plain entries precede all fullscreen entries.
-    var plain_end: usize = 0;
-    while (plain_end < count and snapshot[plain_end].entry.saved_fs == null) plain_end += 1;
-    const plain_wins = snapshot[0..plain_end];
-    const fs_wins    = snapshot[plain_end..count];
-
-    if (plain_wins.len > 0) {
-        // Focus the most recently minimized window (highest timestamp) so
-        // unminimizeAll has the same focus semantics as repeated LIFO unminimize calls.
-        // Captured here because plain_wins is re-sorted below for tiling insertion order.
-        var focus_target = plain_wins[0].win;
-        var focus_ts     = plain_wins[0].entry.timestamp;
-        for (plain_wins[1..]) |rec| {
-            if (rec.entry.timestamp > focus_ts) {
-                focus_target = rec.win;
-                focus_ts     = rec.entry.timestamp;
-            }
-        }
-
-        _ = xcb.xcb_grab_server(core.conn);
-
-        if (core.config.tiling.enabled) {
-            // Re-sort plain_wins by tiling_index ascending (nulls last) before
-            // inserting. Required for correctness: inserting a window at index i
-            // shifts every slot > i by 1, so lower-index windows must be inserted
-            // first to avoid displacing the target positions of higher-index windows.
-            //
-            // Example (original list [X, A, B, Z], A at ti=1, B at ti=2):
-            //   after minimizing: [X, Z]
-            //   insert A at 1 -> [X, A, Z]
-            //   insert B at 2 -> [X, A, B, Z]  ← correct
-            //   (reversed order would mis-place A at index 2)
-            std.sort.pdq(MinimizedRecord, plain_wins, {}, struct {
-                fn lt(_: void, a: MinimizedRecord, b: MinimizedRecord) bool {
-                    if (a.entry.tiling_index == null) return false; // nulls last
-                    if (b.entry.tiling_index == null) return true;
-                    return a.entry.tiling_index.? < b.entry.tiling_index.?;
-                }
-            }.lt);
-            for (plain_wins) |rec| {
-                if (rec.entry.tiling_index) |ti|
-                    tiling.addWindowAtFilteredIndex(rec.win, ti)
-                else
-                    tiling.addWindow(rec.win);
-            }
-            tiling.retileCurrentWorkspace();
-        } else {
-            for (plain_wins) |rec| window.restoreFloatGeom(rec.win);
-        }
-
-        // Focus the most recently minimized plain window (highest timestamp, as captured above).
-        focus.setFocus(focus_target, .window_spawn);
-
-        bar.redrawInsideGrab();
-        utils.ungrabAndFlush(core.conn);
-    }
-
-    // Each fullscreen window needs its own grab (enterFullscreen owns it).
-    // Entries were already removed from g_buf above, so restoreWindowImpl is
-    // called directly — no buffer lookup needed.
-    for (fs_wins) |rec| restoreWindowImpl(rec.win, rec.entry.saved_fs, rec.entry.tiling_index);
-}
-
-// Snapshot helpers 
-
-/// Fills `set` with the window ID of every currently minimized window.
-/// Called by bar.zig to build the per-frame BarSnapshot.minimized_set.
-/// The caller is responsible for clearing the set before this call.
-///
-/// Deprecated: prefer iterating minimizedSlice() directly.  That removes the
-/// only allocator-dependent (!void) function from this module and lets bar.zig
-/// control its own memory strategy.  This function can be deleted once bar.zig
-/// has been migrated.
-pub fn collectMinimizedIntoSet(
-    set:       *std.AutoHashMapUnmanaged(u32, void),
-    allocator: std.mem.Allocator,
-) !void {
-    try set.ensureTotalCapacity(allocator, g_len);
-    for (g_buf[0..g_len]) |rec|
-        set.putAssumeCapacity(rec.win, {});
-}
-
-// State maintenance 
-
-/// Called by window.zig on unmap/destroy to keep state coherent.
-pub fn untrackWindow(win: u32) void {
-    _ = removeFromBuf(win); // return value intentionally ignored here
-}
-
-/// Called by workspaces.zig when a minimized window is moved to another workspace.
-pub fn moveToWorkspace(win: u32, new_ws: u8) void {
-    if (findInBuf(win)) |i| {
-        g_buf[i].entry.workspace_idx = new_ws;
-    }
 }
 </file>
 
@@ -10458,1129 +10458,6 @@ pub fn toggle() void {
 }
 </file>
 
-<file path="src/bar/modules/prompt/prompt.zig">
-//! Prompt bar segment
-//! In-line command runner embedded in hana's bar
-//!
-//! Borrows title's segment space to integrate seamlessly into the bar
-
-const std   = @import("std");
-const build = @import("build_options");
-
-const core    = @import("core");
-    const xcb = core.xcb;
-
-const types = @import("types");
-
-const drawing = @import("drawing");
-const title   = if (build.has_title) @import("title") else struct {};
-const vim     = if (build.has_vim)   @import("vim")   else struct {
-    const VimState = struct {};
-};
-
-const debug = @import("debug");
-
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("stdlib.h");
-    @cInclude("stdio.h");
-    @cInclude("fcntl.h");
-    @cInclude("dirent.h");
-    @cInclude("sys/stat.h");
-    @cInclude("sys/wait.h");
-});
-
-
-// xcb-keysyms bindings (link with -lxcb-keysyms)
-
-const xcb_key_symbols_t = opaque {};
-
-extern fn xcb_key_symbols_alloc(conn: *xcb.xcb_connection_t) ?*xcb_key_symbols_t;
-extern fn xcb_key_symbols_free(syms: *xcb_key_symbols_t) void;
-extern fn xcb_key_symbols_get_keysym(syms: *xcb_key_symbols_t, code: xcb.xcb_keycode_t, col: c_int) xcb.xcb_keysym_t;
-
-// Module constants
-
-/// Minimum pixel width of the block cursor; ensures it is visible even on
-/// the narrowest glyphs (e.g. '.', '!').
-const min_cursor_px: u16 = 8;
-/// Width of the blinking caret in insert mode (pixels).
-const cursor_width: u16 = 1;
-/// Cursor blink half-period: cursor is visible for this many ms, then
-/// invisible for the same duration.
-const cursor_blink_ms: u64 = 300;
-/// Vertical padding (pixels) above and below the block cursor / selection.
-const cursor_v_pad: u16 = 2;
-/// Maximum number of executable names stored for tab-completion.
-const max_completions: usize = 4096;
-/// Maximum byte length of a single completion entry (executable name).
-const max_completion_len: usize = 64;
-/// Maximum number of history entries kept in memory.
-const max_history: usize = 512;
-/// Maximum byte length of a single history entry.
-const max_history_line: usize = vim.default_max_input;
-
-// Module state
-
-/// All mutable state owned by this module.
-const PromptState = struct {
-    is_active: bool         = false,
-    vim_state: vim.VimState = .{},
-
-    allocator: std.mem.Allocator = undefined,
-
-    key_syms:        ?*xcb_key_symbols_t = null,
-    cached_prompt_w: ?u16                = null,
-    /// Cached pixel width of each mode label, indexed by `vim.Mode` integer value.
-    cached_mode_w:   [4]?u16             = .{ null, null, null, null },
-
-    // PATH completion
-    comp_names: []u8  = &.{},
-    comp_count: usize = 0,
-
-    /// Ghost text: the completion suffix shown dimmed after the cursor.
-    ghost_buf: []u8  = &.{},
-    ghost_len: usize = 0,
-    /// True when the current buffer contains at least one space.  Maintained
-    /// incrementally so `updateGhost` can skip a full buffer scan on every call.
-    has_space: bool = false,
-
-    is_blink_visible: bool = true,
-
-    /// Caret geometry cached after the first insert-mode draw.  Font metrics
-    /// and bar height are constant between reloads, so these never need clearing.
-    cached_caret_top: ?u16 = null,
-    cached_caret_h:   ?u16 = null,
-
-    // Command history (newest at index 0)
-    hist_entries: []u8  = &.{},
-    hist_count:   usize = 0,
-    is_hist_loaded: bool = false,
-
-    /// Set by key handlers, `activate`, and `deactivate` to notify the bar
-    /// that the prompt area needs to be redrawn.  Consumed (read + cleared)
-    /// by `consumeRedrawRequest` to avoid a circular import between prompt ↔ bar.
-    redraw_pending: bool = false,
-};
-
-var g: PromptState = .{};
-
-// Public API
-
-/// Returns true when the prompt is currently active and accepting key input.
-pub fn isActive() bool { return g.is_active; }
-
-/// Returns true when the prompt is active in insert mode, signalling that
-/// the bar should schedule a periodic redraw for the cursor blink animation.
-
-/// Returns the milliseconds until the next blink toggle, or -1 if the cursor
-/// blink animation is not running.  Pass this (combined with the clock timeout)
-/// to poll() so the event loop wakes up exactly when a redraw is needed.
-pub fn blinkPollTimeoutMs() i32 {
-    if (!g.is_active) return -1;
-    if (g.vim_state.mode == .insert or vim.colonInput(&g.vim_state) != null)
-        return cursor_blink_ms;
-    return -1;
-}
-
-/// Toggle cursor visibility.  Call from the event loop on every poll timeout
-/// where `blinkPollTimeoutMs() >= 0`, then trigger a bar redraw.
-pub fn blinkTick() void {
-    g.is_blink_visible = !g.is_blink_visible;
-}
-
-/// Returns true and clears the flag if a prompt-driven redraw is outstanding.
-/// Call once per event-loop iteration from `bar.updateIfDirty`.
-pub fn consumeRedrawRequest() bool {
-    const pending = g.redraw_pending;
-    g.redraw_pending = false;
-    return pending;
-}
-
-/// Initialises all prompt state: vim engine, key-symbol table, completions, and history buffers.
-/// No-op if already initialised (idempotent).
-pub fn init(allocator: std.mem.Allocator, conn: *xcb.xcb_connection_t) !void {
-    if (g.vim_state.buf.len != 0) return; // already initialised
-    g.allocator   = allocator;
-    g.vim_state   = try vim.VimState.init(allocator, vim.default_max_input, vim.default_undo_max);
-    g.comp_names  = try allocator.alloc(u8, (max_completion_len + 1) * max_completions);
-    g.ghost_buf   = try allocator.alloc(u8, max_completion_len);
-    g.hist_entries= try allocator.alloc(u8, (max_history_line + 1) * max_history);
-    g.key_syms    = xcb_key_symbols_alloc(conn);
-    if (g.key_syms == null)
-        debug.warn("prompt: xcb_key_symbols_alloc failed — key input will not work", .{});
-}
-
-/// Frees all prompt resources and resets state to zero. Safe to call multiple times.
-pub fn deinit() void {
-    if (g.key_syms) |ks| {
-        xcb_key_symbols_free(ks);
-        g.key_syms = null;
-    }
-    if (g.vim_state.buf.len != 0) g.vim_state.deinit();
-    if (g.hist_entries.len  != 0) g.allocator.free(g.hist_entries);
-    if (g.ghost_buf.len     != 0) g.allocator.free(g.ghost_buf);
-    if (g.comp_names.len    != 0) g.allocator.free(g.comp_names);
-    g = .{};
-}
-
-/// Activates the prompt if inactive, or deactivates it if active.
-pub fn toggle() void {
-    if (g.is_active) deactivate() else activate();
-}
-
-/// Complete key-event routing entry point called by `input.zig`.
-///
-/// Owns all prompt-specific routing decisions so `input.zig` stays free of
-/// prompt internals:
-///   - Returns false immediately when the prompt is inactive, so the caller
-///     falls through to normal keybind dispatch without any special-casing.
-///   - If the key is bound to `close_window`, dismisses the prompt instead of
-///     closing a window or silently swallowing the keystroke.
-///   - Otherwise delegates to `handleKeyPress` which processes the raw key.
-///
-/// `bound_action` is whatever the keybind map resolved for this key; pass
-/// `state.map.get(key)` directly — null is fine when there is no binding.
-pub fn handlePromptKeypress(
-    event:        *const xcb.xcb_key_press_event_t,
-    bound_action: ?*const types.Action,
-) bool {
-    if (!g.is_active) return false;
-
-    // When the mod key (Super) is held and a WM action is bound to this key,
-    // let the normal keybind dispatcher handle it so the user can perform
-    // window-manager operations without cancelling the prompt.
-    // The close_window action is still routed through here so it dismisses
-    // the prompt rather than closing a window.
-    if (event.state & xcb.XCB_MOD_MASK_4 != 0) {
-        if (bound_action) |action| {
-            if (action.* == .close_window) {
-                deactivate();
-                return true;
-            }
-            return false; // let WM dispatch execute the bind; prompt stays open
-        }
-    }
-
-    if (bound_action) |action| if (action.* == .close_window) {
-        deactivate();
-        return true;
-    };
-    return handleKeyPress(event);
-}
-
-/// Low-level key-press handler.  Called by `handlePromptKeypress` after all
-/// prompt-level routing decisions have been made.
-///
-/// Exposed as `pub` so the bar's legacy key dispatch path can call it
-/// directly when it has already confirmed the prompt is active.  Prefer
-/// `handlePromptKeypress` for new call sites.
-pub fn handleKeyPress(event: *const xcb.xcb_key_press_event_t) bool {
-    if (!g.is_active) return false;
-
-    // Only process XCB_KEY_PRESS events.  xcb_key_press_event_t and
-    // xcb_key_release_event_t share the same struct layout, so the event loop
-    // can (and sometimes does) cast a release event and dispatch it here.
-    //
-    // Without this guard the XCB_KEY_RELEASE for Escape is a fatal trap:
-    //   1. XCB_KEY_PRESS  (Escape): handleInsert switches mode to .normal ✓
-    //   2. XCB_KEY_RELEASE(Escape): handleNormal sees XK_Escape with a clean
-    //      pending (op=0, count=0) -> returns .deactivate -> prompt closes.
-    // The user then presses 'b' or an arrow key to start editing in normal
-    // mode, but the prompt is already gone — so those keys get the blame.
-    //
-    // Returning true (not false) for non-press events ensures the caller
-    // considers the event consumed and does not fall through to WM keybind
-    // dispatch for the release.
-    if (event.response_type & 0x7F != xcb.XCB_KEY_PRESS) return true;
-
-    const syms = g.key_syms orelse return false;
-
-    const shift_held = event.state & xcb.XCB_MOD_MASK_SHIFT   != 0;
-    const ctrl_held  = event.state & xcb.XCB_MOD_MASK_CONTROL != 0;
-    const col: c_int = if (shift_held) 1 else 0;
-    const sym        = xcb_key_symbols_get_keysym(syms, event.detail, col);
-
-    // Drop bare modifier key events (Shift, Ctrl, Alt, Super, Meta, Hyper …).
-    //
-    // XCB delivers a XCB_KEY_PRESS event for every key including modifiers, so
-    // pressing Shift before typing '$' or '^' fires a key event with keysym
-    // 0xFFE1/0xFFE2 (XK_Shift_L/R) before the '$'/'^' event arrives.  If that
-    // event reaches handleNormal it falls through to resetPendingCmd(), clearing
-    // any pending operator ('d', 'c', 'y') or accumulated count — which is why
-    // operator+motion sequences that require Shift (d$, d^, dW, dE, c$, y^,
-    // visual 3W, …) silently turn into bare cursor moves instead of edits.
-    //
-    // Modifier keysyms occupy the contiguous range 0xFFE1–0xFFEE; nothing in
-    // that band is a valid editing key (editing specials such as Escape/Return/
-    // BackSpace/Delete/Arrow/Home/End all live elsewhere in 0xFF00–0xFFFF).
-    if (sym >= 0xFFE0 and sym <= 0xFFEF) return true;
-
-    // Ctrl-modified keys
-    if (ctrl_held) {
-        const action   = vim.handleCtrl(&g.vim_state, sym);
-        const prev_len = g.vim_state.len;
-        handleAction(action);
-        if (g.vim_state.len != prev_len)
-            g.has_space = std.mem.indexOfScalar(u8, g.vim_state.buf[0..g.vim_state.len], ' ') != null;
-        g.redraw_pending = true;
-        return true;
-    }
-
-    // Tab: accept ghost completion
-    if (sym == vim.XK_Tab and g.vim_state.mode == .insert) {
-        const n_ghost: usize = if (g.ghost_len > 0 and g.vim_state.cursor == g.vim_state.len)
-            @min(g.ghost_len, g.vim_state.max_input - 1 - g.vim_state.len)
-        else 0;
-        if (n_ghost > 0) {
-            vim.insertSlice(&g.vim_state, g.ghost_buf[0..n_ghost]);
-            g.ghost_len = 0;
-        }
-        g.is_blink_visible = true;
-        g.redraw_pending   = true;
-        return true;
-    }
-
-    // Dispatch to mode handler
-    const action = switch (g.vim_state.mode) {
-        .insert  => vim.handleInsert(&g.vim_state, sym),
-        .normal  => vim.handleNormal(&g.vim_state, sym),
-        .visual  => vim.handleVisual(&g.vim_state, sym),
-        .replace => vim.handleReplace(&g.vim_state, sym),
-    };
-    const prev_len = g.vim_state.len;
-    handleAction(action);
-    if (g.vim_state.len != prev_len)
-        g.has_space = std.mem.indexOfScalar(u8, g.vim_state.buf[0..g.vim_state.len], ' ') != null;
-    updateGhost();
-    g.is_blink_visible = true;
-    g.redraw_pending   = true;
-    return true;
-}
-
-pub fn draw(
-    dc:                  *drawing.DrawContext,
-    config:              types.BarConfig,
-    height:              u16,
-    start_x:             u16,
-    width:               u16,
-    conn:                *xcb.xcb_connection_t,
-    focused_window:      ?u32,
-    focused_title:       []const u8,
-    minimized_title:     []const u8,
-    current_ws_wins:     []const u32,
-    minimized_set:       *const std.AutoHashMapUnmanaged(u32, void),
-    window_title_data:   []const u8,
-    window_title_ends:   []const u32,
-    cached_title:        *std.ArrayList(u8),
-    cached_title_window: *?u32,
-    title_invalidated:   bool,
-    allocator:           std.mem.Allocator,
-) !u16 {
-    if (!g.is_active) return title.draw(
-        .{
-            .dc      = dc,
-            .config  = config,
-            .height  = height,
-            .start_x = start_x,
-            .width   = width,
-            .conn    = conn,
-        },
-        .{
-            .focused_window    = focused_window,
-            .focused_title     = focused_title,
-            .minimized_title   = minimized_title,
-            .current_ws_wins   = current_ws_wins,
-            .minimized_set     = minimized_set,
-            .window_title_data = window_title_data,
-            .window_title_ends = window_title_ends,
-        },
-        .{
-            .cached_title        = cached_title,
-            .cached_title_window = cached_title_window,
-        },
-        allocator,
-        title_invalidated,
-    );
-    return drawActive(dc, config, height, start_x, width);
-}
-
-// Private — action handling
-
-/// Dispatches a vim.Action returned by a mode handler: executes/closes on spawn,
-/// resets and keeps open on spawn_keep, deactivates on deactivate, no-ops on none.
-fn handleAction(action: vim.Action) void {
-    switch (action) {
-        .none       => {},
-        .deactivate => deactivate(),
-        .spawn      => {
-            const cmd = g.vim_state.buf[0..g.vim_state.len];
-            if (cmd.len > 0) spawnCommand(cmd);
-            deactivate();
-        },
-        // :w — execute the current command but keep the prompt open so the
-        // user can immediately type a new one.  The buffer is cleared and the
-        // mode is reset to INSERT, mirroring what activate() does without the
-        // keyboard-grab overhead (the grab is already held).
-        .spawn_keep => {
-            const cmd = g.vim_state.buf[0..g.vim_state.len];
-            if (cmd.len > 0) spawnCommand(cmd);
-            resetVimEditing(&g.vim_state);
-            g.ghost_len = 0;
-            g.has_space = false;
-        },
-    }
-}
-
-// Private — activate / deactivate
-
-/// Reset all `VimState` editing fields to their defaults without touching the
-/// heap-allocated buffers (buf, yank_buf, undo/redo stacks, etc.).
-fn resetVimEditing(vs: *vim.VimState) void {
-    const allocator         = vs.allocator;
-    const max_input         = vs.max_input;
-    const undo_max          = vs.undo_max;
-    const buf               = vs.buf;
-    const yank_buf          = vs.yank_buf;
-    const replace_origin_buf= vs.replace_origin_buf;
-    const insert_rec_buf    = vs.insert_rec_buf;
-    const dot_insert_buf    = vs.dot_insert_buf;
-    const undo_entries      = vs.undo.entries;
-    const redo_entries      = vs.redo.entries;
-    vs.* = .{
-        .allocator          = allocator,
-        .max_input          = max_input,
-        .undo_max           = undo_max,
-        .buf                = buf,
-        .yank_buf           = yank_buf,
-        .replace_origin_buf = replace_origin_buf,
-        .insert_rec_buf     = insert_rec_buf,
-        .dot_insert_buf     = dot_insert_buf,
-        // Preserve heap allocations; top and base default to 0 (history cleared).
-        .undo = .{ .entries = undo_entries },
-        .redo = .{ .entries = redo_entries },
-    };
-}
-
-/// Grabs the keyboard, resets editing state, and marks the prompt active.
-fn activate() void {
-    resetVimEditing(&g.vim_state); // reset editing state, preserve heap allocations
-    g.ghost_len = 0;
-    g.has_space = false;
-    // Load completions and history on first activation.
-    if (g.comp_count == 0)   loadCompletions();
-    if (!g.is_hist_loaded)   loadHistory();
-    g.is_blink_visible = true;
-
-    const cookie = xcb.xcb_grab_keyboard(
-        core.conn, 0, core.root, xcb.XCB_CURRENT_TIME,
-        xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC,
-    );
-    const grab_reply = xcb.xcb_grab_keyboard_reply(core.conn, cookie, null);
-    if (grab_reply == null) {
-        debug.warn("prompt: xcb_grab_keyboard_reply returned null — aborting activation", .{});
-        return;
-    }
-    defer std.c.free(grab_reply);
-    if (grab_reply.*.status != xcb.XCB_GRAB_STATUS_SUCCESS) {
-        debug.warn("prompt: keyboard grab failed (status {}) — aborting activation", .{grab_reply.*.status});
-        return;
-    }
-    g.is_active      = true;
-    g.redraw_pending = true;
-    _ = xcb.xcb_flush(core.conn);
-}
-
-/// Ungrabs the keyboard and marks the prompt inactive.
-fn deactivate() void {
-    g.is_active                   = false;
-    g.vim_state.is_replaying_dot  = false;
-    g.vim_state.is_recording_insert = false;
-    vim.resetPendingCmd(&g.vim_state);
-    _ = xcb.xcb_ungrab_keyboard(core.conn, xcb.XCB_CURRENT_TIME);
-    _ = xcb.xcb_flush(core.conn);
-    g.redraw_pending = true;
-}
-
-// Private — PATH completion
-
-/// Scan every directory in $PATH and collect executable names into the static
-/// completion table.  Called once on first activation.
-fn loadCompletions() void {
-    g.comp_count = 0;
-    const path_env_ptr = c.getenv("PATH") orelse return;
-    const path_env = std.mem.span(path_env_ptr);
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-
-    var dir_it = std.mem.splitScalar(u8, path_env, ':');
-    outer: while (dir_it.next()) |dir_path| {
-        if (dir_path.len == 0 or dir_path.len >= dir_buf.len) continue;
-        @memcpy(dir_buf[0..dir_path.len], dir_path);
-        dir_buf[dir_path.len] = 0;
-
-        const dirp = c.opendir(&dir_buf) orelse continue;
-        defer _ = c.closedir(dirp);
-
-        while (c.readdir(dirp)) |entry| {
-            const d_name: [*:0]const u8 = @ptrCast(&entry.*.d_name);
-            const name = std.mem.span(d_name);
-            if (name.len == 0 or name.len > max_completion_len) continue;
-            if (name[0] == '.') continue;
-
-            const dt = entry.*.d_type;
-            if (dt != 0 and dt != c.DT_REG and dt != c.DT_LNK) continue;
-
-            const slot = g.comp_count * (max_completion_len + 1);
-            @memcpy(g.comp_names[slot .. slot + name.len], name);
-            g.comp_names[slot + name.len] = 0;
-            g.comp_count += 1;
-            if (g.comp_count >= max_completions) break :outer;
-        }
-    }
-
-    // Sort for O(log n) binary search in updateGhost.
-    const slot_stride = max_completion_len + 1;
-    const entries = @as([*][slot_stride]u8, @ptrCast(g.comp_names.ptr))[0..g.comp_count];
-    std.sort.pdq([slot_stride]u8, entries, {}, struct {
-        fn lt(_: void, a: [slot_stride]u8, b: [slot_stride]u8) bool {
-            return std.mem.order(u8, std.mem.sliceTo(&a, 0), std.mem.sliceTo(&b, 0)) == .lt;
-        }
-    }.lt);
-}
-
-/// Binary search for the first `comp_names` entry >= prefix.
-/// Used as the starting point for prefix scanning in `updateGhost`,
-/// and as the basis for `compExistsExact`.
-/// Binary searches the sorted completion table for the first entry ≥ `prefix`.
-/// Returns the insertion index (0..comp_count) — use with compExistsExact for lookup.
-fn compLowerBound(prefix: []const u8) usize {
-    var lo: usize = 0;
-    var hi: usize = g.comp_count;
-    while (lo < hi) {
-        const mid  = lo + (hi - lo) / 2;
-        const slot = mid * (max_completion_len + 1);
-        const entry = std.mem.sliceTo(g.comp_names[slot .. slot + max_completion_len + 1], 0);
-        if (std.mem.order(u8, entry, prefix) == .lt) lo = mid + 1 else hi = mid;
-    }
-    return lo;
-}
-
-/// Returns true when `name` exists verbatim in the sorted completion table.
-/// Delegates to `compLowerBound` to avoid duplicating the binary-search logic.
-fn compExistsExact(name: []const u8) bool {
-    const idx = compLowerBound(name);
-    if (idx >= g.comp_count) return false;
-    const slot = idx * (max_completion_len + 1);
-    const entry = std.mem.sliceTo(g.comp_names[slot .. slot + max_completion_len + 1], 0);
-    return std.mem.eql(u8, entry, name);
-}
-
-/// Recompute the ghost-text suggestion based on the current buffer.
-/// Priority: history (newest first) -> any executable match.
-/// Only operates in INSERT mode with cursor at end and no spaces typed.
-fn updateGhost() void {
-    g.ghost_len = 0;
-
-    if (g.vim_state.mode != .insert)                          return;
-    if (g.vim_state.len == 0 or g.vim_state.cursor != g.vim_state.len) return;
-    if (g.has_space)                                          return;
-
-    const prefix = g.vim_state.buf[0..g.vim_state.len];
-
-    // 1. History-based suggestion (newest first)
-    var hi: usize = 0;
-    while (hi < g.hist_count) : (hi += 1) {
-        const hslot = hi * (max_history_line + 1);
-        const entry = std.mem.sliceTo(g.hist_entries[hslot .. hslot + max_history_line + 1], 0);
-        if (entry.len == 0) continue;
-
-        const cmd_end = std.mem.indexOfScalar(u8, entry, ' ') orelse entry.len;
-        const cmd_tok = entry[0..cmd_end];
-
-        if (cmd_tok.len <= prefix.len)               continue;
-        if (!std.mem.startsWith(u8, cmd_tok, prefix)) continue;
-        if (!compExistsExact(cmd_tok))                continue;
-
-        const suffix = cmd_tok[prefix.len..];
-        const n = @min(suffix.len, max_completion_len);
-        @memcpy(g.ghost_buf[0..n], suffix[0..n]);
-        g.ghost_len = n;
-        return;
-    }
-
-    // 2. Fallback: shortest executable that starts with prefix.
-    //    comp_names is sorted, so the first entry past the lower bound that
-    //    starts with prefix and is longer than prefix IS the shortest match.
-    var i: usize = compLowerBound(prefix);
-    while (i < g.comp_count) : (i += 1) {
-        const slot = i * (max_completion_len + 1);
-        const name = std.mem.sliceTo(g.comp_names[slot .. slot + max_completion_len + 1], 0);
-        if (!std.mem.startsWith(u8, name, prefix)) return; // past all prefix matches
-        if (name.len <= prefix.len) continue;              // exact match, not a completion
-        const suffix = name[prefix.len..];
-        const n = @min(suffix.len, max_completion_len);
-        @memcpy(g.ghost_buf[0..n], suffix[0..n]);
-        g.ghost_len = n;
-        return;
-    }
-}
-
-// Private — history
-
-/// Prepend `cmd` to the in-memory history ring (newest at index 0).
-/// Shifts all history entries right by one slot and inserts `cmd` at index 0 (newest first).
-/// Silently no-ops when cmd is empty or exceeds max_history_line.
-fn histPrepend(cmd: []const u8) void {
-    if (cmd.len == 0 or cmd.len > max_history_line) return;
-
-    const keep = @min(g.hist_count, max_history - 1);
-    var i: usize = keep;
-    while (i > 0) : (i -= 1) {
-        const src = (i - 1) * (max_history_line + 1);
-        const dst =  i      * (max_history_line + 1);
-        @memcpy(g.hist_entries[dst .. dst + max_history_line + 1],
-                g.hist_entries[src .. src + max_history_line + 1]);
-    }
-    @memcpy(g.hist_entries[0..cmd.len], cmd);
-    g.hist_entries[cmd.len] = 0;
-    if (g.hist_count < max_history) g.hist_count += 1;
-}
-
-/// Append `cmd` to the prompt's own history file (~/.local/share/drun/history).
-fn histAppendToFile(cmd: []const u8) void {
-    if (cmd.len == 0) return;
-    const home = std.mem.span(c.getenv("HOME") orelse return);
-
-    var dir_buf:  [512:0]u8 = undefined;
-    var file_buf: [512:0]u8 = undefined;
-
-    _ = std.fmt.bufPrintZ(&dir_buf,  "{s}/.local/share/drun",        .{home}) catch return;
-    _ = std.fmt.bufPrintZ(&file_buf, "{s}/.local/share/drun/history", .{home}) catch return;
-
-    _ = c.mkdir(&dir_buf, 0o700);
-
-    const fd = c.open(&file_buf, c.O_WRONLY | c.O_CREAT | c.O_APPEND, @as(c_int, 0o600));
-    if (fd < 0) return;
-    defer _ = c.close(fd);
-    _ = c.write(fd, cmd.ptr, cmd.len);
-    _ = c.write(fd, "\n", 1);
-}
-
-/// Parse one line from a shell history file into `out`, returning its length.
-/// Returns 0 to skip the line.
-///
-/// Formats understood:
-///   fish  : `"- cmd: <command>"` (YAML block)
-///   zsh   : `": <ts>:<elapsed>;<command>"` OR bare line
-///   bash  : bare line (may have `"#<timestamp>"` markers which are skipped)
-///   drun  : bare line
-fn histParseLine(line: []const u8, out: []u8) usize {
-    if (line.len == 0) return 0;
-
-    var cmd = line;
-
-    if (std.mem.startsWith(u8, cmd, "- cmd: ")) {
-        cmd = cmd["- cmd: ".len..];
-    } else if (cmd.len > 2 and cmd[0] == ':' and cmd[1] == ' ') {
-        if (std.mem.indexOfScalar(u8, cmd, ';')) |semi| {
-            cmd = cmd[semi + 1..];
-        }
-    } else if (cmd[0] == '#') {
-        return 0;
-    }
-
-    cmd = std.mem.trim(u8, cmd, " \t\r");
-
-    if (cmd.len == 0 or cmd.len > max_history_line) return 0;
-    @memcpy(out[0..cmd.len], cmd);
-    return cmd.len;
-}
-
-/// Load history from a file, processing lines in reverse so the newest entry
-/// ends up at index 0.
-fn histLoadFile(fp: *c.FILE) void {
-    const file_buf_size = 256 * 1024;
-    const file_buf: []u8 = blk: {
-        const ptr = c.malloc(file_buf_size) orelse return;
-        break :blk @as([*]u8, @ptrCast(ptr))[0..file_buf_size];
-    };
-    defer c.free(file_buf.ptr);
-
-    const n_read = c.fread(file_buf.ptr, 1, file_buf_size - 1, fp);
-    if (n_read == 0) return;
-    const text = file_buf[0..n_read];
-
-    const max_lines_cap = max_history * 2;
-    const lines_raw = c.malloc(@sizeOf(usize) * max_lines_cap * 2) orelse return;
-    defer c.free(lines_raw);
-    const lines_buf   = @as([*]usize, @ptrCast(@alignCast(lines_raw)));
-    const line_starts = lines_buf[0..max_lines_cap];
-    const line_ends   = lines_buf[max_lines_cap .. max_lines_cap * 2];
-
-    var n_lines: usize = 0;
-    var pos: usize = 0;
-    while (pos < text.len and n_lines < max_lines_cap) {
-        const line_start = pos;
-        while (pos < text.len and text[pos] != '\n') : (pos += 1) {}
-        const line_end = pos;
-        if (pos < text.len) pos += 1;
-        line_starts[n_lines] = line_start;
-        line_ends[n_lines]   = line_end;
-        n_lines += 1;
-    }
-
-    var out_line: [max_history_line]u8 = undefined;
-
-    // Build a hash set of already-loaded entries so duplicate detection is O(1)
-    // instead of O(n²).  Pre-populate with any entries that were prepended by
-    // earlier histLoadFile calls in the same session.
-    var seen = std.AutoHashMapUnmanaged(u64, void){};
-    defer seen.deinit(g.allocator);
-    for (0..g.hist_count) |di| {
-        const dslot    = di * (max_history_line + 1);
-        const existing = std.mem.sliceTo(g.hist_entries[dslot .. dslot + max_history_line + 1], 0);
-        seen.put(g.allocator, std.hash.Wyhash.hash(0, existing), {}) catch {};
-    }
-
-    var li: usize = n_lines;
-    while (li > 0) {
-        li -= 1;
-        if (g.hist_count >= max_history) break;
-        const line = text[line_starts[li]..line_ends[li]];
-        const len = histParseLine(line, &out_line);
-        if (len == 0) continue;
-        const h = std.hash.Wyhash.hash(0, out_line[0..len]);
-        if (seen.contains(h)) continue;
-        histPrepend(out_line[0..len]);
-        seen.put(g.allocator, h, {}) catch {};
-    }
-}
-
-/// Load history from drun -> bash -> zsh -> fish (load order).
-/// Because `histPrepend()` inserts at index 0, fish ends up with the highest
-/// suggestion priority in `updateGhost`.
-fn loadHistory() void {
-    g.is_hist_loaded = true;
-
-    var path_buf: [512]u8 = undefined;
-    const home = std.mem.span(c.getenv("HOME") orelse return);
-
-    // Local helper: format a path and open it for reading.
-    const tryOpen = struct {
-        fn tryOpenFormatted(buf: []u8, comptime fmt: []const u8, args: anytype) ?*c.FILE {
-            const s = std.fmt.bufPrint(buf[0..buf.len-1], fmt, args) catch return null;
-            buf[s.len] = 0;
-            return c.fopen(@ptrCast(buf.ptr), "r");
-        }
-    }.tryOpenFormatted;
-
-    if (tryOpen(&path_buf, "{s}/.local/share/drun/history",          .{home})) |fp| {
-        defer _ = c.fclose(fp);
-        histLoadFile(fp);
-    }
-    if (tryOpen(&path_buf, "{s}/.bash_history",                       .{home})) |fp| {
-        defer _ = c.fclose(fp);
-        histLoadFile(fp);
-    }
-    if (tryOpen(&path_buf, "{s}/.zsh_history",                        .{home})) |fp| {
-        defer _ = c.fclose(fp);
-        histLoadFile(fp);
-    }
-    if (tryOpen(&path_buf, "{s}/.local/share/fish/fish_history",      .{home})) |fp| {
-        defer _ = c.fclose(fp);
-        histLoadFile(fp);
-    }
-}
-
-// Private — command spawning
-
-fn spawnCommand(cmd: []const u8) void {
-    histPrepend(cmd);
-    histAppendToFile(cmd);
-
-    // cmd.len <= vim.default_max_input - 1 (enforced by insertChar), so buf
-    // always has room for the null terminator.
-    var buf: [vim.default_max_input]u8 = undefined;
-    @memcpy(buf[0..cmd.len], cmd);
-    buf[cmd.len] = 0;
-    const cmd_z: [*:0]const u8 = buf[0..cmd.len :0];
-
-    const pid = c.fork();
-    if (pid == 0) {
-        const pid2 = c.fork();
-        if (pid2 == 0) {
-            _ = c.setsid();
-            _ = c.execvp("/bin/sh", @ptrCast(&[_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z, null }));
-            std.process.exit(1);
-        }
-        std.process.exit(0);
-    } else if (pid > 0) {
-        var status: c_int = 0;
-        _ = c.waitpid(pid, &status, 0);
-    }
-}
-
-// Private — rendering helpers
-
-/// Binary search: first byte offset where `measureTextWidth(text[0..offset])
-/// >= target_px`.  Returns `text.len` if the whole string is narrower.
-/// Binary-searches `text` for the byte offset whose rendered width first reaches `target_px`.
-/// Used to map a pixel scroll offset back to a character boundary.
-fn textOffsetAtPx(dc: *drawing.DrawContext, text: []const u8, target_px: u16) usize {
-    var lo: usize = 0;
-    var hi: usize = text.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (dc.measureTextWidth(text[0..mid]) < target_px) lo = mid + 1 else hi = mid;
-    }
-    return lo;
-}
-
-/// Return the longest prefix of `text` whose pixel width is ≤ `max_px`.
-/// Fast path: returns the full slice when the text already fits.
-fn textPrefixFit(dc: *drawing.DrawContext, text: []const u8, max_px: u16) []const u8 {
-    if (dc.measureTextWidth(text) <= max_px) return text;
-    var lo: usize = 0;
-    var hi: usize = text.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo + 1) / 2; // round up to avoid infinite loop
-        if (dc.measureTextWidth(text[0..mid]) <= max_px) lo = mid else hi = mid - 1;
-    }
-    return text[0..lo];
-}
-
-/// Draw `text` with hard pixel clipping to `[text_left_x, scroll_end_x)`.
-///
-/// `px` is the virtual pen position (scroll-space, may be negative).  It is
-/// always advanced by the full text width whether or not anything is drawn —
-/// callers rely on this to keep the pen position consistent.
-///
-/// Both edges are clipped without ellipsis:
-///   Left  — characters whose right edges fall before `text_left_x` are skipped.
-///   Right — characters that would extend past `scroll_end_x` are dropped.
-///
-/// This is the correct behaviour for pre-cursor text in a scrolling field:
-/// the cursor must appear immediately after the last visible character with no "…".
-inline fn drawSpan(
-    dc:           *drawing.DrawContext,
-    px:           *i32,
-    text_left_x:  u16,
-    scroll_end_x: u16,
-    baseline:     u16,
-    text:         []const u8,
-    color:        u32,
-) !void {
-    const w = dc.measureTextWidth(text);
-    defer px.* += @intCast(w);
-    if (w == 0) return;
-
-    const tl: i32 = text_left_x;
-    const se: i32 = scroll_end_x;
-
-    // Fully off-screen to the left or right — nothing to draw.
-    if (px.* + @as(i32, w) <= tl or px.* >= se) return;
-
-    // Skip the prefix that lies off-screen to the left.
-    const start: usize = if (px.* < tl)
-        textOffsetAtPx(dc, text, @intCast(tl - px.*))
-    else
-        0;
-
-    const draw_x: u16  = @intCast(@max(px.*, tl));
-    const available: u16 = @intCast(se - @as(i32, draw_x));
-
-    // Clip the visible suffix to the available width on the right.
-    const visible = textPrefixFit(dc, text[start..], available);
-    if (visible.len > 0)
-        try dc.drawText(draw_x, baseline, visible, color);
-}
-
-/// Draw `text` from `px` to the right edge, ellipsizing on overflow.
-/// Shared by the insert, normal, and visual branches of `drawActive` for
-/// post-cursor text.
-inline fn drawPostSpan(
-    dc:           *drawing.DrawContext,
-    px:           i32,
-    text_left_x:  u16,
-    scroll_end_x: u16,
-    baseline:     u16,
-    text:         []const u8,
-    color:        u32,
-) !void {
-    if (text.len == 0 or px >= @as(i32, scroll_end_x)) return;
-    const draw_x: u16    = @intCast(@max(px, @as(i32, text_left_x)));
-    const remaining: u16 = scroll_end_x -| draw_x;
-    if (remaining > 0)
-        try dc.drawTextEllipsis(draw_x, baseline, text, remaining, color);
-}
-
-/// Compute the clamped `draw_x` and `vis_w` for a block cursor or selection
-/// highlight.  Returns null when the block is entirely off-screen.
-inline fn cursorBlockGeom(
-    px:           i32,
-    block_w:      u16,
-    text_left_x:  u16,
-    scroll_end_x: u16,
-) ?struct { draw_x: u16, vis_w: u16 } {
-    if (px + @as(i32, block_w) <= @as(i32, text_left_x) or px >= @as(i32, scroll_end_x))
-        return null;
-    const draw_x: u16 = @intCast(@max(px, @as(i32, text_left_x)));
-    const vis_w: u16  = @intCast(@min(@as(i32, block_w), @as(i32, scroll_end_x) - px));
-    if (vis_w == 0) return null;
-    return .{ .draw_x = draw_x, .vis_w = vis_w };
-}
-
-// Private — active-mode rendering
-
-/// Render the active input UI.
-///
-/// Layout:
-///
-///   [ pad | scrollable: PROMPT | pre | CURSOR/SELECTION | post | MODE_LABEL | pad ]
-///
-/// The mode label is pinned to the right edge (does not scroll).
-/// The scrollable region keeps the cursor in view.
-fn drawActive(
-    dc:      *drawing.DrawContext,
-    config:  types.BarConfig,
-    height:  u16,
-    start_x: u16,
-    width:   u16,
-) !u16 {
-    const end_x  = start_x + width;
-    const pad    = config.scaledSegmentPadding(height);
-    const accent = config.drunPromptColor();
-    const bg     = config.drunBg();
-    const fg     = config.drunFg();
-    const prompt = config.drun_prompt;
-
-    dc.fillRect(start_x, 0, width, height, bg);
-
-    const baseline    = dc.baselineY(height);
-    const text_left_x = start_x + pad;
-    const text_end_x  = end_x   -| pad;
-    if (text_left_x >= text_end_x) return end_x;
-
-    // Mode widget — pinned to the right edge; does not scroll.
-    //
-    // Rendered as a filled pill: accent-coloured background, white text.
-    // Horizontal padding of `pill_h_pad` is applied on both sides so the text
-    // never touches the pill edge and there is a natural gap between the pill
-    // and the scrollable text region.
-    //
-    // In colon-command mode the mode label is replaced by an ex-command input
-    // field that shows ":typed_chars" followed by a block cursor.
-    const pill_h_pad: u16 = 6;
-    const white: u32 = 0xFFFFFFFF;
-
-    const mode_label = g.vim_state.mode.label();
-    const mode_idx: usize = @intFromEnum(g.vim_state.mode);
-
-    const mode_w: u16 = g.cached_mode_w[mode_idx] orelse blk: {
-        const w = dc.measureTextWidth(mode_label);
-        g.cached_mode_w[mode_idx] = w;
-        break :blk w;
-    };
-
-    // Total pill width = inner text width + left pad + right pad.
-    const pill_w: u16 = mode_w + pill_h_pad * 2;
-
-    // Reserve the pill width on the right; the scrollable region ends here.
-    const scroll_end_x: u16 = if (text_end_x >= pill_w) text_end_x - pill_w else text_left_x;
-    // Clip post-cursor text 2 px before the pill so ink never bleeds into it.
-    const ellipsis_end_x: u16 = scroll_end_x -| 2;
-
-    if (pill_w > 0 and text_end_x >= pill_w) {
-        const pill_x: u16 = text_end_x - pill_w;
-        if (pill_x >= text_left_x) {
-            // Filled pill background.
-            dc.fillRect(pill_x, cursor_v_pad, pill_w, height -| cursor_v_pad * 2, accent);
-
-            if (vim.colonInput(&g.vim_state)) |ct| {
-                // Ex-command input: ":typed_chars" + blinking insert-style caret.
-                var ppx: i32 = @as(i32, pill_x) + @as(i32, pill_h_pad);
-                const colon_w: i32 = @intCast(dc.measureTextWidth(":"));
-                try dc.drawText(@intCast(ppx), baseline, ":", white);
-                ppx += colon_w;
-                if (ct.len > 0) {
-                    try dc.drawText(@intCast(ppx), baseline, ct, white);
-                    ppx += @intCast(dc.measureTextWidth(ct));
-                }
-                // Blinking thin caret — same geometry as the insert-mode caret
-                // in the main text area so both look identical.
-                if (g.cached_caret_top == null) {
-                    const asc, const desc = dc.getMetrics();
-                    const font_h: u16 = @intCast(@max(0, @as(i32, asc) + @as(i32, desc)));
-                    g.cached_caret_top = (height -| font_h) / 2;
-                    g.cached_caret_h   = @min(font_h, height);
-                }
-                const caret_top = g.cached_caret_top.?;
-                const caret_h   = g.cached_caret_h.?;
-                const pill_inner_end: i32 = @as(i32, pill_x) + @as(i32, pill_w) - @as(i32, pill_h_pad);
-                if (g.is_blink_visible and ppx < pill_inner_end) {
-                    dc.fillRect(@intCast(ppx), caret_top, cursor_width, caret_h, white);
-                }
-            } else {
-                // Normal mode label centred (left-padded) inside the pill.
-                try dc.drawText(pill_x + pill_h_pad, baseline, mode_label, white);
-            }
-        }
-    }
-
-    if (text_left_x >= scroll_end_x) return end_x;
-
-    const max_scroll_px: u16 = scroll_end_x - text_left_x;
-
-    // Measure prompt width (cached).
-    const prompt_w: u16 = g.cached_prompt_w orelse blk: {
-        const w = dc.measureTextWidth(prompt);
-        g.cached_prompt_w = w;
-        break :blk w;
-    };
-
-    // Compute scroll offset to keep the cursor visible.
-    //
-    // In INSERT mode the cursor is a thin caret; the character it sits on is
-    // NOT consumed, so `post_text` starts at cursor (not cursor+1) and the
-    // caret_w used for layout is `cursor_width`.
-    // In all other modes a full-character block model is used.
-    const pre_cur_text = g.vim_state.buf[0..g.vim_state.cursor];
-    const pre_w_cur    = dc.measureTextWidth(pre_cur_text);
-
-    const caret_w: u16 = if (g.vim_state.mode == .insert)
-        cursor_width
-    else
-        @max(
-            dc.measureTextWidth(if (g.vim_state.cursor < g.vim_state.len)
-                g.vim_state.buf[g.vim_state.cursor..g.vim_state.cursor + 1]
-            else " "),
-            min_cursor_px,
-        );
-
-    const post_text: []const u8 = if (g.vim_state.mode == .insert)
-        g.vim_state.buf[g.vim_state.cursor..g.vim_state.len]
-    else
-        (if (g.vim_state.cursor < g.vim_state.len)
-            g.vim_state.buf[g.vim_state.cursor + 1 .. g.vim_state.len]
-        else "");
-
-    var scroll_x: u16 = 0;
-    const cursor_right = prompt_w + pre_w_cur + caret_w;
-    if (cursor_right > max_scroll_px) {
-        const min_scroll: u16 = cursor_right -| max_scroll_px;
-        // Snap scroll_x to the nearest character boundary at or past min_scroll.
-        // Without snapping, `drawSpan` draws text[start..] at text_left_x even
-        // though character `start` begins some pixels past text_left_x in virtual
-        // space.  That shift creates a gap between the rendered text and the caret
-        // that looks like a phantom extra character to the right of the cursor.
-        if (min_scroll <= prompt_w) {
-            const idx = textOffsetAtPx(dc, prompt, min_scroll);
-            scroll_x = dc.measureTextWidth(prompt[0..idx]);
-        } else {
-            const min_in_pre: u16 = min_scroll - prompt_w;
-            const idx = textOffsetAtPx(dc, pre_cur_text, min_in_pre);
-            scroll_x = prompt_w + dc.measureTextWidth(pre_cur_text[0..idx]);
-        }
-    }
-
-    // Draw prompt
-    var px: i32 = @as(i32, text_left_x) - @as(i32, scroll_x);
-    try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, prompt, accent);
-
-    // Mode-specific text rendering.
-    // When colon-command mode is active the cursor lives in the pill widget,
-    // not here — so we skip all cursor drawing in the main text area.
-    const colon_active = vim.colonInput(&g.vim_state) != null;
-
-    if (g.vim_state.mode == .visual) {
-        const sel      = vim.visualRange(&g.vim_state);
-        const sel_lo   = sel[0];
-        const sel_hi   = sel[1];
-
-        const pre_sel  = g.vim_state.buf[0..sel_lo];
-        const sel_text = g.vim_state.buf[sel_lo..sel_hi];
-        const post_sel = g.vim_state.buf[sel_hi..g.vim_state.len];
-        const sel_w    = @max(dc.measureTextWidth(sel_text), min_cursor_px);
-
-        if (pre_sel.len > 0)
-            try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, pre_sel, fg);
-
-        if (cursorBlockGeom(px, sel_w, text_left_x, scroll_end_x)) |block| {
-            dc.fillRect(block.draw_x, cursor_v_pad, block.vis_w, height -| cursor_v_pad * 2, accent);
-            if (sel_text.len > 0)
-                try dc.drawText(block.draw_x, baseline, sel_text, bg);
-        }
-        px += @intCast(sel_w);
-
-        try drawPostSpan(dc, px, text_left_x, ellipsis_end_x, baseline, post_sel, fg);
-
-    } else if (g.vim_state.mode == .insert) {
-        // Blinking thin caret; text NOT consumed by cursor position.
-        if (pre_cur_text.len > 0)
-            try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, pre_cur_text, fg);
-
-        // Caret geometry — cached since font metrics and bar height are constant
-        // between reloads.
-        if (g.cached_caret_top == null) {
-            const asc, const desc = dc.getMetrics();
-            const font_h: u16 = @intCast(@max(0, @as(i32, asc) + @as(i32, desc)));
-            g.cached_caret_top = (height -| font_h) / 2;
-            g.cached_caret_h   = @min(font_h, height);
-        }
-        const caret_top = g.cached_caret_top.?;
-        const caret_h   = g.cached_caret_h.?;
-
-        if (g.is_blink_visible and !colon_active and px >= @as(i32, text_left_x) and px < @as(i32, scroll_end_x)) {
-            dc.fillRect(@intCast(px), caret_top, cursor_width, caret_h, accent);
-        }
-
-        // Ghost text (only when cursor is at end).
-        if (g.ghost_len > 0 and g.vim_state.cursor == g.vim_state.len and px < @as(i32, scroll_end_x)) {
-            const ghost = g.ghost_buf[0..g.ghost_len];
-            const draw_x: u16  = @intCast(@max(px, @as(i32, text_left_x)));
-            const remaining: u16 = scroll_end_x -| draw_x;
-            if (remaining > 0)
-                try dc.drawTextEllipsis(draw_x, baseline, ghost, remaining, accent);
-        }
-
-        try drawPostSpan(dc, px, text_left_x, ellipsis_end_x, baseline, post_text, fg);
-
-    } else {
-        // NORMAL / REPLACE: full-character block cursor.
-        const pre_text = g.vim_state.buf[0..g.vim_state.cursor];
-        const cur_text = if (g.vim_state.cursor < g.vim_state.len)
-            g.vim_state.buf[g.vim_state.cursor .. g.vim_state.cursor + 1]
-        else " ";
-        const cur_w    = @max(dc.measureTextWidth(cur_text), min_cursor_px);
-
-        if (pre_text.len > 0)
-            try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, pre_text, fg);
-
-        if (colon_active) {
-            // No cursor box — draw the character under the cursor as plain text
-            // so it isn't swallowed when the cursor moves to the pill widget.
-            if (g.vim_state.cursor < g.vim_state.len) {
-                if (cursorBlockGeom(px, cur_w, text_left_x, scroll_end_x)) |block|
-                    try dc.drawText(block.draw_x, baseline, cur_text, fg);
-            }
-        } else {
-            if (cursorBlockGeom(px, cur_w, text_left_x, scroll_end_x)) |block| {
-                dc.fillRect(block.draw_x, cursor_v_pad, block.vis_w, height -| cursor_v_pad * 2, accent);
-                if (g.vim_state.cursor < g.vim_state.len)
-                    try dc.drawText(block.draw_x, baseline, cur_text, bg);
-            }
-        }
-        px += @intCast(cur_w);
-
-        try drawPostSpan(dc, px, text_left_x, ellipsis_end_x, baseline, post_text, fg);
-    }
-
-    dc.flushRect(start_x, width);
-    return end_x;
-}
-</file>
-
 <file path="src/bar/bar.zig">
 //! Status bar
 //! Renders segments via Cairo/Pango into an XCB override-redirect window.
@@ -12943,6 +11820,1151 @@ fn retileAllWorkspaces() void {
         }
         tiling.retileCurrentWorkspace();
     }
+}
+</file>
+
+<file path="src/bar/modules/prompt/prompt.zig">
+//! Prompt bar in-line command runner
+//! Borrows title's segment space to embed into the bar
+
+const std   = @import("std");
+const build = @import("build_options");
+
+const core    = @import("core");
+    const xcb = core.xcb;
+
+const bar   = @import("bar");
+const types = @import("types");
+
+const drawing = @import("drawing");
+const title   = if (build.has_title) @import("title") else struct {};
+const vim     = if (build.has_vim)   @import("vim")   else struct {
+    const VimState = struct {};
+};
+
+const debug = @import("debug");
+
+const c = @cImport({
+    @cInclude("unistd.h");
+    @cInclude("stdlib.h");
+    @cInclude("stdio.h");
+    @cInclude("fcntl.h");
+    @cInclude("dirent.h");
+    @cInclude("sys/stat.h");
+    @cInclude("sys/wait.h");
+});
+
+// xcb-keysyms bindings (link with -lxcb-keysyms)
+
+const xcb_key_symbols_t = opaque {};
+
+extern fn xcb_key_symbols_alloc(conn: *xcb.xcb_connection_t) ?*xcb_key_symbols_t;
+extern fn xcb_key_symbols_free(syms: *xcb_key_symbols_t) void;
+extern fn xcb_key_symbols_get_keysym(syms: *xcb_key_symbols_t, code: xcb.xcb_keycode_t, col: c_int) xcb.xcb_keysym_t;
+
+// Module constants
+
+/// Minimum pixel width of the block cursor; ensures it is visible even on
+/// the narrowest glyphs (e.g. '.', '!').
+const min_cursor_px: u16 = 8;
+/// Width of the blinking caret in insert mode (pixels).
+const cursor_width: u16 = 1;
+/// Cursor blink half-period: cursor is visible for this many ms, then
+/// invisible for the same duration.
+const cursor_blink_ms: u64 = 300;
+/// Vertical padding (pixels) above and below the block cursor / selection.
+const cursor_v_pad: u16 = 2;
+/// Maximum number of executable names stored for tab-completion.
+const max_completions: usize = 4096;
+/// Maximum byte length of a single completion entry (executable name).
+const max_completion_len: usize = 64;
+/// Maximum number of history entries kept in memory.
+const max_history: usize = 512;
+/// Maximum byte length of a single history entry.
+const max_history_line: usize = vim.default_max_input;
+
+// Module state
+
+/// All mutable state owned by this module.
+const PromptState = struct {
+    is_active: bool         = false,
+    vim_state: vim.VimState = .{},
+
+    allocator: std.mem.Allocator = undefined,
+
+    key_syms:        ?*xcb_key_symbols_t = null,
+    cached_prompt_w: ?u16                = null,
+    /// Cached pixel width of each mode label, indexed by `vim.Mode` integer value.
+    cached_mode_w:   [4]?u16             = .{ null, null, null, null },
+
+    // PATH completion
+    comp_names: []u8  = &.{},
+    comp_count: usize = 0,
+
+    /// Ghost text: the completion suffix shown dimmed after the cursor.
+    ghost_buf: []u8  = &.{},
+    ghost_len: usize = 0,
+    /// True when the current buffer contains at least one space.  Maintained
+    /// incrementally so `updateGhost` can skip a full buffer scan on every call.
+    has_space: bool = false,
+
+    is_blink_visible: bool = true,
+
+    /// Caret geometry cached after the first insert-mode draw.  Font metrics
+    /// and bar height are constant between reloads, so these never need clearing.
+    cached_caret_top: ?u16 = null,
+    cached_caret_h:   ?u16 = null,
+
+    // Command history (newest at index 0)
+    hist_entries: []u8  = &.{},
+    hist_count:   usize = 0,
+    is_hist_loaded: bool = false,
+
+    /// Set by key handlers, `activate`, and `deactivate` to notify the bar
+    /// that the prompt area needs to be redrawn.  Consumed (read + cleared)
+    /// by `consumeRedrawRequest` to avoid a circular import between prompt ↔ bar.
+    redraw_pending: bool = false,
+};
+
+var g: PromptState = .{};
+
+// Public API
+
+/// Returns true when the prompt is currently active and accepting key input.
+pub fn isActive() bool { return g.is_active; }
+
+/// Returns true when the prompt is active in insert mode, signalling that
+/// the bar should schedule a periodic redraw for the cursor blink animation.
+
+/// Returns the milliseconds until the next blink toggle, or -1 if the cursor
+/// blink animation is not running.  Pass this (combined with the clock timeout)
+/// to poll() so the event loop wakes up exactly when a redraw is needed.
+pub fn blinkPollTimeoutMs() i32 {
+    if (!g.is_active) return -1;
+    if (g.vim_state.mode == .insert or vim.colonInput(&g.vim_state) != null)
+        return cursor_blink_ms;
+    return -1;
+}
+
+/// Toggle cursor visibility.  Call from the event loop on every poll timeout
+/// where `blinkPollTimeoutMs() >= 0`, then trigger a bar redraw.
+pub fn blinkTick() void {
+    g.is_blink_visible = !g.is_blink_visible;
+}
+
+/// Returns true and clears the flag if a prompt-driven redraw is outstanding.
+/// Call once per event-loop iteration from `bar.updateIfDirty`.
+pub fn consumeRedrawRequest() bool {
+    const pending = g.redraw_pending;
+    g.redraw_pending = false;
+    return pending;
+}
+
+/// Initialises all prompt state: vim engine, key-symbol table, completions, and history buffers.
+/// No-op if already initialised (idempotent).
+pub fn init(allocator: std.mem.Allocator, conn: *xcb.xcb_connection_t) !void {
+    if (g.vim_state.buf.len != 0) return; // already initialised
+    g.allocator   = allocator;
+    g.vim_state   = try vim.VimState.init(allocator, vim.default_max_input, vim.default_undo_max);
+    g.comp_names  = try allocator.alloc(u8, (max_completion_len + 1) * max_completions);
+    g.ghost_buf   = try allocator.alloc(u8, max_completion_len);
+    g.hist_entries= try allocator.alloc(u8, (max_history_line + 1) * max_history);
+    g.key_syms    = xcb_key_symbols_alloc(conn);
+    if (g.key_syms == null)
+        debug.warn("prompt: xcb_key_symbols_alloc failed — key input will not work", .{});
+}
+
+/// Frees all prompt resources and resets state to zero. Safe to call multiple times.
+pub fn deinit() void {
+    if (g.key_syms) |ks| {
+        xcb_key_symbols_free(ks);
+        g.key_syms = null;
+    }
+    if (g.vim_state.buf.len != 0) g.vim_state.deinit();
+    if (g.hist_entries.len  != 0) g.allocator.free(g.hist_entries);
+    if (g.ghost_buf.len     != 0) g.allocator.free(g.ghost_buf);
+    if (g.comp_names.len    != 0) g.allocator.free(g.comp_names);
+    g = .{};
+}
+
+/// Activates the prompt if inactive, or deactivates it if active.
+pub fn toggle() void {
+    if (g.is_active) deactivate() else activate();
+}
+
+/// Query the X pointer and decide what close_window should do while the
+/// prompt is active:
+///   • cursor over bar window → kill the prompt, swallow the event
+///   • cursor over a program  → let WM close that window (return false)
+///   • cursor over nothing    → swallow the event silently, do nothing
+fn closeWindowOrPromptUnderCursor() bool {
+    const ptr_cookie = xcb.xcb_query_pointer(core.conn, core.root);
+    const ptr_reply  = xcb.xcb_query_pointer_reply(core.conn, ptr_cookie, null);
+    defer if (ptr_reply) |r| std.c.free(r);
+
+    const child: u32 = if (ptr_reply) |r| r.*.child else 0;
+
+    if (bar.isBarWindow(child)) {
+        // Cursor is on the bar — kill the prompt.
+        deactivate();
+        return true;
+    }
+    if (child == 0 or child == core.root) {
+        // Cursor is over the desktop / no window — do nothing, swallow key.
+        return true;
+    }
+    // Cursor is over a real program window — let the WM close it.
+    return false;
+}
+
+/// Complete key-event routing entry point called by `input.zig`.
+///
+/// Owns all prompt-specific routing decisions so `input.zig` stays free of
+/// prompt internals:
+///   - Returns false immediately when the prompt is inactive, so the caller
+///     falls through to normal keybind dispatch without any special-casing.
+///   - If the key is bound to `close_window`, checks where the cursor is:
+///     over the bar kills the prompt, over a window lets the WM close it,
+///     over the desktop swallows the key silently.
+///   - Otherwise delegates to `handleKeyPress` which processes the raw key.
+///
+/// `bound_action` is whatever the keybind map resolved for this key; pass
+/// `state.map.get(key)` directly — null is fine when there is no binding.
+pub fn handlePromptKeypress(
+    event:        *const xcb.xcb_key_press_event_t,
+    bound_action: ?*const types.Action,
+) bool {
+    if (!g.is_active) return false;
+
+    // When the mod key (Super) is held and a WM action is bound to this key,
+    // let the normal keybind dispatcher handle it so the user can perform
+    // window-manager operations without cancelling the prompt.
+    // The close_window action is still routed through here so it can dismiss
+    // the prompt — but only when the cursor is over the bar itself.
+    if (event.state & xcb.XCB_MOD_MASK_4 != 0) {
+        if (bound_action) |action| {
+            if (action.* == .close_window) {
+                return closeWindowOrPromptUnderCursor();
+            }
+            return false; // let WM dispatch execute the bind; prompt stays open
+        }
+    }
+
+    if (bound_action) |action| if (action.* == .close_window) {
+        return closeWindowOrPromptUnderCursor();
+    };
+    return handleKeyPress(event);
+}
+
+/// Low-level key-press handler.  Called by `handlePromptKeypress` after all
+/// prompt-level routing decisions have been made.
+///
+/// Exposed as `pub` so the bar's legacy key dispatch path can call it
+/// directly when it has already confirmed the prompt is active.  Prefer
+/// `handlePromptKeypress` for new call sites.
+pub fn handleKeyPress(event: *const xcb.xcb_key_press_event_t) bool {
+    if (!g.is_active) return false;
+
+    // Only process XCB_KEY_PRESS events.  xcb_key_press_event_t and
+    // xcb_key_release_event_t share the same struct layout, so the event loop
+    // can (and sometimes does) cast a release event and dispatch it here.
+    //
+    // Without this guard the XCB_KEY_RELEASE for Escape is a fatal trap:
+    //   1. XCB_KEY_PRESS  (Escape): handleInsert switches mode to .normal ✓
+    //   2. XCB_KEY_RELEASE(Escape): handleNormal sees XK_Escape with a clean
+    //      pending (op=0, count=0) -> returns .deactivate -> prompt closes.
+    // The user then presses 'b' or an arrow key to start editing in normal
+    // mode, but the prompt is already gone — so those keys get the blame.
+    //
+    // Returning true (not false) for non-press events ensures the caller
+    // considers the event consumed and does not fall through to WM keybind
+    // dispatch for the release.
+    if (event.response_type & 0x7F != xcb.XCB_KEY_PRESS) return true;
+
+    const syms = g.key_syms orelse return false;
+
+    const shift_held = event.state & xcb.XCB_MOD_MASK_SHIFT   != 0;
+    const ctrl_held  = event.state & xcb.XCB_MOD_MASK_CONTROL != 0;
+    const col: c_int = if (shift_held) 1 else 0;
+    const sym        = xcb_key_symbols_get_keysym(syms, event.detail, col);
+
+    // Drop bare modifier key events (Shift, Ctrl, Alt, Super, Meta, Hyper …).
+    //
+    // XCB delivers a XCB_KEY_PRESS event for every key including modifiers, so
+    // pressing Shift before typing '$' or '^' fires a key event with keysym
+    // 0xFFE1/0xFFE2 (XK_Shift_L/R) before the '$'/'^' event arrives.  If that
+    // event reaches handleNormal it falls through to resetPendingCmd(), clearing
+    // any pending operator ('d', 'c', 'y') or accumulated count — which is why
+    // operator+motion sequences that require Shift (d$, d^, dW, dE, c$, y^,
+    // visual 3W, …) silently turn into bare cursor moves instead of edits.
+    //
+    // Modifier keysyms occupy the contiguous range 0xFFE1–0xFFEE; nothing in
+    // that band is a valid editing key (editing specials such as Escape/Return/
+    // BackSpace/Delete/Arrow/Home/End all live elsewhere in 0xFF00–0xFFFF).
+    if (sym >= 0xFFE0 and sym <= 0xFFEF) return true;
+
+    // Ctrl-modified keys
+    if (ctrl_held) {
+        const action   = vim.handleCtrl(&g.vim_state, sym);
+        const prev_len = g.vim_state.len;
+        handleAction(action);
+        if (g.vim_state.len != prev_len)
+            g.has_space = std.mem.indexOfScalar(u8, g.vim_state.buf[0..g.vim_state.len], ' ') != null;
+        g.redraw_pending = true;
+        return true;
+    }
+
+    // Tab: accept ghost completion
+    if (sym == vim.XK_Tab and g.vim_state.mode == .insert) {
+        const n_ghost: usize = if (g.ghost_len > 0 and g.vim_state.cursor == g.vim_state.len)
+            @min(g.ghost_len, g.vim_state.max_input - 1 - g.vim_state.len)
+        else 0;
+        if (n_ghost > 0) {
+            vim.insertSlice(&g.vim_state, g.ghost_buf[0..n_ghost]);
+            g.ghost_len = 0;
+        }
+        g.is_blink_visible = true;
+        g.redraw_pending   = true;
+        return true;
+    }
+
+    // Dispatch to mode handler
+    const action = switch (g.vim_state.mode) {
+        .insert  => vim.handleInsert(&g.vim_state, sym),
+        .normal  => vim.handleNormal(&g.vim_state, sym),
+        .visual  => vim.handleVisual(&g.vim_state, sym),
+        .replace => vim.handleReplace(&g.vim_state, sym),
+    };
+    const prev_len = g.vim_state.len;
+    handleAction(action);
+    if (g.vim_state.len != prev_len)
+        g.has_space = std.mem.indexOfScalar(u8, g.vim_state.buf[0..g.vim_state.len], ' ') != null;
+    updateGhost();
+    g.is_blink_visible = true;
+    g.redraw_pending   = true;
+    return true;
+}
+
+pub fn draw(
+    dc:                  *drawing.DrawContext,
+    config:              types.BarConfig,
+    height:              u16,
+    start_x:             u16,
+    width:               u16,
+    conn:                *xcb.xcb_connection_t,
+    focused_window:      ?u32,
+    focused_title:       []const u8,
+    minimized_title:     []const u8,
+    current_ws_wins:     []const u32,
+    minimized_set:       *const std.AutoHashMapUnmanaged(u32, void),
+    window_title_data:   []const u8,
+    window_title_ends:   []const u32,
+    cached_title:        *std.ArrayList(u8),
+    cached_title_window: *?u32,
+    title_invalidated:   bool,
+    allocator:           std.mem.Allocator,
+) !u16 {
+    if (!g.is_active) return title.draw(
+        .{
+            .dc      = dc,
+            .config  = config,
+            .height  = height,
+            .start_x = start_x,
+            .width   = width,
+            .conn    = conn,
+        },
+        .{
+            .focused_window    = focused_window,
+            .focused_title     = focused_title,
+            .minimized_title   = minimized_title,
+            .current_ws_wins   = current_ws_wins,
+            .minimized_set     = minimized_set,
+            .window_title_data = window_title_data,
+            .window_title_ends = window_title_ends,
+        },
+        .{
+            .cached_title        = cached_title,
+            .cached_title_window = cached_title_window,
+        },
+        allocator,
+        title_invalidated,
+    );
+    return drawActive(dc, config, height, start_x, width);
+}
+
+// Private — action handling
+
+/// Dispatches a vim.Action returned by a mode handler: executes/closes on spawn,
+/// resets and keeps open on spawn_keep, deactivates on deactivate, no-ops on none.
+fn handleAction(action: vim.Action) void {
+    switch (action) {
+        .none       => {},
+        .deactivate => deactivate(),
+        .spawn      => {
+            const cmd = g.vim_state.buf[0..g.vim_state.len];
+            if (cmd.len > 0) spawnCommand(cmd);
+            deactivate();
+        },
+        // :w — execute the current command but keep the prompt open so the
+        // user can immediately type a new one.  The buffer is cleared and the
+        // mode is reset to INSERT, mirroring what activate() does without the
+        // keyboard-grab overhead (the grab is already held).
+        .spawn_keep => {
+            const cmd = g.vim_state.buf[0..g.vim_state.len];
+            if (cmd.len > 0) spawnCommand(cmd);
+            resetVimEditing(&g.vim_state);
+            g.ghost_len = 0;
+            g.has_space = false;
+        },
+    }
+}
+
+// Private — activate / deactivate
+
+/// Reset all `VimState` editing fields to their defaults without touching the
+/// heap-allocated buffers (buf, yank_buf, undo/redo stacks, etc.).
+fn resetVimEditing(vs: *vim.VimState) void {
+    const allocator         = vs.allocator;
+    const max_input         = vs.max_input;
+    const undo_max          = vs.undo_max;
+    const buf               = vs.buf;
+    const yank_buf          = vs.yank_buf;
+    const replace_origin_buf= vs.replace_origin_buf;
+    const insert_rec_buf    = vs.insert_rec_buf;
+    const dot_insert_buf    = vs.dot_insert_buf;
+    const undo_entries      = vs.undo.entries;
+    const redo_entries      = vs.redo.entries;
+    vs.* = .{
+        .allocator          = allocator,
+        .max_input          = max_input,
+        .undo_max           = undo_max,
+        .buf                = buf,
+        .yank_buf           = yank_buf,
+        .replace_origin_buf = replace_origin_buf,
+        .insert_rec_buf     = insert_rec_buf,
+        .dot_insert_buf     = dot_insert_buf,
+        // Preserve heap allocations; top and base default to 0 (history cleared).
+        .undo = .{ .entries = undo_entries },
+        .redo = .{ .entries = redo_entries },
+    };
+}
+
+/// Grabs the keyboard, resets editing state, and marks the prompt active.
+fn activate() void {
+    resetVimEditing(&g.vim_state); // reset editing state, preserve heap allocations
+    g.ghost_len = 0;
+    g.has_space = false;
+    // Load completions and history on first activation.
+    if (g.comp_count == 0)   loadCompletions();
+    if (!g.is_hist_loaded)   loadHistory();
+    g.is_blink_visible = true;
+
+    const cookie = xcb.xcb_grab_keyboard(
+        core.conn, 0, core.root, xcb.XCB_CURRENT_TIME,
+        xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC,
+    );
+    const grab_reply = xcb.xcb_grab_keyboard_reply(core.conn, cookie, null);
+    if (grab_reply == null) {
+        debug.warn("prompt: xcb_grab_keyboard_reply returned null — aborting activation", .{});
+        return;
+    }
+    defer std.c.free(grab_reply);
+    if (grab_reply.*.status != xcb.XCB_GRAB_STATUS_SUCCESS) {
+        debug.warn("prompt: keyboard grab failed (status {}) — aborting activation", .{grab_reply.*.status});
+        return;
+    }
+    g.is_active      = true;
+    g.redraw_pending = true;
+    _ = xcb.xcb_flush(core.conn);
+}
+
+/// Ungrabs the keyboard and marks the prompt inactive.
+fn deactivate() void {
+    g.is_active                   = false;
+    g.vim_state.is_replaying_dot  = false;
+    g.vim_state.is_recording_insert = false;
+    vim.resetPendingCmd(&g.vim_state);
+    _ = xcb.xcb_ungrab_keyboard(core.conn, xcb.XCB_CURRENT_TIME);
+    _ = xcb.xcb_flush(core.conn);
+    g.redraw_pending = true;
+}
+
+// Private — PATH completion
+
+/// Scan every directory in $PATH and collect executable names into the static
+/// completion table.  Called once on first activation.
+fn loadCompletions() void {
+    g.comp_count = 0;
+    const path_env_ptr = c.getenv("PATH") orelse return;
+    const path_env = std.mem.span(path_env_ptr);
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    var dir_it = std.mem.splitScalar(u8, path_env, ':');
+    outer: while (dir_it.next()) |dir_path| {
+        if (dir_path.len == 0 or dir_path.len >= dir_buf.len) continue;
+        @memcpy(dir_buf[0..dir_path.len], dir_path);
+        dir_buf[dir_path.len] = 0;
+
+        const dirp = c.opendir(&dir_buf) orelse continue;
+        defer _ = c.closedir(dirp);
+
+        while (c.readdir(dirp)) |entry| {
+            const d_name: [*:0]const u8 = @ptrCast(&entry.*.d_name);
+            const name = std.mem.span(d_name);
+            if (name.len == 0 or name.len > max_completion_len) continue;
+            if (name[0] == '.') continue;
+
+            const dt = entry.*.d_type;
+            if (dt != 0 and dt != c.DT_REG and dt != c.DT_LNK) continue;
+
+            const slot = g.comp_count * (max_completion_len + 1);
+            @memcpy(g.comp_names[slot .. slot + name.len], name);
+            g.comp_names[slot + name.len] = 0;
+            g.comp_count += 1;
+            if (g.comp_count >= max_completions) break :outer;
+        }
+    }
+
+    // Sort for O(log n) binary search in updateGhost.
+    const slot_stride = max_completion_len + 1;
+    const entries = @as([*][slot_stride]u8, @ptrCast(g.comp_names.ptr))[0..g.comp_count];
+    std.sort.pdq([slot_stride]u8, entries, {}, struct {
+        fn lt(_: void, a: [slot_stride]u8, b: [slot_stride]u8) bool {
+            return std.mem.order(u8, std.mem.sliceTo(&a, 0), std.mem.sliceTo(&b, 0)) == .lt;
+        }
+    }.lt);
+}
+
+/// Binary search for the first `comp_names` entry >= prefix.
+/// Used as the starting point for prefix scanning in `updateGhost`,
+/// and as the basis for `compExistsExact`.
+/// Binary searches the sorted completion table for the first entry ≥ `prefix`.
+/// Returns the insertion index (0..comp_count) — use with compExistsExact for lookup.
+fn compLowerBound(prefix: []const u8) usize {
+    var lo: usize = 0;
+    var hi: usize = g.comp_count;
+    while (lo < hi) {
+        const mid  = lo + (hi - lo) / 2;
+        const slot = mid * (max_completion_len + 1);
+        const entry = std.mem.sliceTo(g.comp_names[slot .. slot + max_completion_len + 1], 0);
+        if (std.mem.order(u8, entry, prefix) == .lt) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// Returns true when `name` exists verbatim in the sorted completion table.
+/// Delegates to `compLowerBound` to avoid duplicating the binary-search logic.
+fn compExistsExact(name: []const u8) bool {
+    const idx = compLowerBound(name);
+    if (idx >= g.comp_count) return false;
+    const slot = idx * (max_completion_len + 1);
+    const entry = std.mem.sliceTo(g.comp_names[slot .. slot + max_completion_len + 1], 0);
+    return std.mem.eql(u8, entry, name);
+}
+
+/// Recompute the ghost-text suggestion based on the current buffer.
+/// Priority: history (newest first) -> any executable match.
+/// Only operates in INSERT mode with cursor at end and no spaces typed.
+fn updateGhost() void {
+    g.ghost_len = 0;
+
+    if (g.vim_state.mode != .insert)                          return;
+    if (g.vim_state.len == 0 or g.vim_state.cursor != g.vim_state.len) return;
+    if (g.has_space)                                          return;
+
+    const prefix = g.vim_state.buf[0..g.vim_state.len];
+
+    // 1. History-based suggestion (newest first)
+    var hi: usize = 0;
+    while (hi < g.hist_count) : (hi += 1) {
+        const hslot = hi * (max_history_line + 1);
+        const entry = std.mem.sliceTo(g.hist_entries[hslot .. hslot + max_history_line + 1], 0);
+        if (entry.len == 0) continue;
+
+        const cmd_end = std.mem.indexOfScalar(u8, entry, ' ') orelse entry.len;
+        const cmd_tok = entry[0..cmd_end];
+
+        if (cmd_tok.len <= prefix.len)               continue;
+        if (!std.mem.startsWith(u8, cmd_tok, prefix)) continue;
+        if (!compExistsExact(cmd_tok))                continue;
+
+        const suffix = cmd_tok[prefix.len..];
+        const n = @min(suffix.len, max_completion_len);
+        @memcpy(g.ghost_buf[0..n], suffix[0..n]);
+        g.ghost_len = n;
+        return;
+    }
+
+    // 2. Fallback: shortest executable that starts with prefix.
+    //    comp_names is sorted, so the first entry past the lower bound that
+    //    starts with prefix and is longer than prefix IS the shortest match.
+    var i: usize = compLowerBound(prefix);
+    while (i < g.comp_count) : (i += 1) {
+        const slot = i * (max_completion_len + 1);
+        const name = std.mem.sliceTo(g.comp_names[slot .. slot + max_completion_len + 1], 0);
+        if (!std.mem.startsWith(u8, name, prefix)) return; // past all prefix matches
+        if (name.len <= prefix.len) continue;              // exact match, not a completion
+        const suffix = name[prefix.len..];
+        const n = @min(suffix.len, max_completion_len);
+        @memcpy(g.ghost_buf[0..n], suffix[0..n]);
+        g.ghost_len = n;
+        return;
+    }
+}
+
+// Private — history
+
+/// Prepend `cmd` to the in-memory history ring (newest at index 0).
+/// Shifts all history entries right by one slot and inserts `cmd` at index 0 (newest first).
+/// Silently no-ops when cmd is empty or exceeds max_history_line.
+fn histPrepend(cmd: []const u8) void {
+    if (cmd.len == 0 or cmd.len > max_history_line) return;
+
+    const keep = @min(g.hist_count, max_history - 1);
+    var i: usize = keep;
+    while (i > 0) : (i -= 1) {
+        const src = (i - 1) * (max_history_line + 1);
+        const dst =  i      * (max_history_line + 1);
+        @memcpy(g.hist_entries[dst .. dst + max_history_line + 1],
+                g.hist_entries[src .. src + max_history_line + 1]);
+    }
+    @memcpy(g.hist_entries[0..cmd.len], cmd);
+    g.hist_entries[cmd.len] = 0;
+    if (g.hist_count < max_history) g.hist_count += 1;
+}
+
+/// Append `cmd` to the prompt's own history file (~/.local/share/drun/history).
+fn histAppendToFile(cmd: []const u8) void {
+    if (cmd.len == 0) return;
+    const home = std.mem.span(c.getenv("HOME") orelse return);
+
+    var dir_buf:  [512:0]u8 = undefined;
+    var file_buf: [512:0]u8 = undefined;
+
+    _ = std.fmt.bufPrintZ(&dir_buf,  "{s}/.local/share/drun",        .{home}) catch return;
+    _ = std.fmt.bufPrintZ(&file_buf, "{s}/.local/share/drun/history", .{home}) catch return;
+
+    _ = c.mkdir(&dir_buf, 0o700);
+
+    const fd = c.open(&file_buf, c.O_WRONLY | c.O_CREAT | c.O_APPEND, @as(c_int, 0o600));
+    if (fd < 0) return;
+    defer _ = c.close(fd);
+    _ = c.write(fd, cmd.ptr, cmd.len);
+    _ = c.write(fd, "\n", 1);
+}
+
+/// Parse one line from a shell history file into `out`, returning its length.
+/// Returns 0 to skip the line.
+///
+/// Formats understood:
+///   fish  : `"- cmd: <command>"` (YAML block)
+///   zsh   : `": <ts>:<elapsed>;<command>"` OR bare line
+///   bash  : bare line (may have `"#<timestamp>"` markers which are skipped)
+///   drun  : bare line
+fn histParseLine(line: []const u8, out: []u8) usize {
+    if (line.len == 0) return 0;
+
+    var cmd = line;
+
+    if (std.mem.startsWith(u8, cmd, "- cmd: ")) {
+        cmd = cmd["- cmd: ".len..];
+    } else if (cmd.len > 2 and cmd[0] == ':' and cmd[1] == ' ') {
+        if (std.mem.indexOfScalar(u8, cmd, ';')) |semi| {
+            cmd = cmd[semi + 1..];
+        }
+    } else if (cmd[0] == '#') {
+        return 0;
+    }
+
+    cmd = std.mem.trim(u8, cmd, " \t\r");
+
+    if (cmd.len == 0 or cmd.len > max_history_line) return 0;
+    @memcpy(out[0..cmd.len], cmd);
+    return cmd.len;
+}
+
+/// Load history from a file, processing lines in reverse so the newest entry
+/// ends up at index 0.
+fn histLoadFile(fp: *c.FILE) void {
+    const file_buf_size = 256 * 1024;
+    const file_buf: []u8 = blk: {
+        const ptr = c.malloc(file_buf_size) orelse return;
+        break :blk @as([*]u8, @ptrCast(ptr))[0..file_buf_size];
+    };
+    defer c.free(file_buf.ptr);
+
+    const n_read = c.fread(file_buf.ptr, 1, file_buf_size - 1, fp);
+    if (n_read == 0) return;
+    const text = file_buf[0..n_read];
+
+    const max_lines_cap = max_history * 2;
+    const lines_raw = c.malloc(@sizeOf(usize) * max_lines_cap * 2) orelse return;
+    defer c.free(lines_raw);
+    const lines_buf   = @as([*]usize, @ptrCast(@alignCast(lines_raw)));
+    const line_starts = lines_buf[0..max_lines_cap];
+    const line_ends   = lines_buf[max_lines_cap .. max_lines_cap * 2];
+
+    var n_lines: usize = 0;
+    var pos: usize = 0;
+    while (pos < text.len and n_lines < max_lines_cap) {
+        const line_start = pos;
+        while (pos < text.len and text[pos] != '\n') : (pos += 1) {}
+        const line_end = pos;
+        if (pos < text.len) pos += 1;
+        line_starts[n_lines] = line_start;
+        line_ends[n_lines]   = line_end;
+        n_lines += 1;
+    }
+
+    var out_line: [max_history_line]u8 = undefined;
+
+    // Build a hash set of already-loaded entries so duplicate detection is O(1)
+    // instead of O(n²).  Pre-populate with any entries that were prepended by
+    // earlier histLoadFile calls in the same session.
+    var seen = std.AutoHashMapUnmanaged(u64, void){};
+    defer seen.deinit(g.allocator);
+    for (0..g.hist_count) |di| {
+        const dslot    = di * (max_history_line + 1);
+        const existing = std.mem.sliceTo(g.hist_entries[dslot .. dslot + max_history_line + 1], 0);
+        seen.put(g.allocator, std.hash.Wyhash.hash(0, existing), {}) catch {};
+    }
+
+    var li: usize = n_lines;
+    while (li > 0) {
+        li -= 1;
+        if (g.hist_count >= max_history) break;
+        const line = text[line_starts[li]..line_ends[li]];
+        const len = histParseLine(line, &out_line);
+        if (len == 0) continue;
+        const h = std.hash.Wyhash.hash(0, out_line[0..len]);
+        if (seen.contains(h)) continue;
+        histPrepend(out_line[0..len]);
+        seen.put(g.allocator, h, {}) catch {};
+    }
+}
+
+/// Load history from drun -> bash -> zsh -> fish (load order).
+/// Because `histPrepend()` inserts at index 0, fish ends up with the highest
+/// suggestion priority in `updateGhost`.
+fn loadHistory() void {
+    g.is_hist_loaded = true;
+
+    var path_buf: [512]u8 = undefined;
+    const home = std.mem.span(c.getenv("HOME") orelse return);
+
+    // Local helper: format a path and open it for reading.
+    const tryOpen = struct {
+        fn tryOpenFormatted(buf: []u8, comptime fmt: []const u8, args: anytype) ?*c.FILE {
+            const s = std.fmt.bufPrint(buf[0..buf.len-1], fmt, args) catch return null;
+            buf[s.len] = 0;
+            return c.fopen(@ptrCast(buf.ptr), "r");
+        }
+    }.tryOpenFormatted;
+
+    if (tryOpen(&path_buf, "{s}/.local/share/drun/history",          .{home})) |fp| {
+        defer _ = c.fclose(fp);
+        histLoadFile(fp);
+    }
+    if (tryOpen(&path_buf, "{s}/.bash_history",                       .{home})) |fp| {
+        defer _ = c.fclose(fp);
+        histLoadFile(fp);
+    }
+    if (tryOpen(&path_buf, "{s}/.zsh_history",                        .{home})) |fp| {
+        defer _ = c.fclose(fp);
+        histLoadFile(fp);
+    }
+    if (tryOpen(&path_buf, "{s}/.local/share/fish/fish_history",      .{home})) |fp| {
+        defer _ = c.fclose(fp);
+        histLoadFile(fp);
+    }
+}
+
+// Private — command spawning
+
+fn spawnCommand(cmd: []const u8) void {
+    histPrepend(cmd);
+    histAppendToFile(cmd);
+
+    // cmd.len <= vim.default_max_input - 1 (enforced by insertChar), so buf
+    // always has room for the null terminator.
+    var buf: [vim.default_max_input]u8 = undefined;
+    @memcpy(buf[0..cmd.len], cmd);
+    buf[cmd.len] = 0;
+    const cmd_z: [*:0]const u8 = buf[0..cmd.len :0];
+
+    const pid = c.fork();
+    if (pid == 0) {
+        const pid2 = c.fork();
+        if (pid2 == 0) {
+            _ = c.setsid();
+            _ = c.execvp("/bin/sh", @ptrCast(&[_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z, null }));
+            std.process.exit(1);
+        }
+        std.process.exit(0);
+    } else if (pid > 0) {
+        var status: c_int = 0;
+        _ = c.waitpid(pid, &status, 0);
+    }
+}
+
+// Private — rendering helpers
+
+/// Binary search: first byte offset where `measureTextWidth(text[0..offset])
+/// >= target_px`.  Returns `text.len` if the whole string is narrower.
+/// Binary-searches `text` for the byte offset whose rendered width first reaches `target_px`.
+/// Used to map a pixel scroll offset back to a character boundary.
+fn textOffsetAtPx(dc: *drawing.DrawContext, text: []const u8, target_px: u16) usize {
+    var lo: usize = 0;
+    var hi: usize = text.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (dc.measureTextWidth(text[0..mid]) < target_px) lo = mid + 1 else hi = mid;
+    }
+    return lo;
+}
+
+/// Return the longest prefix of `text` whose pixel width is ≤ `max_px`.
+/// Fast path: returns the full slice when the text already fits.
+fn textPrefixFit(dc: *drawing.DrawContext, text: []const u8, max_px: u16) []const u8 {
+    if (dc.measureTextWidth(text) <= max_px) return text;
+    var lo: usize = 0;
+    var hi: usize = text.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo + 1) / 2; // round up to avoid infinite loop
+        if (dc.measureTextWidth(text[0..mid]) <= max_px) lo = mid else hi = mid - 1;
+    }
+    return text[0..lo];
+}
+
+/// Draw `text` with hard pixel clipping to `[text_left_x, scroll_end_x)`.
+///
+/// `px` is the virtual pen position (scroll-space, may be negative).  It is
+/// always advanced by the full text width whether or not anything is drawn —
+/// callers rely on this to keep the pen position consistent.
+///
+/// Both edges are clipped without ellipsis:
+///   Left  — characters whose right edges fall before `text_left_x` are skipped.
+///   Right — characters that would extend past `scroll_end_x` are dropped.
+///
+/// This is the correct behaviour for pre-cursor text in a scrolling field:
+/// the cursor must appear immediately after the last visible character with no "…".
+inline fn drawSpan(
+    dc:           *drawing.DrawContext,
+    px:           *i32,
+    text_left_x:  u16,
+    scroll_end_x: u16,
+    baseline:     u16,
+    text:         []const u8,
+    color:        u32,
+) !void {
+    const w = dc.measureTextWidth(text);
+    defer px.* += @intCast(w);
+    if (w == 0) return;
+
+    const tl: i32 = text_left_x;
+    const se: i32 = scroll_end_x;
+
+    // Fully off-screen to the left or right — nothing to draw.
+    if (px.* + @as(i32, w) <= tl or px.* >= se) return;
+
+    // Skip the prefix that lies off-screen to the left.
+    const start: usize = if (px.* < tl)
+        textOffsetAtPx(dc, text, @intCast(tl - px.*))
+    else
+        0;
+
+    const draw_x: u16  = @intCast(@max(px.*, tl));
+    const available: u16 = @intCast(se - @as(i32, draw_x));
+
+    // Clip the visible suffix to the available width on the right.
+    const visible = textPrefixFit(dc, text[start..], available);
+    if (visible.len > 0)
+        try dc.drawText(draw_x, baseline, visible, color);
+}
+
+/// Draw `text` from `px` to the right edge, ellipsizing on overflow.
+/// Shared by the insert, normal, and visual branches of `drawActive` for
+/// post-cursor text.
+inline fn drawPostSpan(
+    dc:           *drawing.DrawContext,
+    px:           i32,
+    text_left_x:  u16,
+    scroll_end_x: u16,
+    baseline:     u16,
+    text:         []const u8,
+    color:        u32,
+) !void {
+    if (text.len == 0 or px >= @as(i32, scroll_end_x)) return;
+    const draw_x: u16    = @intCast(@max(px, @as(i32, text_left_x)));
+    const remaining: u16 = scroll_end_x -| draw_x;
+    if (remaining > 0)
+        try dc.drawTextEllipsis(draw_x, baseline, text, remaining, color);
+}
+
+/// Compute the clamped `draw_x` and `vis_w` for a block cursor or selection
+/// highlight.  Returns null when the block is entirely off-screen.
+inline fn cursorBlockGeom(
+    px:           i32,
+    block_w:      u16,
+    text_left_x:  u16,
+    scroll_end_x: u16,
+) ?struct { draw_x: u16, vis_w: u16 } {
+    if (px + @as(i32, block_w) <= @as(i32, text_left_x) or px >= @as(i32, scroll_end_x))
+        return null;
+    const draw_x: u16 = @intCast(@max(px, @as(i32, text_left_x)));
+    const vis_w: u16  = @intCast(@min(@as(i32, block_w), @as(i32, scroll_end_x) - px));
+    if (vis_w == 0) return null;
+    return .{ .draw_x = draw_x, .vis_w = vis_w };
+}
+
+// Private — active-mode rendering
+
+/// Render the active input UI.
+///
+/// Layout:
+///
+///   [ pad | scrollable: PROMPT | pre | CURSOR/SELECTION | post | MODE_LABEL | pad ]
+///
+/// The mode label is pinned to the right edge (does not scroll).
+/// The scrollable region keeps the cursor in view.
+fn drawActive(
+    dc:      *drawing.DrawContext,
+    config:  types.BarConfig,
+    height:  u16,
+    start_x: u16,
+    width:   u16,
+) !u16 {
+    const end_x  = start_x + width;
+    const pad    = config.scaledSegmentPadding(height);
+    const accent = config.drunPromptColor();
+    const bg     = config.drunBg();
+    const fg     = config.drunFg();
+    const prompt = config.drun_prompt;
+
+    dc.fillRect(start_x, 0, width, height, bg);
+
+    const baseline    = dc.baselineY(height);
+    const text_left_x = start_x + pad;
+    const text_end_x  = end_x   -| pad;
+    if (text_left_x >= text_end_x) return end_x;
+
+    // Mode widget — pinned to the right edge; does not scroll.
+    //
+    // Rendered as a filled pill: accent-coloured background, white text.
+    // Horizontal padding of `pill_h_pad` is applied on both sides so the text
+    // never touches the pill edge and there is a natural gap between the pill
+    // and the scrollable text region.
+    //
+    // In colon-command mode the mode label is replaced by an ex-command input
+    // field that shows ":typed_chars" followed by a block cursor.
+    const pill_h_pad: u16 = 6;
+    const white: u32 = 0xFFFFFFFF;
+
+    const mode_label = g.vim_state.mode.label();
+    const mode_idx: usize = @intFromEnum(g.vim_state.mode);
+
+    const mode_w: u16 = g.cached_mode_w[mode_idx] orelse blk: {
+        const w = dc.measureTextWidth(mode_label);
+        g.cached_mode_w[mode_idx] = w;
+        break :blk w;
+    };
+
+    // Total pill width = inner text width + left pad + right pad.
+    const pill_w: u16 = mode_w + pill_h_pad * 2;
+
+    // Reserve the pill width on the right; the scrollable region ends here.
+    const scroll_end_x: u16 = if (text_end_x >= pill_w) text_end_x - pill_w else text_left_x;
+    // Clip post-cursor text 2 px before the pill so ink never bleeds into it.
+    const ellipsis_end_x: u16 = scroll_end_x -| 2;
+
+    if (pill_w > 0 and text_end_x >= pill_w) {
+        const pill_x: u16 = text_end_x - pill_w;
+        if (pill_x >= text_left_x) {
+            // Filled pill background.
+            dc.fillRect(pill_x, cursor_v_pad, pill_w, height -| cursor_v_pad * 2, accent);
+
+            if (vim.colonInput(&g.vim_state)) |ct| {
+                // Ex-command input: ":typed_chars" + blinking insert-style caret.
+                var ppx: i32 = @as(i32, pill_x) + @as(i32, pill_h_pad);
+                const colon_w: i32 = @intCast(dc.measureTextWidth(":"));
+                try dc.drawText(@intCast(ppx), baseline, ":", white);
+                ppx += colon_w;
+                if (ct.len > 0) {
+                    try dc.drawText(@intCast(ppx), baseline, ct, white);
+                    ppx += @intCast(dc.measureTextWidth(ct));
+                }
+                // Blinking thin caret — same geometry as the insert-mode caret
+                // in the main text area so both look identical.
+                if (g.cached_caret_top == null) {
+                    const asc, const desc = dc.getMetrics();
+                    const font_h: u16 = @intCast(@max(0, @as(i32, asc) + @as(i32, desc)));
+                    g.cached_caret_top = (height -| font_h) / 2;
+                    g.cached_caret_h   = @min(font_h, height);
+                }
+                const caret_top = g.cached_caret_top.?;
+                const caret_h   = g.cached_caret_h.?;
+                const pill_inner_end: i32 = @as(i32, pill_x) + @as(i32, pill_w) - @as(i32, pill_h_pad);
+                if (g.is_blink_visible and ppx < pill_inner_end) {
+                    dc.fillRect(@intCast(ppx), caret_top, cursor_width, caret_h, white);
+                }
+            } else {
+                // Normal mode label centred (left-padded) inside the pill.
+                try dc.drawText(pill_x + pill_h_pad, baseline, mode_label, white);
+            }
+        }
+    }
+
+    if (text_left_x >= scroll_end_x) return end_x;
+
+    const max_scroll_px: u16 = scroll_end_x - text_left_x;
+
+    // Measure prompt width (cached).
+    const prompt_w: u16 = g.cached_prompt_w orelse blk: {
+        const w = dc.measureTextWidth(prompt);
+        g.cached_prompt_w = w;
+        break :blk w;
+    };
+
+    // Compute scroll offset to keep the cursor visible.
+    //
+    // In INSERT mode the cursor is a thin caret; the character it sits on is
+    // NOT consumed, so `post_text` starts at cursor (not cursor+1) and the
+    // caret_w used for layout is `cursor_width`.
+    // In all other modes a full-character block model is used.
+    const pre_cur_text = g.vim_state.buf[0..g.vim_state.cursor];
+    const pre_w_cur    = dc.measureTextWidth(pre_cur_text);
+
+    const caret_w: u16 = if (g.vim_state.mode == .insert)
+        cursor_width
+    else
+        @max(
+            dc.measureTextWidth(if (g.vim_state.cursor < g.vim_state.len)
+                g.vim_state.buf[g.vim_state.cursor..g.vim_state.cursor + 1]
+            else " "),
+            min_cursor_px,
+        );
+
+    const post_text: []const u8 = if (g.vim_state.mode == .insert)
+        g.vim_state.buf[g.vim_state.cursor..g.vim_state.len]
+    else
+        (if (g.vim_state.cursor < g.vim_state.len)
+            g.vim_state.buf[g.vim_state.cursor + 1 .. g.vim_state.len]
+        else "");
+
+    var scroll_x: u16 = 0;
+    const cursor_right = prompt_w + pre_w_cur + caret_w;
+    if (cursor_right > max_scroll_px) {
+        const min_scroll: u16 = cursor_right -| max_scroll_px;
+        // Snap scroll_x to the nearest character boundary at or past min_scroll.
+        // Without snapping, `drawSpan` draws text[start..] at text_left_x even
+        // though character `start` begins some pixels past text_left_x in virtual
+        // space.  That shift creates a gap between the rendered text and the caret
+        // that looks like a phantom extra character to the right of the cursor.
+        if (min_scroll <= prompt_w) {
+            const idx = textOffsetAtPx(dc, prompt, min_scroll);
+            scroll_x = dc.measureTextWidth(prompt[0..idx]);
+        } else {
+            const min_in_pre: u16 = min_scroll - prompt_w;
+            const idx = textOffsetAtPx(dc, pre_cur_text, min_in_pre);
+            scroll_x = prompt_w + dc.measureTextWidth(pre_cur_text[0..idx]);
+        }
+    }
+
+    // Draw prompt
+    var px: i32 = @as(i32, text_left_x) - @as(i32, scroll_x);
+    try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, prompt, accent);
+
+    // Mode-specific text rendering.
+    // When colon-command mode is active the cursor lives in the pill widget,
+    // not here — so we skip all cursor drawing in the main text area.
+    const colon_active = vim.colonInput(&g.vim_state) != null;
+
+    if (g.vim_state.mode == .visual) {
+        const sel      = vim.visualRange(&g.vim_state);
+        const sel_lo   = sel[0];
+        const sel_hi   = sel[1];
+
+        const pre_sel  = g.vim_state.buf[0..sel_lo];
+        const sel_text = g.vim_state.buf[sel_lo..sel_hi];
+        const post_sel = g.vim_state.buf[sel_hi..g.vim_state.len];
+        const sel_w    = @max(dc.measureTextWidth(sel_text), min_cursor_px);
+
+        if (pre_sel.len > 0)
+            try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, pre_sel, fg);
+
+        if (cursorBlockGeom(px, sel_w, text_left_x, scroll_end_x)) |block| {
+            dc.fillRect(block.draw_x, cursor_v_pad, block.vis_w, height -| cursor_v_pad * 2, accent);
+            if (sel_text.len > 0)
+                try dc.drawText(block.draw_x, baseline, sel_text, bg);
+        }
+        px += @intCast(sel_w);
+
+        try drawPostSpan(dc, px, text_left_x, ellipsis_end_x, baseline, post_sel, fg);
+
+    } else if (g.vim_state.mode == .insert) {
+        // Blinking thin caret; text NOT consumed by cursor position.
+        if (pre_cur_text.len > 0)
+            try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, pre_cur_text, fg);
+
+        // Caret geometry — cached since font metrics and bar height are constant
+        // between reloads.
+        if (g.cached_caret_top == null) {
+            const asc, const desc = dc.getMetrics();
+            const font_h: u16 = @intCast(@max(0, @as(i32, asc) + @as(i32, desc)));
+            g.cached_caret_top = (height -| font_h) / 2;
+            g.cached_caret_h   = @min(font_h, height);
+        }
+        const caret_top = g.cached_caret_top.?;
+        const caret_h   = g.cached_caret_h.?;
+
+        if (g.is_blink_visible and !colon_active and px >= @as(i32, text_left_x) and px < @as(i32, scroll_end_x)) {
+            dc.fillRect(@intCast(px), caret_top, cursor_width, caret_h, accent);
+        }
+
+        // Ghost text (only when cursor is at end).
+        if (g.ghost_len > 0 and g.vim_state.cursor == g.vim_state.len and px < @as(i32, scroll_end_x)) {
+            const ghost = g.ghost_buf[0..g.ghost_len];
+            const draw_x: u16  = @intCast(@max(px, @as(i32, text_left_x)));
+            const remaining: u16 = scroll_end_x -| draw_x;
+            if (remaining > 0)
+                try dc.drawTextEllipsis(draw_x, baseline, ghost, remaining, accent);
+        }
+
+        try drawPostSpan(dc, px, text_left_x, ellipsis_end_x, baseline, post_text, fg);
+
+    } else {
+        // NORMAL / REPLACE: full-character block cursor.
+        const pre_text = g.vim_state.buf[0..g.vim_state.cursor];
+        const cur_text = if (g.vim_state.cursor < g.vim_state.len)
+            g.vim_state.buf[g.vim_state.cursor .. g.vim_state.cursor + 1]
+        else " ";
+        const cur_w    = @max(dc.measureTextWidth(cur_text), min_cursor_px);
+
+        if (pre_text.len > 0)
+            try drawSpan(dc, &px, text_left_x, scroll_end_x, baseline, pre_text, fg);
+
+        if (colon_active) {
+            // No cursor box — draw the character under the cursor as plain text
+            // so it isn't swallowed when the cursor moves to the pill widget.
+            if (g.vim_state.cursor < g.vim_state.len) {
+                if (cursorBlockGeom(px, cur_w, text_left_x, scroll_end_x)) |block|
+                    try dc.drawText(block.draw_x, baseline, cur_text, fg);
+            }
+        } else {
+            if (cursorBlockGeom(px, cur_w, text_left_x, scroll_end_x)) |block| {
+                dc.fillRect(block.draw_x, cursor_v_pad, block.vis_w, height -| cursor_v_pad * 2, accent);
+                if (g.vim_state.cursor < g.vim_state.len)
+                    try dc.drawText(block.draw_x, baseline, cur_text, bg);
+            }
+        }
+        px += @intCast(cur_w);
+
+        try drawPostSpan(dc, px, text_left_x, ellipsis_end_x, baseline, post_text, fg);
+    }
+
+    dc.flushRect(start_x, width);
+    return end_x;
 }
 </file>
 
