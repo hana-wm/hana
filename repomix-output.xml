@@ -1586,320 +1586,6 @@ pub inline fn warnOnErr(e: anyerror, comptime context: []const u8) void {
 }
 </file>
 
-<file path="src/core/modules/scale.zig">
-//! DPI detection and scaling utilities for consistent bar appearance across display resolutions.
-
-const std = @import("std");
-
-const core      = @import("core");
-    const xcb   = core.xcb;
-const constants = @import("constants");
-const debug     = @import("debug");
-
-const parser = @import("parser");
-
-// Baseline screen used to define "1× scale". All percentage-based values
-// are computed relative to this reference display.
-const BASELINE_WIDTH:  f32 = 2560.0;
-const BASELINE_HEIGHT: f32 = 1600.0;
-const BASELINE_DPI          = constants.BASELINE_DPI;
-
-// Font size percentages are relative to 1080 p height, not the baseline display,
-// so font sizing degrades more gracefully on smaller screens.
-const FONT_BASELINE_HEIGHT: f32 = 1080.0;
-
-const BASELINE_DIAGONAL: f32 = @sqrt(BASELINE_WIDTH * BASELINE_WIDTH + BASELINE_HEIGHT * BASELINE_HEIGHT);
-
-/// Snap to a common DPI value if within 5% of it, to avoid rendering at odd
-/// intermediate DPIs caused by imprecise monitor EDID data.
-const SNAP_THRESHOLD: f32 = 0.05;
-
-/// Minimum bar height in pixels. Exposed so callers can validate config values
-/// before passing them to scaleBarHeight.
-pub const BAR_MIN_HEIGHT_PX: u16 = 20;
-
-/// Maximum long-words to request for the RESOURCE_MANAGER property (16 KB).
-const RESOURCE_MANAGER_MAX_LEN: u32 = 4096;
-
-// Not thread-safe; assumes detectDpi() is only called from the main thread.
-var dpi_cache: ?DpiInfo = null;
-
-const COMMON_DPI_TABLE = [_]f32{ 96.0, 120.0, 144.0, 192.0 };
-
-/// Re-exported from core so callers that only import scale still get the type.
-pub const DpiInfo = core.DpiInfo;
-
-/// Reads the Xft.dpi value from the X RESOURCE_MANAGER property, if present.
-/// Returns null when the property is absent, empty, or does not contain an Xft.dpi entry.
-fn readXftDpi(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) ?f32 {
-    const atom_cookie = xcb.xcb_intern_atom(conn, 0, "RESOURCE_MANAGER".len, "RESOURCE_MANAGER");
-    const atom_reply  = xcb.xcb_intern_atom_reply(conn, atom_cookie, null) orelse return null;
-    defer std.c.free(atom_reply);
-
-    const prop_cookie = xcb.xcb_get_property(conn, 0, screen.*.root, atom_reply.*.atom,
-        xcb.XCB_ATOM_STRING, 0, RESOURCE_MANAGER_MAX_LEN);
-    const prop_reply = xcb.xcb_get_property_reply(conn, prop_cookie, null) orelse return null;
-    defer std.c.free(prop_reply);
-
-    if (prop_reply.*.format != 8 or prop_reply.*.type != xcb.XCB_ATOM_STRING) return null;
-
-    const value_len = xcb.xcb_get_property_value_length(prop_reply);
-    if (value_len == 0) return null;
-
-    const value_ptr    = xcb.xcb_get_property_value(prop_reply);
-    const resource_str = @as([*]const u8, @ptrCast(value_ptr))[0..@intCast(value_len)];
-
-    // Format: "Xft.dpi:\t96" or "Xft.dpi: 96".
-    // Slice off the prefix and trim whitespace — avoids the split-on-delimiter
-    // trap where ":\t" would yield an empty token before the value.
-    const prefix = "Xft.dpi:";
-    var lines = std.mem.splitScalar(u8, resource_str, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.startsWith(u8, trimmed, prefix)) {
-            const rest = std.mem.trim(u8, trimmed[prefix.len..], " \t");
-            const dpi  = std.fmt.parseFloat(f32, rest) catch continue;
-            return dpi;
-        }
-    }
-    return null;
-}
-
-/// Computes DPI from the screen's physical dimensions reported by X.
-/// Returns BASELINE_DPI if the screen reports 0mm dimensions (e.g. virtual displays).
-fn calcDpiFromGeometry(screen: *xcb.xcb_screen_t) f32 {
-    const width_px:  f32 = @floatFromInt(screen.width_in_pixels);
-    const height_px: f32 = @floatFromInt(screen.height_in_pixels);
-    const width_mm:  f32 = @floatFromInt(screen.width_in_millimeters);
-    const height_mm: f32 = @floatFromInt(screen.height_in_millimeters);
-    if (width_mm == 0 or height_mm == 0) {
-        debug.warn("Display reports 0mm dimensions, using baseline DPI", .{});
-        return BASELINE_DPI;
-    }
-    const dpi_x   = (width_px  / width_mm)  * 25.4;
-    const dpi_y   = (height_px / height_mm) * 25.4;
-    const avg_dpi = (dpi_x + dpi_y) / 2.0;
-    debug.info("Calculated DPI: X={d:.1}, Y={d:.1}, Average={d:.1}", .{ dpi_x, dpi_y, avg_dpi });
-    return avg_dpi;
-}
-
-/// Returns the entry in COMMON_DPI_TABLE nearest to `dpi`, snapping only when
-/// within SNAP_THRESHOLD of it to avoid rendering at odd intermediate DPIs.
-fn snapToCommonDpi(dpi: f32) f32 {
-    var closest = COMMON_DPI_TABLE[0];
-    for (COMMON_DPI_TABLE[1..]) |entry| {
-        if (@abs(dpi - entry) < @abs(dpi - closest)) closest = entry;
-    }
-    if (@abs(dpi - closest) / closest < SNAP_THRESHOLD) {
-        debug.info("Snapped DPI {d:.1} to common value {d:.1}", .{ dpi, closest });
-        return closest;
-    }
-    return dpi;
-}
-
-/// Computes a scale factor from the screen's pixel diagonal relative to the baseline display.
-/// Used as a fallback when geometry-based DPI is out of a plausible range.
-fn calcScaleFromResolution(screen: *xcb.xcb_screen_t) f32 {
-    const width_px:  f32 = @floatFromInt(screen.width_in_pixels);
-    const height_px: f32 = @floatFromInt(screen.height_in_pixels);
-    const diagonal         = @sqrt(width_px * width_px + height_px * height_px);
-    const resolution_scale = diagonal / BASELINE_DIAGONAL;
-    debug.info("Resolution scaling: {d:.0}x{d:.0} -> {d:.2}x baseline ({d:.0}x{d:.0})",
-        .{ width_px, height_px, resolution_scale, BASELINE_WIDTH, BASELINE_HEIGHT });
-    return resolution_scale;
-}
-
-/// Detect DPI, returning a cached result until the DPI cache is invalidated.
-/// Priority: Xft.dpi from X resources -> geometry calculation -> resolution-based scaling.
-pub fn detectDpi(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) DpiInfo {
-    if (dpi_cache) |cached| return cached;
-    const result = detectDpiUncached(conn, screen);
-    dpi_cache = result;
-    return result;
-}
-
-/// Performs the actual DPI detection without consulting or updating the cache.
-fn detectDpiUncached(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) DpiInfo {
-    if (readXftDpi(conn, screen)) |xft_dpi| {
-        debug.info("Using DPI from X resources (Xft.dpi): {d:.1}", .{xft_dpi});
-        return DpiInfo.fromDpi(snapToCommonDpi(xft_dpi));
-    }
-
-    var geometry_dpi = calcDpiFromGeometry(screen);
-    if (geometry_dpi < 50.0 or geometry_dpi > 300.0) {
-        debug.warn("Calculated DPI {d:.1} seems unreasonable, using resolution-based scaling", .{geometry_dpi});
-        geometry_dpi = BASELINE_DPI * calcScaleFromResolution(screen);
-        debug.info("Using resolution-based DPI: {d:.1}", .{geometry_dpi});
-    } else {
-        debug.info("Using geometry-calculated DPI: {d:.1}", .{geometry_dpi});
-    }
-
-    return DpiInfo.fromDpi(snapToCommonDpi(geometry_dpi));
-}
-
-/// Scales an integer value by `scale_factor`, rounding to the nearest integer.
-pub fn scaleInt(base_value: anytype, scale_factor: f32) @TypeOf(base_value) {
-    const T = @TypeOf(base_value);
-    return switch (@typeInfo(T)) {
-        .int, .comptime_int => @intFromFloat(@round(@as(f32, @floatFromInt(base_value)) * scale_factor)),
-        else => @compileError("scaleInt() only supports integer types; use scaleToInt() for floats"),
-    };
-}
-
-/// Scales a float value by `scale_factor` and rounds to the nearest integer of type `T`.
-pub fn scaleToInt(comptime T: type, base_value: f32, scale_factor: f32) T {
-    return @intFromFloat(@round(base_value * scale_factor));
-}
-
-/// Scale a border or gap value.
-/// Percentage values are screen-relative, so scale_factor is intentionally
-/// excluded — applying it would double-scale on HiDPI displays.
-/// Absolute pixel values are screen-independent and used as-is.
-pub fn scaleBorderWidth(value: parser.ScalableValue, reference_dimension: u16) u16 {
-    if (value.is_percentage) {
-        const dim_f: f32 = @floatFromInt(reference_dimension);
-        return @intFromFloat(@max(0.0, @round((value.value / 100.0) * 0.5 * dim_f)));
-    }
-    return @intFromFloat(@max(0.0, @round(value.value)));
-}
-
-/// Returns the master width as a fraction (0.0–1.0) for percentage values,
-/// or as a negative float encoding an absolute pixel value otherwise.
-/// Callers should treat negative results as `@abs(result)` pixels.
-pub fn scaleMasterWidth(value: parser.ScalableValue) f32 {
-    return if (value.is_percentage) value.value / 100.0 else -value.value;
-}
-
-/// Scales a font size value against the screen height, clamped to a minimum of 1px.
-/// Percentage values are relative to FONT_BASELINE_HEIGHT (1080px) rather than the
-/// screen baseline, so font sizes degrade more gracefully on smaller screens.
-pub fn scaleFontSize(value: parser.ScalableValue, screen: *xcb.xcb_screen_t) u16 {
-    if (value.is_percentage) {
-        const screen_height: f32 = @floatFromInt(screen.height_in_pixels);
-        return @intFromFloat(@max(1.0, @round(value.value * (screen_height / FONT_BASELINE_HEIGHT))));
-    }
-    return @intFromFloat(@max(1.0, @round(value.value)));
-}
-
-/// Converts a scalable bar height value to pixels, clamped to BAR_MIN_HEIGHT_PX.
-pub fn scaleBarHeight(value: parser.ScalableValue, screen_height: u16) u16 {
-    const screen_height_f: f32 = @floatFromInt(screen_height);
-    const scaled_px: f32 = if (value.is_percentage)
-        screen_height_f * (value.value / 100.0)
-    else
-        value.value;
-    return @max(BAR_MIN_HEIGHT_PX, @as(u16, @intFromFloat(@round(scaled_px))));
-}
-
-// Refresh-rate detection
-
-/// Fallback refresh rate used when RandR is unavailable or returns an invalid value.
-pub const default_hz: f64 = 60.0;
-
-const HzCache = struct {
-    hz:       f64  = default_hz,
-    is_ready: bool = false,
-};
-var hz_cache: HzCache = .{};
-
-/// Detect and cache the monitor refresh rate.
-/// Subsequent calls are a single branch and a return — zero X11 I/O.
-pub fn ensureRefreshRateDetected(conn: *xcb.xcb_connection_t) void {
-    if (hz_cache.is_ready) return;
-    hz_cache.is_ready = true;
-    hz_cache.hz       = detectRefreshRate(conn);
-}
-
-/// Returns the detected monitor refresh rate in Hz.
-/// Returns `default_hz` (60.0) when called before `ensureRefreshRateDetected`.
-pub fn getDetectedRateHz() f64 {
-    return if (hz_cache.is_ready) hz_cache.hz else default_hz;
-}
-
-/// Returns the root window ID of the first screen, or 0 if no screens are available.
-fn xcbRootWindow(conn: *xcb.xcb_connection_t) u32 {
-    const setup = xcb.xcb_get_setup(conn);
-    var it      = xcb.xcb_setup_roots_iterator(setup);
-    return if (it.rem > 0) it.data.*.root else 0;
-}
-
-/// Read the refresh rate of all active CRTCs and return the highest value.
-///
-/// All `xcb_randr_get_crtc_info` cookies are fired before any reply is read,
-/// reducing round-trips from O(crtcs) to O(1).
-///
-/// Returning the maximum rate rather than the first ensures correct behaviour
-/// on multi-monitor setups where each display has a different refresh rate.
-///
-/// Returns null on any failure.
-fn detectRefreshRateViaCrtc(conn: *xcb.xcb_connection_t, root: u32) ?f64 {
-    const rc = xcb.xcb_randr_get_screen_resources_current(conn, root);
-    const rr = xcb.xcb_randr_get_screen_resources_current_reply(conn, rc, null) orelse
-        return null;
-    defer std.c.free(rr);
-
-    const mode_it_len = xcb.xcb_randr_get_screen_resources_current_modes_length(rr);
-    const mode_it_ptr = xcb.xcb_randr_get_screen_resources_current_modes(rr);
-    if (mode_it_len <= 0 or mode_it_ptr == null) return null;
-    const modes = mode_it_ptr.?[0..@intCast(mode_it_len)];
-
-    const crtc_it_len = xcb.xcb_randr_get_screen_resources_current_crtcs_length(rr);
-    const crtc_it_ptr = xcb.xcb_randr_get_screen_resources_current_crtcs(rr);
-    if (crtc_it_len <= 0 or crtc_it_ptr == null) return null;
-    const crtcs = crtc_it_ptr.?[0..@intCast(crtc_it_len)];
-
-    const max_crtcs: usize = 16;
-    const n_crtcs          = @min(crtcs.len, max_crtcs);
-    var crtc_cookies: [max_crtcs]xcb.xcb_randr_get_crtc_info_cookie_t = undefined;
-    for (crtcs[0..n_crtcs], crtc_cookies[0..n_crtcs]) |crtc, *cookie| {
-        cookie.* = xcb.xcb_randr_get_crtc_info(conn, crtc, rr.*.config_timestamp);
-    }
-
-    var best_hz: f64 = 0.0;
-    for (0..n_crtcs) |i| {
-        const cr = xcb.xcb_randr_get_crtc_info_reply(conn, crtc_cookies[i], null) orelse continue;
-        defer std.c.free(cr);
-
-        const mode_id = cr.*.mode;
-        if (mode_id == 0) continue;
-
-        for (modes) |m| {
-            if (m.id != mode_id) continue;
-            const htotal: u64 = m.htotal;
-            const vtotal: u64 = m.vtotal;
-            if (htotal == 0 or vtotal == 0) break;
-            const hz: f64 = @as(f64, @floatFromInt(m.dot_clock)) /
-                @as(f64, @floatFromInt(htotal * vtotal));
-            if (hz > best_hz) best_hz = hz;
-            break;
-        }
-    }
-    return if (best_hz > 0.0) best_hz else null;
-}
-
-/// Attempt to read the current refresh rate via `xcb_randr_get_screen_info`.
-/// Falls back to CRTC mode data when rate == 0, then to `default_hz`.
-fn detectRefreshRate(conn: *xcb.xcb_connection_t) f64 {
-    if (!@hasDecl(xcb, "xcb_randr_get_screen_info")) return default_hz;
-
-    const root = xcbRootWindow(conn);
-    if (root == 0) return default_hz;
-
-    const cookie = xcb.xcb_randr_get_screen_info(conn, root);
-    const reply  = xcb.xcb_randr_get_screen_info_reply(conn, cookie, null) orelse
-        return default_hz;
-    defer std.c.free(reply);
-
-    const rate = reply.*.rate;
-    if (rate > 0) return @floatFromInt(rate);
-
-    if (@hasDecl(xcb, "xcb_randr_get_screen_resources_current"))
-        if (detectRefreshRateViaCrtc(conn, root)) |hz| return hz;
-
-    return default_hz;
-}
-</file>
-
 <file path="src/core/constants.zig">
 //! Central location for core constants used across multiple files.
 
@@ -2263,6 +1949,484 @@ pub fn draw(
 }
 </file>
 
+<file path="src/core/modules/scale.zig">
+//! DPI detection and scaling utilities for consistent bar appearance across display resolutions.
+
+const std = @import("std");
+
+const core      = @import("core");
+    const xcb   = core.xcb;
+const constants = @import("constants");
+const debug     = @import("debug");
+
+const parser = @import("parser");
+
+// Baseline screen used to define "1× scale". All percentage-based values
+// are computed relative to this reference display.
+const BASELINE_WIDTH:  f32 = 2560.0;
+const BASELINE_HEIGHT: f32 = 1600.0;
+const BASELINE_DPI          = constants.BASELINE_DPI;
+
+// Font size percentages are relative to 1080 p height, not the baseline display,
+// so font sizing degrades more gracefully on smaller screens.
+const FONT_BASELINE_HEIGHT: f32 = 1080.0;
+
+const BASELINE_DIAGONAL: f32 = @sqrt(BASELINE_WIDTH * BASELINE_WIDTH + BASELINE_HEIGHT * BASELINE_HEIGHT);
+
+/// Snap to a common DPI value if within 5% of it, to avoid rendering at odd
+/// intermediate DPIs caused by imprecise monitor EDID data.
+const SNAP_THRESHOLD: f32 = 0.05;
+
+/// Minimum bar height in pixels. Exposed so callers can validate config values
+/// before passing them to scaleBarHeight.
+pub const BAR_MIN_HEIGHT_PX: u16 = 20;
+
+/// Maximum long-words to request for the RESOURCE_MANAGER property (16 KB).
+const RESOURCE_MANAGER_MAX_LEN: u32 = 4096;
+
+// Not thread-safe; assumes detectDpi() is only called from the main thread.
+var dpi_cache: ?DpiInfo = null;
+
+const COMMON_DPI_TABLE = [_]f32{ 96.0, 120.0, 144.0, 192.0 };
+
+/// Re-exported from core so callers that only import scale still get the type.
+pub const DpiInfo = core.DpiInfo;
+
+/// Reads the Xft.dpi value from the X RESOURCE_MANAGER property, if present.
+/// Returns null when the property is absent, empty, or does not contain an Xft.dpi entry.
+fn readXftDpi(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) ?f32 {
+    const atom_cookie = xcb.xcb_intern_atom(conn, 0, "RESOURCE_MANAGER".len, "RESOURCE_MANAGER");
+    const atom_reply  = xcb.xcb_intern_atom_reply(conn, atom_cookie, null) orelse return null;
+    defer std.c.free(atom_reply);
+
+    const prop_cookie = xcb.xcb_get_property(conn, 0, screen.*.root, atom_reply.*.atom,
+        xcb.XCB_ATOM_STRING, 0, RESOURCE_MANAGER_MAX_LEN);
+    const prop_reply = xcb.xcb_get_property_reply(conn, prop_cookie, null) orelse return null;
+    defer std.c.free(prop_reply);
+
+    if (prop_reply.*.format != 8 or prop_reply.*.type != xcb.XCB_ATOM_STRING) return null;
+
+    const value_len = xcb.xcb_get_property_value_length(prop_reply);
+    if (value_len == 0) return null;
+
+    const value_ptr    = xcb.xcb_get_property_value(prop_reply);
+    const resource_str = @as([*]const u8, @ptrCast(value_ptr))[0..@intCast(value_len)];
+
+    // Format: "Xft.dpi:\t96" or "Xft.dpi: 96".
+    // Slice off the prefix and trim whitespace — avoids the split-on-delimiter
+    // trap where ":\t" would yield an empty token before the value.
+    const prefix = "Xft.dpi:";
+    var lines = std.mem.splitScalar(u8, resource_str, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, prefix)) {
+            const rest = std.mem.trim(u8, trimmed[prefix.len..], " \t");
+            const dpi  = std.fmt.parseFloat(f32, rest) catch continue;
+            return dpi;
+        }
+    }
+    return null;
+}
+
+/// Computes DPI from the screen's physical dimensions reported by X.
+/// Returns BASELINE_DPI if the screen reports 0mm dimensions (e.g. virtual displays).
+fn calcDpiFromGeometry(screen: *xcb.xcb_screen_t) f32 {
+    const width_px:  f32 = @floatFromInt(screen.width_in_pixels);
+    const height_px: f32 = @floatFromInt(screen.height_in_pixels);
+    const width_mm:  f32 = @floatFromInt(screen.width_in_millimeters);
+    const height_mm: f32 = @floatFromInt(screen.height_in_millimeters);
+    if (width_mm == 0 or height_mm == 0) {
+        debug.warn("Display reports 0mm dimensions, using baseline DPI", .{});
+        return BASELINE_DPI;
+    }
+    const dpi_x   = (width_px  / width_mm)  * 25.4;
+    const dpi_y   = (height_px / height_mm) * 25.4;
+    const avg_dpi = (dpi_x + dpi_y) / 2.0;
+    debug.info("Calculated DPI: X={d:.1}, Y={d:.1}, Average={d:.1}", .{ dpi_x, dpi_y, avg_dpi });
+    return avg_dpi;
+}
+
+/// Returns the entry in COMMON_DPI_TABLE nearest to `dpi`, snapping only when
+/// within SNAP_THRESHOLD of it to avoid rendering at odd intermediate DPIs.
+fn snapToCommonDpi(dpi: f32) f32 {
+    var closest = COMMON_DPI_TABLE[0];
+    for (COMMON_DPI_TABLE[1..]) |entry| {
+        if (@abs(dpi - entry) < @abs(dpi - closest)) closest = entry;
+    }
+    if (@abs(dpi - closest) / closest < SNAP_THRESHOLD) {
+        debug.info("Snapped DPI {d:.1} to common value {d:.1}", .{ dpi, closest });
+        return closest;
+    }
+    return dpi;
+}
+
+/// Computes a scale factor from the screen's pixel diagonal relative to the baseline display.
+/// Used as a fallback when geometry-based DPI is out of a plausible range.
+fn calcScaleFromResolution(screen: *xcb.xcb_screen_t) f32 {
+    const width_px:  f32 = @floatFromInt(screen.width_in_pixels);
+    const height_px: f32 = @floatFromInt(screen.height_in_pixels);
+    const diagonal         = @sqrt(width_px * width_px + height_px * height_px);
+    const resolution_scale = diagonal / BASELINE_DIAGONAL;
+    debug.info("Resolution scaling: {d:.0}x{d:.0} -> {d:.2}x baseline ({d:.0}x{d:.0})",
+        .{ width_px, height_px, resolution_scale, BASELINE_WIDTH, BASELINE_HEIGHT });
+    return resolution_scale;
+}
+
+/// Detect DPI, returning a cached result until the DPI cache is invalidated.
+/// Priority: Xft.dpi from X resources -> geometry calculation -> resolution-based scaling.
+pub fn detectDpi(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) DpiInfo {
+    if (dpi_cache) |cached| return cached;
+    const result = detectDpiUncached(conn, screen);
+    dpi_cache = result;
+    return result;
+}
+
+/// Performs the actual DPI detection without consulting or updating the cache.
+fn detectDpiUncached(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) DpiInfo {
+    if (readXftDpi(conn, screen)) |xft_dpi| {
+        debug.info("Using DPI from X resources (Xft.dpi): {d:.1}", .{xft_dpi});
+        return DpiInfo.fromDpi(snapToCommonDpi(xft_dpi));
+    }
+
+    var geometry_dpi = calcDpiFromGeometry(screen);
+    if (geometry_dpi < 50.0 or geometry_dpi > 300.0) {
+        debug.warn("Calculated DPI {d:.1} seems unreasonable, using resolution-based scaling", .{geometry_dpi});
+        geometry_dpi = BASELINE_DPI * calcScaleFromResolution(screen);
+        debug.info("Using resolution-based DPI: {d:.1}", .{geometry_dpi});
+    } else {
+        debug.info("Using geometry-calculated DPI: {d:.1}", .{geometry_dpi});
+    }
+
+    return DpiInfo.fromDpi(snapToCommonDpi(geometry_dpi));
+}
+
+/// Scales an integer value by `scale_factor`, rounding to the nearest integer.
+pub fn scaleInt(base_value: anytype, scale_factor: f32) @TypeOf(base_value) {
+    const T = @TypeOf(base_value);
+    return switch (@typeInfo(T)) {
+        .int, .comptime_int => @intFromFloat(@round(@as(f32, @floatFromInt(base_value)) * scale_factor)),
+        else => @compileError("scaleInt() only supports integer types; use scaleToInt() for floats"),
+    };
+}
+
+/// Scales a float value by `scale_factor` and rounds to the nearest integer of type `T`.
+pub fn scaleToInt(comptime T: type, base_value: f32, scale_factor: f32) T {
+    return @intFromFloat(@round(base_value * scale_factor));
+}
+
+/// Scale a border or gap value.
+/// Percentage values are screen-relative, so scale_factor is intentionally
+/// excluded — applying it would double-scale on HiDPI displays.
+/// Absolute pixel values are screen-independent and used as-is.
+pub fn scaleBorderWidth(value: parser.ScalableValue, reference_dimension: u16) u16 {
+    if (value.is_percentage) {
+        const dim_f: f32 = @floatFromInt(reference_dimension);
+        return @intFromFloat(@max(0.0, @round((value.value / 100.0) * 0.5 * dim_f)));
+    }
+    return @intFromFloat(@max(0.0, @round(value.value)));
+}
+
+/// Returns the master width as a fraction (0.0–1.0) for percentage values,
+/// or as a negative float encoding an absolute pixel value otherwise.
+/// Callers should treat negative results as `@abs(result)` pixels.
+pub fn scaleMasterWidth(value: parser.ScalableValue) f32 {
+    return if (value.is_percentage) value.value / 100.0 else -value.value;
+}
+
+/// Scales a font size value against the screen height, clamped to a minimum of 1px.
+/// Percentage values are relative to FONT_BASELINE_HEIGHT (1080px) rather than the
+/// screen baseline, so font sizes degrade more gracefully on smaller screens.
+pub fn scaleFontSize(value: parser.ScalableValue, screen: *xcb.xcb_screen_t) u16 {
+    if (value.is_percentage) {
+        const screen_height: f32 = @floatFromInt(screen.height_in_pixels);
+        return @intFromFloat(@max(1.0, @round(value.value * (screen_height / FONT_BASELINE_HEIGHT))));
+    }
+    return @intFromFloat(@max(1.0, @round(value.value)));
+}
+
+/// Converts a scalable bar height value to pixels, clamped to BAR_MIN_HEIGHT_PX.
+pub fn scaleBarHeight(value: parser.ScalableValue, screen_height: u16) u16 {
+    const screen_height_f: f32 = @floatFromInt(screen_height);
+    const scaled_px: f32 = if (value.is_percentage)
+        screen_height_f * (value.value / 100.0)
+    else
+        value.value;
+    return @max(BAR_MIN_HEIGHT_PX, @as(u16, @intFromFloat(@round(scaled_px))));
+}
+
+// Refresh-rate detection
+
+/// Fallback refresh rate used when RandR is unavailable or returns an invalid value.
+pub const default_hz: f64 = 60.0;
+
+const HzCache = struct {
+    hz:       f64  = default_hz,
+    is_ready: bool = false,
+};
+var hz_cache: HzCache = .{};
+
+/// Detect and cache the monitor refresh rate.
+/// Subsequent calls are a single branch and a return — zero X11 I/O.
+pub fn ensureRefreshRateDetected(conn: *xcb.xcb_connection_t) void {
+    if (hz_cache.is_ready) return;
+    hz_cache.is_ready = true;
+    hz_cache.hz       = detectRefreshRate(conn);
+}
+
+/// Returns the detected monitor refresh rate in Hz.
+/// Returns `default_hz` (60.0) when called before `ensureRefreshRateDetected`.
+pub fn getDetectedRateHz() f64 {
+    return if (hz_cache.is_ready) hz_cache.hz else default_hz;
+}
+
+/// Returns the root window ID of the first screen, or 0 if no screens are available.
+fn xcbRootWindow(conn: *xcb.xcb_connection_t) u32 {
+    const setup = xcb.xcb_get_setup(conn);
+    var it      = xcb.xcb_setup_roots_iterator(setup);
+    return if (it.rem > 0) it.data.*.root else 0;
+}
+
+/// Read the refresh rate of all active CRTCs and return the highest value.
+///
+/// All `xcb_randr_get_crtc_info` cookies are fired before any reply is read,
+/// reducing round-trips from O(crtcs) to O(1).
+///
+/// Returning the maximum rate rather than the first ensures correct behaviour
+/// on multi-monitor setups where each display has a different refresh rate.
+///
+/// Returns null on any failure.
+fn detectRefreshRateViaCrtc(conn: *xcb.xcb_connection_t, root: u32) ?f64 {
+    const rc = xcb.xcb_randr_get_screen_resources_current(conn, root);
+    const rr = xcb.xcb_randr_get_screen_resources_current_reply(conn, rc, null) orelse
+        return null;
+    defer std.c.free(rr);
+
+    const mode_it_len = xcb.xcb_randr_get_screen_resources_current_modes_length(rr);
+    const mode_it_ptr = xcb.xcb_randr_get_screen_resources_current_modes(rr);
+    if (mode_it_len <= 0 or mode_it_ptr == null) return null;
+    const modes = mode_it_ptr.?[0..@intCast(mode_it_len)];
+
+    const crtc_it_len = xcb.xcb_randr_get_screen_resources_current_crtcs_length(rr);
+    const crtc_it_ptr = xcb.xcb_randr_get_screen_resources_current_crtcs(rr);
+    if (crtc_it_len <= 0 or crtc_it_ptr == null) return null;
+    const crtcs = crtc_it_ptr.?[0..@intCast(crtc_it_len)];
+
+    const max_crtcs: usize = 16;
+    const n_crtcs          = @min(crtcs.len, max_crtcs);
+    var crtc_cookies: [max_crtcs]xcb.xcb_randr_get_crtc_info_cookie_t = undefined;
+    for (crtcs[0..n_crtcs], crtc_cookies[0..n_crtcs]) |crtc, *cookie| {
+        cookie.* = xcb.xcb_randr_get_crtc_info(conn, crtc, rr.*.config_timestamp);
+    }
+
+    var best_hz: f64 = 0.0;
+    for (0..n_crtcs) |i| {
+        const cr = xcb.xcb_randr_get_crtc_info_reply(conn, crtc_cookies[i], null) orelse continue;
+        defer std.c.free(cr);
+
+        const mode_id = cr.*.mode;
+        if (mode_id == 0) continue;
+
+        for (modes) |m| {
+            if (m.id != mode_id) continue;
+            const htotal: u64 = m.htotal;
+            const vtotal: u64 = m.vtotal;
+            if (htotal == 0 or vtotal == 0) break;
+            const hz: f64 = @as(f64, @floatFromInt(m.dot_clock)) /
+                @as(f64, @floatFromInt(htotal * vtotal));
+            if (hz > best_hz) best_hz = hz;
+            break;
+        }
+    }
+    return if (best_hz > 0.0) best_hz else null;
+}
+
+/// Attempt to read the current refresh rate via `xcb_randr_get_screen_info`.
+/// Falls back to CRTC mode data when rate == 0, then to `default_hz`.
+fn detectRefreshRate(conn: *xcb.xcb_connection_t) f64 {
+    if (!@hasDecl(xcb, "xcb_randr_get_screen_info")) return default_hz;
+
+    const root = xcbRootWindow(conn);
+    if (root == 0) return default_hz;
+
+    const cookie = xcb.xcb_randr_get_screen_info(conn, root);
+    const reply  = xcb.xcb_randr_get_screen_info_reply(conn, cookie, null) orelse
+        return default_hz;
+    defer std.c.free(reply);
+
+    const rate = reply.*.rate;
+    if (rate > 0) return @floatFromInt(rate);
+
+    if (@hasDecl(xcb, "xcb_randr_get_screen_resources_current"))
+        if (detectRefreshRateViaCrtc(conn, root)) |hz| return hz;
+
+    return default_hz;
+}
+</file>
+
+<file path="src/input/xkbcommon.zig">
+//! XKB (X Keyboard Extension) bindings and keyboard state management.
+
+const std  = @import("std");
+
+const constants = @import("constants");
+
+pub const xkb = @cImport({
+    @cInclude("xkbcommon/xkbcommon.h");
+    @cInclude("xkbcommon/xkbcommon-x11.h");
+});
+
+// Re-exports for callers that don't want to reach through `xkb.*`.
+pub const XKB_KEYSYM_CASE_INSENSITIVE:    u32 = xkb.XKB_KEYSYM_CASE_INSENSITIVE;
+pub const XKB_KEY_NoSymbol:               u32 = xkb.XKB_KEY_NoSymbol;
+pub const xkb_context                         = xkb.struct_xkb_context;
+pub const xkb_keymap                          = xkb.struct_xkb_keymap;
+pub const xkb_state                           = xkb.struct_xkb_state;
+pub const xkb_keysym_from_name                = xkb.xkb_keysym_from_name;
+pub const xkb_context_new                     = xkb.xkb_context_new;
+pub const xkb_context_unref                   = xkb.xkb_context_unref;
+pub const xkb_x11_setup_xkb_extension         = xkb.xkb_x11_setup_xkb_extension;
+pub const xkb_x11_get_core_keyboard_device_id = xkb.xkb_x11_get_core_keyboard_device_id;
+pub const xkb_x11_keymap_new_from_device      = xkb.xkb_x11_keymap_new_from_device;
+pub const xkb_state_new                       = xkb.xkb_state_new;
+pub const xkb_state_unref                     = xkb.xkb_state_unref;
+pub const xkb_keymap_unref                    = xkb.xkb_keymap_unref;
+pub const xkb_state_key_get_one_sym           = xkb.xkb_state_key_get_one_sym;
+
+const MAX_ATTEMPTS: u8 = 3;
+
+pub const XkbState = struct {
+    context:           *xkb_context,
+    keymap:            *xkb_keymap,
+    state:             *xkb_state,
+    device_id:         i32,
+    /// Flat keycode->keysym table for the standard X11 range (indices 0..255).
+    /// Populated at init time; entries outside 8..255 hold XKB_KEY_NoSymbol.
+    /// No allocator needed — 256 × 4 bytes = 1 KiB, lives inside XkbState.
+    keysym_by_keycode: [256]u32,
+
+    /// Initialises an XKB context, keymap, and state from the live X connection.
+    /// Retries up to MAX_ATTEMPTS times to handle early-startup races.
+    pub fn init(xcb_conn: *anyopaque) !XkbState {
+        const ctx = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
+            return error.XkbContextFailed;
+        errdefer xkb.xkb_context_unref(ctx);
+
+        try retrySetup(xcb_conn);
+
+        const device_id = xkb.xkb_x11_get_core_keyboard_device_id(@ptrCast(xcb_conn));
+        if (device_id == -1) return error.XkbNoKeyboard;
+
+        const km = try retryKeymap(ctx, xcb_conn, device_id);
+        errdefer xkb.xkb_keymap_unref(km);
+
+        const st = xkb.xkb_state_new(km) orelse return error.XkbStateFailed;
+
+        // Populate the flat table. Keycodes below 8 are reserved by X11 and
+        // will never produce a real keysym; fill them with NoSymbol so the
+        // array is always fully initialised and index arithmetic stays trivial.
+        var table: [256]u32 = [_]u32{xkb.XKB_KEY_NoSymbol} ** 256;
+        for (8..256) |kc| {
+            table[kc] = xkb.xkb_state_key_get_one_sym(st, @intCast(kc));
+        }
+
+        return XkbState{
+            .context           = ctx,
+            .keymap            = km,
+            .state             = st,
+            .device_id         = device_id,
+            .keysym_by_keycode = table,
+        };
+    }
+
+    /// Releases the XKB state, keymap, and context in reverse-init order.
+    pub fn deinit(self: *XkbState) void {
+        xkb.xkb_state_unref(self.state);
+        xkb.xkb_keymap_unref(self.keymap);
+        xkb.xkb_context_unref(self.context);
+    }
+
+    /// Convert an X11 keycode to a keysym (used during event processing).
+    pub inline fn keycodeToKeysym(self: *XkbState, keycode: u8) u32 {
+        return xkb.xkb_state_key_get_one_sym(self.state, keycode);
+    }
+
+    /// Reverse-look up a keysym to its keycode (used during config parsing).
+    ///
+    /// Scans the flat table (248 entries, all in L1 cache). This is called
+    /// only at config-parse time — never on the hot key-press path — so the
+    /// linear scan costs nothing in practice.
+    /// When a keysym is reachable from multiple keycodes (e.g. base and
+    /// shifted variants), returns the first match in keycode order (8..255).
+    pub inline fn keysymToKeycode(self: *const XkbState, keysym: u32) ?u8 {
+        for (8..256) |kc| {
+            if (self.keysym_by_keycode[kc] == keysym) return @intCast(kc);
+        }
+        return null;
+    }
+};
+
+const XKB_RETRY_DELAY_MS = constants.XKB_RETRY_DELAY_MS;
+
+/// Sleep between retry attempts; skips the sleep on the final attempt to avoid
+/// a pointless wait before the error propagates to the caller.
+/// Failure is benign — retries simply happen sooner.
+inline fn retryDelay(attempt: u8) void {
+    if (attempt >= MAX_ATTEMPTS - 1) return;
+    const ns = XKB_RETRY_DELAY_MS * std.time.ns_per_ms;
+    var req = std.os.linux.timespec{
+        .sec  = @intCast(ns / std.time.ns_per_s),
+        .nsec = @intCast(ns % std.time.ns_per_s),
+    };
+    var rem = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.nanosleep(&req, &rem);
+}
+
+/// Calls xkb_x11_setup_xkb_extension, retrying up to MAX_ATTEMPTS times with a brief delay.
+/// The extension may not be ready immediately at WM startup.
+fn retrySetup(xcb_conn: *anyopaque) !void {
+    for (0..MAX_ATTEMPTS) |i| {
+        const ok = xkb.xkb_x11_setup_xkb_extension(
+            @ptrCast(xcb_conn),
+            xkb.XKB_X11_MIN_MAJOR_XKB_VERSION,
+            xkb.XKB_X11_MIN_MINOR_XKB_VERSION,
+            xkb.XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS,
+            null, null, null, null,
+        );
+        if (ok != 0) return;
+        retryDelay(@intCast(i));
+    }
+    return error.XkbSetupFailed;
+}
+
+/// Accept a keymap only if it has at least 40 reachable keysyms in the 8..128
+/// range — guards against a partially-initialised keymap on early startup.
+fn retryKeymap(ctx: *xkb_context, xcb_conn: *anyopaque, device_id: i32) !*xkb_keymap {
+    for (0..MAX_ATTEMPTS) |i| {
+        const km = xkb.xkb_x11_keymap_new_from_device(
+            ctx, @ptrCast(xcb_conn), device_id, xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+        ) orelse {
+            retryDelay(@intCast(i));
+            continue;
+        };
+
+        validate: {
+            const test_state = xkb.xkb_state_new(km) orelse break :validate;
+            defer xkb.xkb_state_unref(test_state);
+            var valid_keys: u32 = 0;
+            for (8..128) |kc| {
+                if (xkb.xkb_state_key_get_one_sym(test_state, @intCast(kc)) != xkb.XKB_KEY_NoSymbol)
+                    valid_keys += 1;
+            }
+            if (valid_keys >= 40) return km;
+        }
+
+        xkb.xkb_keymap_unref(km);
+        retryDelay(@intCast(i));
+    }
+    return error.XkbKeymapFailed;
+}
+</file>
+
 <file path="src/window/modules/tiling/modules/master.zig">
 //! Master-stack tiling layout.
 //!
@@ -2532,170 +2696,6 @@ pub var root:     WindowId                = undefined;
 pub var alloc:    std.mem.Allocator       = undefined;
 pub var config:   @import("types").Config = undefined;
 pub var dpi_info: DpiInfo                 = .{ .dpi = 96.0, .scale_factor = 1.0 };
-</file>
-
-<file path="src/input/xkbcommon.zig">
-//! XKB (X Keyboard Extension) bindings and keyboard state management.
-
-const std  = @import("std");
-
-const constants = @import("constants");
-
-pub const xkb = @cImport({
-    @cInclude("xkbcommon/xkbcommon.h");
-    @cInclude("xkbcommon/xkbcommon-x11.h");
-});
-
-// Re-exports for callers that don't want to reach through `xkb.*`.
-pub const XKB_KEYSYM_CASE_INSENSITIVE:    u32 = xkb.XKB_KEYSYM_CASE_INSENSITIVE;
-pub const XKB_KEY_NoSymbol:               u32 = xkb.XKB_KEY_NoSymbol;
-pub const xkb_context                         = xkb.struct_xkb_context;
-pub const xkb_keymap                          = xkb.struct_xkb_keymap;
-pub const xkb_state                           = xkb.struct_xkb_state;
-pub const xkb_keysym_from_name                = xkb.xkb_keysym_from_name;
-pub const xkb_context_new                     = xkb.xkb_context_new;
-pub const xkb_context_unref                   = xkb.xkb_context_unref;
-pub const xkb_x11_setup_xkb_extension         = xkb.xkb_x11_setup_xkb_extension;
-pub const xkb_x11_get_core_keyboard_device_id = xkb.xkb_x11_get_core_keyboard_device_id;
-pub const xkb_x11_keymap_new_from_device      = xkb.xkb_x11_keymap_new_from_device;
-pub const xkb_state_new                       = xkb.xkb_state_new;
-pub const xkb_state_unref                     = xkb.xkb_state_unref;
-pub const xkb_keymap_unref                    = xkb.xkb_keymap_unref;
-pub const xkb_state_key_get_one_sym           = xkb.xkb_state_key_get_one_sym;
-
-const MAX_ATTEMPTS: u8 = 3;
-
-pub const XkbState = struct {
-    context:           *xkb_context,
-    keymap:            *xkb_keymap,
-    state:             *xkb_state,
-    device_id:         i32,
-    /// Flat keycode->keysym table for the standard X11 range (indices 0..255).
-    /// Populated at init time; entries outside 8..255 hold XKB_KEY_NoSymbol.
-    /// No allocator needed — 256 × 4 bytes = 1 KiB, lives inside XkbState.
-    keysym_by_keycode: [256]u32,
-
-    /// Initialises an XKB context, keymap, and state from the live X connection.
-    /// Retries up to MAX_ATTEMPTS times to handle early-startup races.
-    pub fn init(xcb_conn: *anyopaque) !XkbState {
-        const ctx = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
-            return error.XkbContextFailed;
-        errdefer xkb.xkb_context_unref(ctx);
-
-        try retrySetup(xcb_conn);
-
-        const device_id = xkb.xkb_x11_get_core_keyboard_device_id(@ptrCast(xcb_conn));
-        if (device_id == -1) return error.XkbNoKeyboard;
-
-        const km = try retryKeymap(ctx, xcb_conn, device_id);
-        errdefer xkb.xkb_keymap_unref(km);
-
-        const st = xkb.xkb_state_new(km) orelse return error.XkbStateFailed;
-
-        // Populate the flat table. Keycodes below 8 are reserved by X11 and
-        // will never produce a real keysym; fill them with NoSymbol so the
-        // array is always fully initialised and index arithmetic stays trivial.
-        var table: [256]u32 = [_]u32{xkb.XKB_KEY_NoSymbol} ** 256;
-        for (8..256) |kc| {
-            table[kc] = xkb.xkb_state_key_get_one_sym(st, @intCast(kc));
-        }
-
-        return XkbState{
-            .context           = ctx,
-            .keymap            = km,
-            .state             = st,
-            .device_id         = device_id,
-            .keysym_by_keycode = table,
-        };
-    }
-
-    /// Releases the XKB state, keymap, and context in reverse-init order.
-    pub fn deinit(self: *XkbState) void {
-        xkb.xkb_state_unref(self.state);
-        xkb.xkb_keymap_unref(self.keymap);
-        xkb.xkb_context_unref(self.context);
-    }
-
-    /// Convert an X11 keycode to a keysym (used during event processing).
-    pub inline fn keycodeToKeysym(self: *XkbState, keycode: u8) u32 {
-        return xkb.xkb_state_key_get_one_sym(self.state, keycode);
-    }
-
-    /// Reverse-look up a keysym to its keycode (used during config parsing).
-    ///
-    /// Scans the flat table (248 entries, all in L1 cache). This is called
-    /// only at config-parse time — never on the hot key-press path — so the
-    /// linear scan costs nothing in practice.
-    /// When a keysym is reachable from multiple keycodes (e.g. base and
-    /// shifted variants), returns the first match in keycode order (8..255).
-    pub inline fn keysymToKeycode(self: *const XkbState, keysym: u32) ?u8 {
-        for (8..256) |kc| {
-            if (self.keysym_by_keycode[kc] == keysym) return @intCast(kc);
-        }
-        return null;
-    }
-};
-
-const XKB_RETRY_DELAY_MS = constants.XKB_RETRY_DELAY_MS;
-
-/// Sleep between retry attempts; skips the sleep on the final attempt to avoid
-/// a pointless wait before the error propagates to the caller.
-/// Failure is benign — retries simply happen sooner.
-inline fn retryDelay(attempt: u8) void {
-    if (attempt >= MAX_ATTEMPTS - 1) return;
-    const ns = XKB_RETRY_DELAY_MS * std.time.ns_per_ms;
-    var req = std.os.linux.timespec{
-        .sec  = @intCast(ns / std.time.ns_per_s),
-        .nsec = @intCast(ns % std.time.ns_per_s),
-    };
-    var rem = std.os.linux.timespec{ .sec = 0, .nsec = 0 };
-    _ = std.os.linux.nanosleep(&req, &rem);
-}
-
-/// Calls xkb_x11_setup_xkb_extension, retrying up to MAX_ATTEMPTS times with a brief delay.
-/// The extension may not be ready immediately at WM startup.
-fn retrySetup(xcb_conn: *anyopaque) !void {
-    for (0..MAX_ATTEMPTS) |i| {
-        const ok = xkb.xkb_x11_setup_xkb_extension(
-            @ptrCast(xcb_conn),
-            xkb.XKB_X11_MIN_MAJOR_XKB_VERSION,
-            xkb.XKB_X11_MIN_MINOR_XKB_VERSION,
-            xkb.XKB_X11_SETUP_XKB_EXTENSION_NO_FLAGS,
-            null, null, null, null,
-        );
-        if (ok != 0) return;
-        retryDelay(@intCast(i));
-    }
-    return error.XkbSetupFailed;
-}
-
-/// Accept a keymap only if it has at least 40 reachable keysyms in the 8..128
-/// range — guards against a partially-initialised keymap on early startup.
-fn retryKeymap(ctx: *xkb_context, xcb_conn: *anyopaque, device_id: i32) !*xkb_keymap {
-    for (0..MAX_ATTEMPTS) |i| {
-        const km = xkb.xkb_x11_keymap_new_from_device(
-            ctx, @ptrCast(xcb_conn), device_id, xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
-        ) orelse {
-            retryDelay(@intCast(i));
-            continue;
-        };
-
-        validate: {
-            const test_state = xkb.xkb_state_new(km) orelse break :validate;
-            defer xkb.xkb_state_unref(test_state);
-            var valid_keys: u32 = 0;
-            for (8..128) |kc| {
-                if (xkb.xkb_state_key_get_one_sym(test_state, @intCast(kc)) != xkb.XKB_KEY_NoSymbol)
-                    valid_keys += 1;
-            }
-            if (valid_keys >= 40) return km;
-        }
-
-        xkb.xkb_keymap_unref(km);
-        retryDelay(@intCast(i));
-    }
-    return error.XkbKeymapFailed;
-}
 </file>
 
 <file path="src/config/types.zig">
@@ -10278,6 +10278,600 @@ fn carouselOffset(start_ms: i64, cycle_w: u16, now_ms: i64) u16 {
 }
 </file>
 
+<file path="src/input/input.zig">
+//! User input handling
+//! Handles keyboard, mouse buttons, pointer motion, and drag operations.
+
+const std   = @import("std");
+const build = @import("build_options");
+
+// libc bindings for fork/exec/wait — no Zig stdlib wrappers exist for these low-level syscalls.
+const c = @cImport({
+    @cInclude("unistd.h");
+    @cInclude("sys/wait.h");
+});
+
+const core      = @import("core");
+    const xcb   = core.xcb;
+const types     = @import("types");
+const utils     = @import("utils");
+const constants = @import("constants");
+
+const debug  = @import("debug");
+const config = @import("config");
+
+const window   = @import("window");
+const tracking = @import("tracking");
+const focus    = @import("focus");
+
+const fullscreen = if (build.has_fullscreen) @import("fullscreen") else struct {};
+const minimize   = if (build.has_minimize) @import("minimize") else struct {};
+const workspaces = if (build.has_workspaces) @import("workspaces") else struct {};
+const tiling     = if (build.has_tiling) @import("tiling") else struct {};
+const drag       = @import("drag");
+
+const xkbcommon = @import("xkbcommon");
+
+const bar = if (build.has_bar) @import("bar") else struct {
+    pub fn scheduleFullRedraw() void {}
+    pub fn scheduleRedraw() void {}
+    pub fn redrawInsideGrab() void {}
+    pub fn setBarState(_: anytype) void {}
+    pub fn toggleBarSegmentAnchor() void {}
+};
+
+const prompt = if (build.has_bar and build.has_prompt) @import("prompt") else struct {
+    pub fn handlePromptKeypress(_: anytype, _: anytype) bool { return false; }
+    pub fn toggle() void {}
+};
+
+/// Returns the workspaces.State pointer, or null when workspaces are compiled out.
+fn getWsState() ?*workspaces.State {
+    return if (comptime build.has_workspaces) workspaces.getState() else null;
+}
+inline fn switchToWs(ws: u8) void {
+    if (comptime build.has_workspaces) workspaces.switchTo(ws);
+}
+inline fn moveWindowToWs(win: u32, ws: u8) !void {
+    if (comptime build.has_workspaces) try workspaces.moveWindowTo(win, ws);
+}
+inline fn wsMoveWindowExclusive(win: u32, ws: u8) void {
+    if (comptime build.has_workspaces) workspaces.moveWindowExclusive(win, ws);
+}
+inline fn wsTagToggle(win: u32, ws: u8, p: bool) void {
+    if (comptime build.has_workspaces) workspaces.tagToggle(win, ws, p);
+}
+inline fn wsSwitchToAll() void {
+    if (comptime build.has_workspaces) workspaces.switchToAll();
+}
+inline fn wsMoveWindowToAll(win: u32) void {
+    if (comptime build.has_workspaces) workspaces.moveWindowToAll(win);
+}
+inline fn wsTagToggleAll(win: u32) void {
+    if (comptime build.has_workspaces) workspaces.tagToggleAll(win);
+}
+
+
+// Constants 
+
+const mouse_button_left:   u8 = 1;
+const mouse_button_middle: u8 = 2;
+const mouse_button_right:  u8 = 3;
+
+const mouse_buttons = [_]u8{ mouse_button_left, mouse_button_middle, mouse_button_right };
+
+// XKB state 
+
+var xkb_state: ?xkbcommon.XkbState = null;
+
+/// Initialises the XKB context, keymap, and key state
+/// from the server's current keyboard configuration.
+pub fn initXkb(conn: *xcb.xcb_connection_t) !void {
+    xkb_state = try xkbcommon.XkbState.init(conn);
+}
+
+/// Tears down XKB state.
+/// Must be called after all other deinit steps.
+pub fn deinitXkb() void {
+    if (xkb_state) |*s| s.deinit();
+    xkb_state = null;
+}
+
+/// Returns a pointer to the module-owned XkbState, 
+/// used by events.zig during config reloads.
+pub fn getXkbState() *xkbcommon.XkbState {
+    return &xkb_state.?;
+}
+
+// Grab setup 
+
+/// Grabs mouse buttons on the root window and applies the user's cursor theme.
+pub fn setup(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t, root: u32) void {
+    setupGrabs(conn, root);
+    XcbCursor.setupRoot(conn, screen);
+}
+
+/// Grabs Super+Button{1,2,3} on the root window.
+/// Button1 = move, Button3 = resize, Button2 = config-driven mouse binds.
+pub fn setupGrabs(conn: *xcb.xcb_connection_t, root: u32) void {
+    for (mouse_buttons) |button| {
+        _ = xcb.xcb_grab_button(
+            conn, 0, root,
+            xcb.XCB_EVENT_MASK_BUTTON_PRESS |
+                xcb.XCB_EVENT_MASK_BUTTON_RELEASE |
+                xcb.XCB_EVENT_MASK_POINTER_MOTION,
+            xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC,
+            root, xcb.XCB_NONE, button, constants.MOD_SUPER,
+        );
+    }
+    _ = xcb.xcb_flush(conn);
+}
+
+// Event handlers 
+
+pub fn handleKeyPress(event: *const xcb.xcb_key_press_event_t) void {
+    focus.setLastEventTime(event.time);
+
+    const mods = utils.normalizeModifiers(event.state);
+    const keysym = xkb_state.?.keycodeToKeysym(event.detail);
+
+    // O(1) keybinding dispatch via the persistent (modifiers << 32 | keysym) map
+    // built by config.resolveKeybindings.  Replaces the previous O(n) linear
+    // scan, eliminating up to 50 comparisons per key press.
+    const matched: ?*const types.Action = config.lookupKeybinding(mods, keysym);
+
+    // The prompt owns all key input while active; routing (including the
+    // close_window dismiss shortcut) is handled entirely inside it.
+    if (prompt.handlePromptKeypress(event, matched)) return;
+
+    debug.info("[KEY] keycode={} state=0x{x} mods=0x{x} keysym=0x{x}",
+        .{ event.detail, event.state, mods, keysym });
+
+    if (matched) |action| {
+        debug.info("[KEY] action={s}", .{@tagName(action.*)});
+        executeAction(action) catch |err| debug.err("action failed: {}", .{err});
+    } else {
+        debug.info("[KEY] no binding", .{});
+    }
+}
+
+/// Dispatches a priority order button-press event
+pub fn handleButtonPress(event: *const xcb.xcb_button_press_event_t) void {
+    focus.setLastEventTime(event.time);
+
+    // Ignore clicks on root / unknown windows
+    const clicked_window = if (event.child != 0) event.child else event.event;
+    const managed_window = window.findManagedWindow(core.conn, clicked_window, tracking.isManaged);
+
+    if (clicked_window == 0 or clicked_window == core.root or managed_window == 0) {
+        replayPointer(event.time);
+        return;
+    }
+
+    const super_held = (event.state & constants.MOD_SUPER) != 0;
+
+    // Config-driven mouse binds (Super + Key)
+    if (super_held) {
+        const mods = utils.normalizeModifiers(event.state);
+        for (core.config.mouse_bindings.items) |*mb| {
+            if (mb.modifiers == mods and mb.button == event.detail) {
+                executeMouseAction(&mb.action, managed_window) 
+                    catch |err| debug.err("mouse bind error: {}", .{err});
+                releaseGrab(event.time);
+                return;
+            }
+        }
+    }
+
+    // Super + Left/Right: Move or Resize
+    if (super_held and (event.detail == mouse_button_left or event.detail == mouse_button_right)) {
+        drag.startDrag(managed_window, event.detail, event.root_x, event.root_y);
+        releaseGrab(event.time); // Explicitly release and exit
+        return;
+    }
+
+    // Fallback: Any other click focuses and raises the window.
+    //
+    // The raise must be issued unconditionally here, before setFocus, because
+    // setFocus short-circuits when managed_window is already focused_window
+    // (the common case after hover-focus) and never reaches the raise inside
+    // commitFocusTransition.  Without this explicit raise, a window that holds
+    // focus but has been visually covered — by a newly-spawned window, a
+    // floating peer, or any stacking change that bypasses the focus path —
+    // stays buried despite the click.  The double-raise when setFocus also
+    // raises is a no-op from the server's perspective.
+    _ = xcb.xcb_configure_window(core.conn, managed_window,
+        xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
+    focus.setFocus(managed_window, .mouse_click);
+    releaseGrab(event.time);
+}
+
+/// Stops any active drag and updates the last event timestamp.
+pub fn handleButtonRelease(event: *const xcb.xcb_button_release_event_t) void {
+    focus.setLastEventTime(event.time);
+    if (drag.isDragging()) drag.stopDrag();
+}
+
+/// Forwards motion to the drag engine, clears focus suppression, and re-arms POINTER_MOTION_HINT.
+pub fn handleMotionNotify(event: *const xcb.xcb_motion_notify_event_t) void {
+    focus.setLastEventTime(event.time);
+
+    if (drag.isDragging()) {
+        drag.updateDrag(event.root_x, event.root_y);
+        return;
+    }
+
+    // Real pointer movement clears any active focus suppression.
+    if (focus.getSuppressReason() != .none) focus.setSuppressReason(.none);
+
+    // POINTER_MOTION_HINT delivers one event per gesture; re-arm by sending a
+    // QueryPointer. We fire and discard the reply — the server re-arms on
+    // receipt of the request, not the reply, so there's no need to block.
+    xcb.xcb_discard_reply(core.conn, xcb.xcb_query_pointer(core.conn, core.root).sequence);
+}
+
+// Window operations 
+
+/// Closes a window gracefully via WM_DELETE_WINDOW (ICCCM §4.1.2.7), falling
+/// back to xcb_destroy_window for clients that don't advertise the protocol.
+fn closeWindow(win: u32) void {
+    if (!window.supportsWMDeleteCached(core.conn, win)) {
+        _ = xcb.xcb_destroy_window(core.conn, win);
+        return;
+    }
+
+    const protocols_atom = utils.getAtomCached("WM_PROTOCOLS") catch return;
+    const delete_atom = utils.getAtomCached("WM_DELETE_WINDOW") catch return;
+
+    // Zero-initialise: XCB transmits raw bytes, so uninitialised padding
+    // would be undefined behaviour on the wire.
+    var event = std.mem.zeroes(xcb.xcb_client_message_event_t);
+    event.response_type = xcb.XCB_CLIENT_MESSAGE;
+    event.format = 32;
+    event.window = win;
+    event.type = protocols_atom;
+    event.data.data32[0] = delete_atom;
+    event.data.data32[1] = focus.getLastEventTime(); // ICCCM §4.1.7
+
+    _ = xcb.xcb_send_event(core.conn, 0, win, xcb.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&event));
+}
+
+// Action dispatch 
+
+fn executeAction(action: *const types.Action) !void {
+    switch (action.*) {
+        // Core 
+        .close_window  => if (focus.getFocused()) |win| closeWindow(win),
+        .reload_config => utils.reload(),
+        .dump_state    => dumpState(),
+        .exec          => |cmd| try executeShellCommand(cmd),
+        .sequence      => |acts| for (acts) |*a| try executeAction(a),
+
+        // Fullscreen 
+        .toggle_fullscreen => if (comptime build.has_fullscreen) fullscreen.toggle(),
+
+        // Tiling 
+        .toggle_floating_window => if (comptime build.has_tiling) {
+            if (focus.getFocused()) |win| tiling.toggleWindowFloat(win);
+            bar.scheduleFullRedraw();
+        },
+        .toggle_layout         => if (comptime build.has_tiling) { tiling.toggleLayout();        bar.scheduleRedraw(); },
+        .toggle_layout_reverse => if (comptime build.has_tiling) { tiling.toggleLayoutReverse(); bar.scheduleRedraw(); },
+        .cycle_layout_variants => if (comptime build.has_tiling) { tiling.stepLayoutVariant(); bar.scheduleRedraw(); },
+        .increase_master       => if (comptime build.has_tiling) tiling.increaseMasterWidth(),
+        .decrease_master       => if (comptime build.has_tiling) tiling.decreaseMasterWidth(),
+        .increase_master_count => if (comptime build.has_tiling) tiling.increaseMasterCount(),
+        .decrease_master_count => if (comptime build.has_tiling) tiling.decreaseMasterCount(),
+
+        .swap_master, .swap_master_focus_swap => if (comptime build.has_tiling) {
+            _ = xcb.xcb_grab_server(core.conn);
+            if (action.* == .swap_master) {
+                // Capture the focused window ID *before* the swap so we can
+                // pass it as defer_configure.  After swapWithMaster() the
+                // focused window is the new master (the growing window); by
+                // deferring its configure_window call to last inside every
+                // column/stack, the shrinking window (old master) fills its new
+                // stack slot before the growing window vacates its old one —
+                // eliminating the one-frame wallpaper gap (Fix 3).
+                const new_master = focus.getFocused();
+                tiling.swapWithMaster();
+                tiling.retileCurrentWorkspaceDeferred(new_master);
+            } else {
+                // For follow-focus: capture focused window, reorder, retile
+                // with deferred configure, then transfer focus — all inside
+                // the grab so the focus border change is part of the same flush.
+                const new_master = focus.getFocused();
+                const displaced = tiling.swapWithMasterFollowFocus();
+                tiling.retileCurrentWorkspaceDeferred(new_master);
+                if (displaced) |win| focus.setFocus(win, .tiling_operation);
+            }
+            // Use the async pointer-sync variant: it queues the xcb_query_pointer
+            // cookie without blocking, so no premature XCB buffer flush occurs
+            // inside the grab.  drainPointerSync() in the event loop will
+            // consume the reply and route focus on the next iteration.
+            focus.beginPointerSync();
+            window.updateWorkspaceBorders();
+            window.markBordersFlushed();
+            // redrawInsideGrab now renders to the off-screen pixmap via the bar
+            // thread (no xcb_flush) and queues xcb_copy_area without flushing.
+            // The blit is sent atomically with configure_window + xcb_ungrab_server
+            // by ungrabAndFlush() below — one compositor frame, no wallpaper flash.
+            bar.redrawInsideGrab();
+            utils.ungrabAndFlush(core.conn);
+        },
+
+        // Bar 
+        .toggle_bar_visibility => if (comptime build.has_bar) bar.setBarState(.toggle),
+        .toggle_bar_position   => if (comptime build.has_bar) bar.toggleBarSegmentAnchor(),
+
+        // Minimize 
+        .minimize_window => if (comptime build.has_minimize) minimize.minimizeWindow(),
+        .unminimize_lifo => if (comptime build.has_minimize) minimize.unminimize(.lifo),
+        .unminimize_fifo => if (comptime build.has_minimize) minimize.unminimize(.fifo),
+        .unminimize_all  => if (comptime build.has_minimize) minimize.unminimizeAll(),
+
+        // Workspaces 
+        .switch_workspace       => |ws| switchToWs(ws),
+        .move_to_workspace      => |ws| if (focus.getFocused()) |win| moveWindowToWs(win, ws) catch |e| debug.warnOnErr(e, "move_to_workspace"),
+        .move_window            => |ws| if (focus.getFocused()) |win| wsMoveWindowExclusive(win, ws),
+        .toggle_tag             => |ws| if (focus.getFocused()) |win| wsTagToggle(win, ws, true),
+        .all_workspaces         => wsSwitchToAll(),
+        .move_to_all_workspaces => if (focus.getFocused()) |win| wsMoveWindowToAll(win),
+        .toggle_tag_all         => if (focus.getFocused()) |win| wsTagToggleAll(win),
+
+        // Prompt 
+        .toggle_prompt => prompt.toggle(),
+
+        // Window focus cycling (dwm-style Mod+k / Mod+j)
+        .focus_next_window => focus.focusNext(),
+        .focus_prev_window => focus.focusPrev(),
+        // Window move in cycle (dwm-style Mod+Shift+k / Mod+Shift+j)
+        .move_window_next  => focus.moveWindowNext(),
+        .move_window_prev  => focus.moveWindowPrev(),
+    }
+}
+
+/// Like executeAction but acts on the clicked window rather than the
+/// keyboard-focused one. Used by the mouse bind dispatcher so that e.g.
+/// toggle_floating_window affects whichever window was actually clicked.
+fn executeMouseAction(action: *const types.Action, clicked_win: u32) !void {
+    switch (action.*) {
+        .toggle_floating_window => if (comptime build.has_tiling) tiling.toggleWindowFloat(clicked_win),
+        else             => try executeAction(action),
+    }
+}
+
+// Shell execution 
+//
+// Commands are launched via a double-fork so the grandchild is re-parented to
+// init and the WM never accumulates zombie processes.
+//
+// Two pipes co-ordinate the three processes:
+//   exec_pipe  – write end is FD_CLOEXEC; exec success closes it silently
+//                (EOF), exec failure writes a sentinel byte.
+//   pid_pipe   – intermediate child writes the grandchild PID before exiting,
+//                so the WM can register the spawn without racing.
+
+/// Grandchild: detaches from the session and execs the command.
+/// Writes a sentinel byte to exec_pipe_write on execvp failure.
+fn execAsGrandchild(exec_pipe_write: c_int, cmd_z: [*:0]const u8) noreturn {
+    _ = c.setsid();
+    _ = c.execvp("/bin/sh", @ptrCast(&[_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z, null }));
+    const sentinel: u8 = 1;
+    _ = c.write(exec_pipe_write, &sentinel, 1);
+    std.process.exit(1);
+}
+
+/// Intermediate child: forks the grandchild, forwards its PID over pid_pipe,
+/// then exits so the grandchild is re-parented to init.
+fn forkIntermediate(exec_pipe_write: c_int, pid_pipe_write: c_int, cmd_z: [*:0]const u8) noreturn {
+    const grandchild_pid = c.fork();
+    if (grandchild_pid < 0) {
+        debug.err("Second fork failed", .{});
+        std.process.exit(1);
+    }
+    if (grandchild_pid == 0) {
+        _ = c.close(pid_pipe_write); // don't leak into the spawned process
+        execAsGrandchild(exec_pipe_write, cmd_z);
+    }
+
+    const gp: c_int = grandchild_pid;
+    _ = c.write(pid_pipe_write, &gp, @sizeOf(c_int));
+    _ = c.close(pid_pipe_write);
+    _ = c.close(exec_pipe_write);
+    std.process.exit(0);
+}
+
+/// Spawns `cmd` as a detached grandchild (double-fork) so the WM never accumulates zombie processes.
+fn executeShellCommand(cmd: []const u8) !void {
+    // Snapshot the target workspace before any blocking syscalls.  In a
+    // single-threaded WM the value cannot change while we are blocked in
+    // waitpid/read, but capturing it here makes the intent explicit and
+    // correctly handles sequence actions of the form [exec, switch_workspace]
+    // where a later action in the same sequence mutates g_current before
+    // registerSpawn is called.
+    const spawn_ws = tracking.getCurrentWorkspace();
+
+    const cmd_z = try core.alloc.dupeZ(u8, cmd);
+    defer core.alloc.free(cmd_z);
+
+    var exec_fds: [2]c_int = undefined;
+    var pid_fds: [2]c_int = undefined;
+
+    // pipe2(O_CLOEXEC) sets close-on-exec atomically on both ends in a single
+    // syscall, closing the TOCTOU window that existed between the old pipe()
+    // and the subsequent fcntl(F_SETFD, FD_CLOEXEC) call.  Another thread
+    // could have fork()ed between those two calls, inheriting the write end
+    // of the exec pipe in the child before the flag was set.
+    const pipe2_flags = std.os.linux.O{ .CLOEXEC = true };
+    switch (std.posix.errno(std.os.linux.pipe2(&exec_fds, pipe2_flags))) {
+        .SUCCESS => {},
+        else => {
+            debug.err("pipe2() failed (exec_pipe): {s}", .{cmd});
+            return error.PipeFailed;
+        },
+    }
+    switch (std.posix.errno(std.os.linux.pipe2(&pid_fds, pipe2_flags))) {
+        .SUCCESS => {},
+        else => {
+            closePipe(exec_fds);
+            debug.err("pipe2() failed (pid_pipe): {s}", .{cmd});
+            return error.PipeFailed;
+        },
+    }
+    // exec_pipe write end is CLOEXEC via pipe2 — no separate fcntl needed.
+    // exec success silently closes it (EOF); exec failure writes a sentinel byte.
+
+    const pid = c.fork();
+    if (pid < 0) {
+        closePipe(exec_fds);
+        closePipe(pid_fds);
+        debug.err("First fork failed: {s}", .{cmd});
+        return error.ForkFailed;
+    }
+
+    if (pid == 0) {
+        _ = c.close(exec_fds[0]);
+        _ = c.close(pid_fds[0]);
+        forkIntermediate(exec_fds[1], pid_fds[1], cmd_z.ptr);
+    }
+
+    // WM: close write ends, then reap the intermediate child.
+    _ = c.close(exec_fds[1]);
+    _ = c.close(pid_fds[1]);
+
+    var status: c_int = 0;
+    if (c.waitpid(pid, &status, 0) == -1) {
+        _ = c.close(exec_fds[0]);
+        _ = c.close(pid_fds[0]);
+        debug.err("waitpid failed", .{});
+        return error.WaitpidFailed;
+    }
+
+    // The intermediate child writes the grandchild PID before exiting, so
+    // this read is guaranteed not to block by the time waitpid returns.
+    var grandchild_pid: c_int = -1;
+    _ = c.read(pid_fds[0], &grandchild_pid, @sizeOf(c_int));
+    _ = c.close(pid_fds[0]);
+
+    // EOF (n == 0) means exec succeeded; a sentinel byte means it failed.
+    var sentinel: u8 = 0;
+    const n = c.read(exec_fds[0], &sentinel, 1);
+    _ = c.close(exec_fds[0]);
+    if (n > 0) return; // exec failed; skip spawn registration
+
+    if (spawn_ws) |ws| {
+        const pid_u32: u32 = if (grandchild_pid > 0) @intCast(grandchild_pid) else 0;
+        window.registerSpawn(ws, pid_u32);
+    }
+}
+
+// Diagnostics 
+
+/// Logs a full WM state snapshot at info level. Used for diagnostics only.
+fn dumpState() void {
+    debug.info("========== STATE DUMP ==========", .{});
+    debug.info("Focused:        {?x}", .{focus.getFocused()});
+    debug.info("Total windows:  {}",   .{tracking.windowCount()});
+    debug.info("Suppress focus: {s}",  .{@tagName(focus.getSuppressReason())});
+    debug.info("Drag active:    {}",   .{drag.isDragging()});
+
+    if (comptime build.has_fullscreen) {
+        fullscreen.forEachFullscreen(struct {
+            fn cb(ws: u8, info: fullscreen.FullscreenInfo) void {
+                debug.info("Fullscreen on workspace {}: {x}", .{ ws, info.window });
+            }
+        }.cb);
+        if (!fullscreen.hasAnyFullscreen()) debug.info("Fullscreen: none", .{});
+    } else {
+        debug.info("Fullscreen: none", .{});
+    }
+
+    if (comptime build.has_workspaces) {
+        if (getWsState()) |ws_state| {
+            debug.info("Current workspace: {}", .{ws_state.current + 1});
+            for (ws_state.workspaces, 0..) |*ws, i| {
+                debug.info("  WS{}: {} windows", .{ i + 1, ws.windows.len });
+            }
+        }
+    }
+
+    if (comptime build.has_tiling) {
+        if (tiling.getStateOpt()) |t| {
+            debug.info("Tiling enabled: {}",     .{t.is_enabled});
+            debug.info("Tiling layout:  {s}",    .{@tagName(t.layout)});
+            debug.info("Tiled windows:  {}",     .{t.windows.len});
+            debug.info("Master count:   {}",     .{t.master_count});
+            debug.info("Master width:   {d:.2}", .{t.master_width});
+        }
+    }
+
+    debug.info("================================", .{});
+}
+
+// Helpers 
+
+/// Replays a frozen pointer event without releasing the keyboard grab.
+/// Always pass event.time — never XCB_CURRENT_TIME.
+inline fn replayPointer(time: u32) void {
+    _ = xcb.xcb_allow_events(core.conn, xcb.XCB_ALLOW_REPLAY_POINTER, time);
+    _ = xcb.xcb_flush(core.conn);
+}
+
+/// Releases both the pointer and keyboard SYNC grabs acquired on Super+click.
+/// Always pass event.time — never XCB_CURRENT_TIME.
+inline fn releaseGrab(time: u32) void {
+    _ = xcb.xcb_allow_events(core.conn, xcb.XCB_ALLOW_REPLAY_POINTER, time);
+    _ = xcb.xcb_allow_events(core.conn, xcb.XCB_ALLOW_ASYNC_KEYBOARD, time);
+    _ = xcb.xcb_flush(core.conn);
+}
+
+inline fn closePipe(p: [2]c_int) void {
+    _ = c.close(p[0]);
+    _ = c.close(p[1]);
+}
+
+// XcbCursor 
+//
+// Declared manually rather than via cImport because xcb_cursor_load_cursor is
+// a static inline function that cImport cannot bind.
+
+const XcbCursor = struct {
+    const Context = opaque {};
+
+    extern fn xcb_cursor_context_new(
+        conn: *xcb.xcb_connection_t,
+        screen: *xcb.xcb_screen_t,
+        ctx: *?*Context,
+    ) c_int;
+    extern fn xcb_cursor_load_cursor(ctx: *Context, name: [*:0]const u8) u32;
+    extern fn xcb_cursor_context_free(ctx: ?*Context) void;
+
+    /// Applies the user's cursor theme to the root window. Falls back silently
+    /// if xcb-cursor is unavailable or the cursor cannot be loaded.
+    fn setupRoot(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) void {
+        var cursor_ctx: ?*Context = null;
+        if (xcb_cursor_context_new(conn, screen, &cursor_ctx) < 0) return;
+        defer xcb_cursor_context_free(cursor_ctx);
+
+        const cursor = xcb_cursor_load_cursor(cursor_ctx.?, "left_ptr");
+        if (cursor == xcb.XCB_NONE) return;
+
+        const cookie = xcb.xcb_change_window_attributes_checked(
+            conn, screen.*.root, xcb.XCB_CW_CURSOR, &[_]u32{cursor},
+        );
+        if (xcb.xcb_request_check(conn, cookie)) |err| {
+            debug.err("Failed to set root cursor: {*}", .{err});
+            std.c.free(err);
+        }
+
+        // The server reference-counts cursors, so freeing our handle here is
+        // safe — it stays alive as long as the root window holds a reference.
+        _ = xcb.xcb_free_cursor(conn, cursor);
+    }
+};
+</file>
+
 <file path="src/bar/modules/prompt/prompt.zig">
 //! Prompt bar in-line command runner
 //! Borrows title's segment space to embed into the bar
@@ -11420,6 +12014,771 @@ fn drawActive(
 
     dc.flushRect(start_x, width);
     return end_x;
+}
+</file>
+
+<file path="src/window/modules/workspaces.zig">
+//! Workspace management — creation, window assignment, and workspace switching.
+
+const std   = @import("std");
+const build = @import("build_options");
+
+const core      = @import("core");
+    const xcb   = core.xcb;
+const utils     = @import("utils");
+const types     = @import("types");
+const constants = @import("constants");
+
+const debug = @import("debug");
+
+const window   = @import("window");
+const tracking = @import("tracking");
+const focus    = @import("focus");
+
+const fullscreen = if (build.has_fullscreen) @import("fullscreen") else struct {};
+const minimize   = if (build.has_minimize) @import("minimize") else struct {};
+
+const tiling       = if (build.has_tiling) @import("tiling") else struct {};
+const TilingLayout = if (build.has_tiling) tiling.Layout else u0; // u0 sentinel when tiling is absent: zero-size, never stored
+
+const bar = if (build.has_bar) @import("bar") else struct {
+    pub fn scheduleRedraw() void {}
+    pub fn raiseBar() void {}
+    pub fn redrawInsideGrab() void {}
+    pub fn setBarState(_: anytype) void {}
+};
+
+
+/// Shim so call-sites don't need to repeat the has_minimize comptime guard.
+/// Returns false when minimize is absent — windows are never considered minimized.
+inline fn isMinimized(win: u32) bool {
+    return if (comptime build.has_minimize) minimize.isMinimized(win) else false;
+}
+
+pub const Workspace = struct {
+    id:      u8,
+    windows: tracking.Tracking,
+    name:    []const u8,
+    // The tiling layout active on this workspace.
+    // Initialized from config; updated when the user switches layouts
+    // in per-workspace mode.
+    layout: TilingLayout,
+    // Optional layout variants override set via the layouts array in config.
+    // Applied on every workspace switch; null means use the global defaults.
+    variants: ?types.LayoutVariantOverride = null,
+    // Per-workspace master width override (master-stack layout).
+    // null = use the global default from tiling state.
+    // Set when the user adjusts master width in per-workspace layout mode;
+    // loaded back into tiling state on every workspace switch-in.
+    master_width: ?f32 = null,
+    // Per-workspace master count override (master-stack layout).
+    // null = use the global default from config / tiling state.
+    // Populated at init from [tiling.layouts.master-stack.counts] and updated
+    // when the user adjusts the count via keybind in per-workspace layout mode.
+    master_count: ?u8 = null,
+    // Last window that held focus on this workspace before the user left it.
+    // Restored on re-entry when the cursor is not hovering over any window.
+    last_focused: ?u32 = null,
+
+    pub fn init(id: u8, name: []const u8, default_layout: TilingLayout) Workspace {
+        return .{ .id = id, .windows = .{}, .name = name, .layout = default_layout };
+    }
+
+    /// Removes `win` from this workspace and clears last_focused if it pointed to it.
+    pub fn removeAndClearFocus(self: *Workspace, win: u32) void {
+        _ = self.windows.remove(win);
+        if (self.last_focused == win) self.last_focused = null;
+    }
+};
+
+pub const State = struct {
+    workspaces: []Workspace,
+    current:    u8,
+    allocator:  std.mem.Allocator,
+    /// Windows temporarily patched into the current workspace by switchToAll().
+    /// Non-empty iff all-workspaces view is active.
+    /// Cleared (and their bitmasks restored) on the next switchToAll() or switchTo().
+    all_view_temp_wins: std.ArrayListUnmanaged(u32) = .empty,
+};
+
+var g_state: ?State = null;
+
+pub inline fn getState() ?*State { return if (g_state) |*s| s else null; }
+
+/// Yields the index of each set bit in `mask`, lowest first.
+const SetBitIterator = struct {
+    bits: u64,
+    pub fn next(self: *SetBitIterator) ?u8 {
+        if (self.bits == 0) return null;
+        const idx: u8 = @intCast(@ctz(self.bits));
+        self.bits &= self.bits - 1;
+        return idx;
+    }
+};
+inline fn setBits(mask: u64) SetBitIterator { return .{ .bits = mask }; }
+
+/// Push `win` offscreen and evict its geometry cache entry.
+/// Used when a window leaves the current workspace.
+inline fn evictWindow(win: u32) void {
+    utils.pushWindowOffscreen(core.conn, win);
+    if (build.has_tiling) tiling.invalidateGeomCache(win);
+}
+
+/// Resolves a layout name (e.g. "master-stack", "monocle") to tiling.Layout.
+fn layoutFromName(name: []const u8) TilingLayout {
+    if (!build.has_tiling) return 0;
+    return if (std.mem.eql(u8, name, "master-stack")) .master
+        else std.meta.stringToEnum(tiling.Layout, name) orelse tiling.defaultLayout();
+}
+
+/// Initializes global workspace state.  Returns error.OutOfMemory if the
+/// workspace slice cannot be allocated; callers should treat this as fatal.
+pub fn init() !void {
+    const count = core.config.workspaces.count;
+    const wss   = try core.alloc.alloc(Workspace, count);
+
+    const default_layout: TilingLayout = if (build.has_tiling) tiling.getState().layout else 0;
+    const cfg_tiling = &core.config.tiling;
+
+    // Build a flat lookup table so each workspace's override is O(1) to find,
+    // instead of the original O(overrides) inner-loop scan per workspace.
+    // The u64 bitmask caps us at 64 workspaces, so a fixed-size array suffices.
+    const MAX_WS = 64;
+    const OverrideLookup = struct {
+        layout_idx: usize,
+        variant:    ?types.LayoutVariantOverride,
+    };
+    var override_lookup: [MAX_WS]?OverrideLookup = .{null} ** MAX_WS;
+    if (build.has_tiling) {
+        for (cfg_tiling.workspace_layout_overrides.items) |o| {
+            if (o.workspace_idx < MAX_WS)
+                override_lookup[o.workspace_idx] = .{
+                    .layout_idx = o.layout_idx,
+                    .variant    = o.variant,
+                };
+        }
+    }
+
+    // Per-workspace master count overrides from [tiling.layouts.master-stack.counts].
+    var master_count_lookup: [MAX_WS]?u8 = .{null} ** MAX_WS;
+    if (build.has_tiling) {
+        for (cfg_tiling.workspace_master_count_overrides.items) |o| {
+            if (o.workspace_idx < MAX_WS)
+                master_count_lookup[o.workspace_idx] = o.count;
+        }
+    }
+
+    for (wss, 0..) |*ws, i| {
+        const id: u8 = @intCast(i);
+        const name = if (i < tracking.WORKSPACE_LABELS.len) tracking.WORKSPACE_LABELS[i] else "?";
+
+        // Apply any workspace-specific layout + variants override from the
+        // layouts array (e.g. `"monocle", "gapless", "4,8"` in config.toml).
+        var ws_layout   = default_layout;
+        var ws_variant: ?types.LayoutVariantOverride = null;
+        if (build.has_tiling) {
+            if (override_lookup[id]) |o| {
+                if (o.layout_idx < cfg_tiling.layouts.items.len)
+                    ws_layout = layoutFromName(cfg_tiling.layouts.items[o.layout_idx]);
+                ws_variant = o.variant;
+            }
+        }
+
+        ws.* = Workspace.init(id, name, ws_layout);
+        ws.variants = ws_variant;
+        if (build.has_tiling) {
+            if (master_count_lookup[id]) |mc| ws.master_count = mc;
+        }
+    }
+
+    tracking.setWorkspaceCount(count);
+    tracking.setCurrentWorkspace(0);
+
+    g_state = .{
+        .workspaces = wss,
+        .current    = 0,
+        .allocator  = core.alloc,
+    };
+}
+
+pub fn deinit() void {
+    if (g_state) |*s| {
+        s.all_view_temp_wins.deinit(s.allocator);
+        s.allocator.free(s.workspaces);
+    }
+    g_state = null;
+    tracking.setWorkspaceCount(1);
+    tracking.setCurrentWorkspace(0);
+}
+
+pub fn removeWindow(win: u32) void {
+    const s = getState() orelse {
+        tracking.removeWindow(win);
+        return;
+    };
+    if (tracking.getWindowWorkspaceMask(win)) |mask| {
+        var it = setBits(mask);
+        while (it.next()) |ws_idx| {
+            if (ws_idx < s.workspaces.len)
+                s.workspaces[ws_idx].removeAndClearFocus(win);
+        }
+    }
+    tracking.removeWindow(win);
+}
+
+pub fn moveWindowTo(win: u32, target_ws: u8) !void {
+    const s = getState() orelse return;
+    if (target_ws >= s.workspaces.len) {
+        debug.err("Invalid target workspace: {}", .{target_ws});
+        return;
+    }
+
+    const mask = tracking.getWindowWorkspaceMask(win) orelse {
+        // Not yet tracked (new window): register in tracking and workspace list.
+        try tracking.registerWindow(win, target_ws);
+        s.workspaces[target_ws].windows.add(win);
+        return;
+    };
+
+    const target_bit = tracking.workspaceBit(target_ws);
+    if (mask == target_bit) return;
+
+    var new_mask = (mask & ~tracking.workspaceBit(s.current)) | target_bit;
+    if (new_mask == 0) new_mask = target_bit; // safety: never leave mask empty
+
+    // Route through setWindowMask so every workspace's window list stays in sync,
+    // including any extra workspaces the window was tagged to beyond the current one.
+    setWindowMask(s, win, new_mask);
+
+    if (isMinimized(win)) {
+        if (comptime build.has_minimize) minimize.moveToWorkspace(win, target_ws);
+    }
+
+    // If this window is fullscreen on the current workspace, clean up the
+    // fullscreen side-effects on the source workspace (bar, floating windows,
+    // border) and transfer the record to target_ws so the window is still
+    // fullscreen when you switch there.
+    if (comptime build.has_fullscreen) fs_blk: {
+        const src_ws = fullscreen.workspaceFor(win) orelse break :fs_blk;
+        if (src_ws != s.current) break :fs_blk;
+        fullscreen.cleanupFullscreenForMove(win, src_ws);
+        fullscreen.moveRecord(src_ws, target_ws);
+    }
+
+    evictWindow(win);
+    if (focus.getFocused() == win) focus.clearFocus();
+    if (build.has_tiling and core.config.tiling.enabled) tiling.markDirty();
+    bar.scheduleRedraw();
+    _ = xcb.xcb_flush(core.conn);
+}
+
+// Tag operations
+
+/// Low-level: set a window's workspace bitmask and keep every workspace
+/// Tracking consistent. Does NOT handle screen visibility or tiling.
+fn setWindowMask(s: *State, win: u32, new_mask: u64) void {
+    std.debug.assert(new_mask != 0);
+    const old_mask = tracking.getWindowWorkspaceMask(win) orelse 0;
+    tracking.setWindowMask(win, new_mask);
+
+    // Add to newly-set workspaces.
+    var added_it = setBits(new_mask & ~old_mask);
+    while (added_it.next()) |idx| {
+        if (idx < s.workspaces.len) s.workspaces[idx].windows.add(win);
+    }
+
+    // Remove from cleared workspaces.
+    var removed_it = setBits(old_mask & ~new_mask);
+    while (removed_it.next()) |idx| {
+        if (idx < s.workspaces.len)
+            s.workspaces[idx].removeAndClearFocus(win);
+    }
+}
+
+/// Retile the current workspace (when tiling is active), schedule a bar redraw,
+/// and flush pending XCB requests. Called at the tail of actions that modify
+/// workspace masks and need the display to reflect the change immediately.
+inline fn retileAndScheduleFlush() void {
+    if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
+    bar.scheduleRedraw();
+    _ = xcb.xcb_flush(core.conn);
+}
+
+/// `move_window` action — Mod+Shift+N. Hard-moves `win` to `target_ws` exclusively,
+/// clearing all other workspace bits. Pair with tagToggle (Mod+Alt+N) to add more.
+pub fn moveWindowExclusive(win: u32, target_ws: u8) void {
+    const s = getState() orelse return;
+    if (target_ws >= s.workspaces.len) return;
+    if (isMinimized(win)) return;
+
+    const mask = tracking.getWindowWorkspaceMask(win) orelse return;
+    if (mask == tracking.workspaceBit(target_ws)) return; // already exclusively on target — no-op
+
+    // Transfer fullscreen record to the target workspace so the window
+    // remains fullscreen wherever it lands, not just on the source workspace.
+    // When the window is actually leaving the current workspace (src_ws !=
+    // target_ws), also run the cleanup that exitFullscreenCommit would have
+    // done: restore the bar, bring back offscreen floating windows, and
+    // restore the window's border. Without this the bar stays hidden on the
+    // source workspace and floating peers remain invisible there indefinitely.
+    if (comptime build.has_fullscreen) fs_blk: {
+        const src_ws = fullscreen.workspaceFor(win) orelse break :fs_blk;
+        if (src_ws != target_ws) fullscreen.cleanupFullscreenForMove(win, src_ws);
+        fullscreen.moveRecord(src_ws, target_ws);
+    }
+
+    setWindowMask(s, win, tracking.workspaceBit(target_ws));
+
+    if (target_ws != s.current) {
+        evictWindow(win);
+        if (focus.getFocused() == win) focus.clearFocus();
+    }
+
+    retileAndScheduleFlush();
+}
+
+/// Toggle workspace tag N on `win` (Mod+Alt+N). Flips bit N in the window's mask;
+/// focus is not changed so the user can tag multiple workspaces in one gesture.
+/// When `protect_current` is true, adding a tag keeps the current workspace set too.
+/// The last remaining workspace tag is always protected and cannot be cleared.
+pub fn tagToggle(win: u32, target_ws: u8, protect_current: bool) void {
+    const s = getState() orelse return;
+    if (target_ws >= s.workspaces.len) return;
+    if (isMinimized(win)) return;
+
+    const current = s.current;
+    const mask = tracking.getWindowWorkspaceMask(win) orelse return;
+    const tbit = tracking.workspaceBit(target_ws);
+
+    if (mask & tbit != 0) {
+        // Remove tag N.
+        if (@popCount(mask) <= 1) return; // last workspace — protect
+        const new_mask = mask & ~tbit;
+        setWindowMask(s, win, new_mask);
+        if (target_ws == current) {
+            // Window is leaving the current workspace; if it was fullscreen here
+            // transfer the record to whichever workspace it still belongs to.
+            if (comptime build.has_fullscreen) {
+                if (fullscreen.workspaceFor(win)) |src_ws| {
+                    if (src_ws == current) {
+                        // Land on the lowest-set-bit workspace still in the new mask.
+                        const dst: u8 = @intCast(@ctz(new_mask));
+                        fullscreen.moveRecord(src_ws, dst);
+                    }
+                }
+            }
+            // Grab the server so the evict (offscreen move) and retile land in
+            // the same atomic batch — the compositor never sees a frame where
+            // the window has vanished but the remaining windows haven't reflowed.
+            _ = xcb.xcb_grab_server(core.conn);
+            evictWindow(win);
+            if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
+            bar.redrawInsideGrab();
+            utils.ungrabAndFlush(core.conn);
+        } else {
+            if (build.has_tiling) tiling.invalidateWsGeomBit(target_ws);
+            bar.scheduleRedraw();
+            _ = xcb.xcb_flush(core.conn);
+        }
+    } else {
+        // Add tag N. In protected mode, always keep the current workspace set too.
+        const new_mask = if (protect_current) mask | tbit | tracking.workspaceBit(current) else mask | tbit;
+        setWindowMask(s, win, new_mask);
+        if (target_ws == current) {
+            // Grab the server so the map and retile land in the same atomic
+            // batch — the compositor never sees a frame where the window is
+            // mapped but not yet positioned by the tiling engine.
+            _ = xcb.xcb_grab_server(core.conn);
+            _ = xcb.xcb_map_window(core.conn, win);
+            if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
+            bar.redrawInsideGrab();
+            utils.ungrabAndFlush(core.conn);
+        } else {
+            if (build.has_tiling) tiling.invalidateWsGeomBit(target_ws);
+            bar.scheduleRedraw();
+            _ = xcb.xcb_flush(core.conn);
+        }
+    }
+}
+
+// Workspace switch
+
+pub fn switchTo(ws_id: u8) void {
+    const s = getState() orelse return;
+    if (ws_id >= s.workspaces.len or ws_id == s.current) return;
+    exitAllWorkspacesView(s); // no-op when list is empty
+    const old = s.current;
+    s.current = ws_id;
+    tracking.setCurrentWorkspace(ws_id);
+    executeSwitch(old, ws_id);
+}
+
+/// Strips the current_ws bit from every window in `s.all_view_temp_wins`,
+/// evicts each one, and clears the list.  No-op when the list is empty.
+fn exitAllWorkspacesView(s: *State) void {
+    if (s.all_view_temp_wins.items.len == 0) return;
+    const current = s.current;
+    for (s.all_view_temp_wins.items) |win| {
+        const mask = tracking.getWindowWorkspaceMask(win) orelse continue;
+        const restored = mask & ~tracking.workspaceBit(current);
+        if (restored == 0) continue; // shouldn't happen, but never leave mask empty
+        setWindowMask(s, win, restored);
+        evictWindow(win);
+    }
+    s.all_view_temp_wins.clearRetainingCapacity();
+}
+
+/// `all_workspaces` action — Mod+5.
+/// Toggles a view where every window from every workspace is visible at once.
+///
+/// Enter: for each non-minimized window not already on the current workspace,
+///        adds the current-workspace bit to its tracking mask and appends it
+///        to `all_view_temp_wins`.  With all windows genuinely on the current
+///        workspace, `tiling.retileCurrentWorkspace()` tiles them normally.
+///
+/// Exit:  calls `exitAllWorkspacesView` which strips the temporary bit from
+///        each saved window and evicts it, then retiles to restore normal layout.
+pub fn switchToAll() void {
+    const s = getState() orelse return;
+
+    if (s.all_view_temp_wins.items.len > 0) {
+        // Exit all-workspaces view 
+        const ptr_cookie = xcb.xcb_query_pointer(core.conn, core.root);
+        _ = xcb.xcb_grab_server(core.conn);
+
+        exitAllWorkspacesView(s);
+
+        if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
+        applyPostSwitchFocus(s.current, &s.workspaces[s.current], ptr_cookie);
+        bar.raiseBar();
+        bar.redrawInsideGrab();
+        utils.ungrabAndFlush(core.conn);
+    } else {
+        // Enter all-workspaces view 
+        _ = xcb.xcb_grab_server(core.conn);
+
+        for (s.workspaces) |*ws| {
+            if (ws.id == s.current) continue;
+            for (ws.windows.items()) |win| {
+                if (tracking.isWindowOnWorkspace(win, s.current)) continue; // already here
+                if (isMinimized(win)) continue;
+
+                const mask = tracking.getWindowWorkspaceMask(win) orelse continue;
+                // Patch the mask: window is now genuinely on the current workspace,
+                // so tiling, focus, and every other subsystem sees it naturally.
+                setWindowMask(s, win, mask | tracking.workspaceBit(s.current));
+                s.all_view_temp_wins.append(s.allocator, win) catch {
+                    // OOM: undo the mask patch so we stay consistent.
+                    setWindowMask(s, win, mask);
+                    continue;
+                };
+            }
+        }
+
+        // All foreign windows are now genuinely on the current workspace.
+        // Retile handles mapping + positioning for tiled windows in one pass.
+        if (build.has_tiling and core.config.tiling.enabled) {
+            tiling.retileCurrentWorkspace();
+        } else {
+            // Floating layout: map and restore geometry manually.
+            for (s.all_view_temp_wins.items) |win| {
+                _ = xcb.xcb_map_window(core.conn, win);
+                window.restoreFloatGeom(win);
+            }
+        }
+
+        bar.scheduleRedraw();
+        utils.ungrabAndFlush(core.conn);
+    }
+}
+
+/// Common implementation for moveWindowToAll and tagToggleAll:
+/// toggles a window between "pinned to every workspace" and "current workspace only".
+fn pinToAllWorkspacesToggle(s: *State, win: u32) void {
+    const all_mask = tracking.allWorkspacesMask(s.workspaces.len);
+    const mask = tracking.getWindowWorkspaceMask(win) orelse return;
+
+    if (mask == all_mask) {
+        // Pinned everywhere — shrink back to current workspace only.
+        setWindowMask(s, win, tracking.workspaceBit(s.current));
+    } else {
+        // Pin to every workspace.
+        setWindowMask(s, win, all_mask);
+        _ = xcb.xcb_map_window(core.conn, win);
+    }
+
+    retileAndScheduleFlush();
+}
+
+/// `move_to_all_workspaces` action — Mod+Shift+5.
+/// Toggles the focused window between pinned-to-all-workspaces and current-workspace-only.
+/// First press: sets all workspace bits — the window appears on every workspace.
+/// Second press: clears back to just the current workspace bit.
+pub fn moveWindowToAll(win: u32) void {
+    const s = getState() orelse return;
+    if (isMinimized(win)) return;
+    pinToAllWorkspacesToggle(s, win);
+}
+
+/// `toggle_tag_all` action — Mod+Alt+5.  Identical semantics to moveWindowToAll.
+pub fn tagToggleAll(win: u32) void { moveWindowToAll(win); }
+
+/// Returns the workspace bitmask for `win`, or null if unmanaged.
+/// Delegates to tracking which owns the map.
+pub inline fn getWindowWorkspaceMask(win: u32) ?u64 {
+    return tracking.getWindowWorkspaceMask(win);
+}
+
+/// True when workspace `ws_idx` is set in `win`'s tag bitmask.
+pub inline fn isWindowOnWorkspace(win: u32, ws_idx: u8) bool {
+    return tracking.isWindowOnWorkspace(win, ws_idx);
+}
+
+/// Returns the first non-minimized window in `windows`, or null if all minimized.
+pub inline fn firstNonMinimized(windows: []const u32) ?u32 {
+    return tracking.firstNonMinimized(windows);
+}
+
+// Prefer the workspace's remembered focus target; fall back to firstNonMinimized.
+// Clears last_focused when it refers to a minimized window so the stale pointer
+// is not rechecked on every subsequent call.
+inline fn lastFocusedOrFirst(ws: *Workspace) ?u32 {
+    if (ws.last_focused) |win| {
+        if (!isMinimized(win)) return win;
+        ws.last_focused = null; // stale — clear so future calls skip it
+    }
+    return firstNonMinimized(ws.windows.items());
+}
+
+pub inline fn getCurrentWorkspace() ?u8 {
+    return tracking.getCurrentWorkspace();
+}
+
+pub inline fn isOnCurrentWorkspace(win: u32) bool {
+    return tracking.isOnCurrentWorkspace(win);
+}
+
+/// Returns true when `win` is on the current workspace and is not minimized.
+///
+/// The combined predicate used by focus.focusBestAvailable for post-unmanage
+/// and post-minimize focus recovery.  Combining the two checks into one
+/// function lets it serve as a typed *const fn(u32) bool without a closure.
+pub fn isOnCurrentWorkspaceAndVisible(win: u32) bool {
+    return tracking.isOnCurrentWorkspaceAndVisible(win);
+}
+
+pub inline fn getCurrentWorkspaceObject() ?*Workspace {
+    const s = getState() orelse return null;
+    return &s.workspaces[s.current];
+}
+
+pub inline fn getWorkspaceCount() usize {
+    const s = getState() orelse return 0;
+    return s.workspaces.len;
+}
+
+/// Returns the lowest-set-bit workspace index for `win`.
+pub inline fn getWorkspaceForWindow(win: u32) ?u8 {
+    return tracking.getWorkspaceForWindow(win);
+}
+
+pub fn isManaged(win: u32) bool {
+    return tracking.isManaged(win);
+}
+
+// Step 1 (of the workspace-switch pipeline): move old-workspace windows offscreen.
+// Windows ALSO tagged to `new_ws` stay on screen — they're visible on both.
+// Steps 2/3a are performed inside tiling.applyWorkspaceLayout and
+// tiling.restoreWorkspaceGeom, called from restoreWorkspaceWindows below.
+fn hideWorkspaceWindows(ws: *const Workspace, new_ws: u8) void {
+    // For each floating window leaving this workspace we need to save its geometry
+    // before it is pushed offscreen.  We fire all XCB geometry requests up-front,
+    // push every window offscreen in the same pass, then consume all replies by
+    // index — eliminating the iteration-order dependency of the old two-pass design.
+    // Windows beyond MAX_FLOAT still go offscreen; they just lose their saved geom.
+    const MAX_FLOAT = 64;
+    const GeomEntry = struct { win: u32, cookie: xcb.xcb_get_geometry_cookie_t };
+    var pending:   [MAX_FLOAT]GeomEntry = undefined;
+    var pending_n: usize                = 0;
+    var cap_warned                      = false;
+
+    for (ws.windows.items()) |win| {
+        if (tracking.isWindowOnWorkspace(win, new_ws)) continue; // stays visible
+
+        if ((!build.has_tiling or !tiling.isWindowActiveTiled(win)) and !isMinimized(win)) {
+            if (pending_n < MAX_FLOAT) {
+                pending[pending_n] = .{ .win = win, .cookie = xcb.xcb_get_geometry(core.conn, win) };
+                pending_n += 1;
+            } else if (!cap_warned) {
+                debug.warn("hideWorkspaceWindows: geometry-save cap ({d}) reached; " ++
+                    "additional floating windows will not have geometry saved", .{MAX_FLOAT});
+                cap_warned = true;
+            }
+        }
+
+        utils.pushWindowOffscreen(core.conn, win);
+        if (build.has_tiling and tiling.isWindowActiveTiled(win)) tiling.invalidateGeomCache(win);
+    }
+
+    // Consume geometry replies by index — independent of window iteration order.
+    for (pending[0..pending_n]) |e| {
+        if (xcb.xcb_get_geometry_reply(core.conn, e.cookie, null)) |geom| {
+            defer std.c.free(geom);
+            window.saveWindowGeom(e.win, .{
+                .x = geom.*.x, .y = geom.*.y,
+                .width = geom.*.width, .height = geom.*.height,
+            });
+        }
+    }
+}
+
+// Step 3b: restore geometry for the new workspace.
+fn restoreWorkspaceWindows(ws: *const Workspace, old_ws: u8) void {
+    const tiling_active = build.has_tiling and tiling.getState().is_enabled;
+
+    if (tiling_active) {
+        if (!core.config.tiling.global_layout) tiling.applyWorkspaceLayout(ws);
+
+        if (tiling.restoreWorkspaceGeom()) {
+            // Restore succeeded: invalidate only windows shared with the old workspace —
+            // their cache holds stale tiling positions from that workspace.
+            for (ws.windows.items()) |win| {
+                if (tiling.isWindowTiled(win) and tracking.isWindowOnWorkspace(win, old_ws))
+                    tiling.invalidateGeomCache(win);
+            }
+        } else {
+            // Restore failed: invalidate all tiled windows and force a full retile.
+            // (The shared-window subset above is a strict subset of this, so doing
+            // it unconditionally up-front would be wasted work on the success path.)
+            for (ws.windows.items()) |win| {
+                if (tiling.isWindowTiled(win)) tiling.invalidateGeomCache(win);
+            }
+            tiling.retileCurrentWorkspace();
+        }
+    } else if (build.has_tiling and tiling.isFloatingLayout()) {
+        // Floating layout: the tiling engine is disabled for window management
+        // but windows on inactive workspaces may have had their geometry cache
+        // zeroed the last time they were left while tiling was still active.
+        // Attempt a fast cache restore first; if that fails, run a silent retile
+        // that bypasses the !s.enabled guard to recompute the correct tiled
+        // positions without changing the active layout or moving any windows
+        // permanently.
+        if (!tiling.restoreWorkspaceGeom()) {
+            tiling.retileForRestore();
+        }
+    }
+
+    // Map every window; restore floating geometry for those not already on screen.
+    for (ws.windows.items()) |win| {
+        _ = xcb.xcb_map_window(core.conn, win);
+        if ((!build.has_tiling or !tiling.isWindowActiveTiled(win)) and !isMinimized(win) and
+            !tracking.isWindowOnWorkspace(win, old_ws))
+        {
+            window.restoreFloatGeom(win);
+        }
+    }
+}
+
+// Step 4: resolve the post-switch focus target and apply it.
+// Skips the mapped-check and stack raise that focus.setFocus would do —
+// all windows are already mapped and workspace_switch never raises.
+// `ptr_cookie` is pre-fired before the server grab to overlap the round-trip.
+fn applyPostSwitchFocus(new_ws: u8, new_ws_obj: *Workspace, ptr_cookie: xcb.xcb_query_pointer_cookie_t) void {
+    const focus_target: ?u32 = blk: {
+        const ptr = xcb.xcb_query_pointer_reply(core.conn, ptr_cookie, null)
+            orelse break :blk lastFocusedOrFirst(new_ws_obj);
+        defer std.c.free(ptr);
+        const child = ptr.*.child;
+        break :blk if (child != 0 and child != core.root and
+            tracking.isWindowOnWorkspace(child, new_ws) and !isMinimized(child))
+            child else lastFocusedOrFirst(new_ws_obj);
+    };
+
+    // Route through focus.setFocus / focus.clearFocus so that
+    // commitFocusTransition runs its full side-effect list:
+    //   • recordInHistory(old)       — MRU history kept correct for recovery
+    //   • tiling.updateWindowFocus   — tiling border state updated
+    //   • carousel.notifyFocusChanged — carousel UI notified
+    //   • advertiseActiveWindow      — _NET_ACTIVE_WINDOW on root updated
+    //   • grabButtons on old/new     — button grab ownership transferred
+    //   • xcb_set_input_focus        — X server notified
+    //
+    // The previous direct focus.setFocused() call bypassed all of these,
+    // leaving the MRU history stale and focus recovery broken after every
+    // workspace switch.
+    //
+    // .workspace_switch skips the mapped-check round-trip and never raises
+    // the window — both correct for this path since all windows are already
+    // mapped and the stacking order is set by hide/restoreWorkspaceWindows.
+    // bar.scheduleFocusRedraw() sets only a dirty bit here; the caller
+    // calls bar.redrawInsideGrab() for the actual synchronous redraw.
+    if (focus_target) |new_win| {
+        focus.setFocus(new_win, .workspace_switch);
+    } else {
+        focus.clearFocus();
+    }
+}
+
+fn executeSwitch(old_ws: u8, new_ws: u8) void {
+    const s          = getState() orelse return;
+    const new_ws_obj = &s.workspaces[new_ws];
+    const fs_info    = if (comptime build.has_fullscreen) fullscreen.getForWorkspace(new_ws) else null;
+
+    focus.setSuppressReason(.none);
+    s.workspaces[old_ws].last_focused = focus.getFocused();
+
+    // Pre-fire before the grab so the round-trip overlaps with hide+restore.
+    const ptr_cookie = xcb.xcb_query_pointer(core.conn, core.root);
+
+    _ = xcb.xcb_grab_server(core.conn);
+
+    hideWorkspaceWindows(&s.workspaces[old_ws], new_ws);
+
+    if (fs_info != null) bar.setBarState(.hide_fullscreen) else bar.setBarState(.show_fullscreen);
+
+    if (fs_info) |info| {
+        // Map and push offscreen every non-fullscreen window on this workspace.
+        //
+        // When a window is spawned onto an inactive workspace that already has
+        // an active fullscreen, executeSwitch takes this branch and skips
+        // restoreWorkspaceWindows — the only place that calls xcb_map_window
+        // on switch-in. The spawned window therefore stays unmapped. On
+        // fullscreen exit, tiling allocates a tile cell for it (it is in
+        // s.windows and on this workspace) but the cell is invisible, leaving
+        // an empty gap until the next workspace round-trip triggers a normal
+        // restoreWorkspaceWindows path.
+        //
+        // Fix: map every non-fullscreen workspace window here, then push it
+        // offscreen so it is hidden behind the fullscreen window. Invalidate
+        // the tiling cache entry for tiled windows so the next retile after
+        // fullscreen exit does not find a stale zero-rect and skip configure.
+        for (new_ws_obj.windows.items()) |win| {
+            if (win == info.window) continue;
+            _ = xcb.xcb_map_window(core.conn, win);
+            utils.pushWindowOffscreen(core.conn, win);
+            if (comptime build.has_tiling) {
+                if (tiling.isWindowActiveTiled(win)) tiling.invalidateGeomCache(win);
+            }
+        }
+        _ = xcb.xcb_configure_window(core.conn, info.window,
+            xcb.XCB_CONFIG_WINDOW_X     | xcb.XCB_CONFIG_WINDOW_Y     |
+            xcb.XCB_CONFIG_WINDOW_WIDTH | xcb.XCB_CONFIG_WINDOW_HEIGHT |
+            xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH,
+            &[_]u32{ 0, 0,
+                @intCast(core.screen.width_in_pixels),
+                @intCast(core.screen.height_in_pixels),
+                0 });
+        _ = xcb.xcb_configure_window(core.conn, info.window,
+            xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
+    } else {
+        restoreWorkspaceWindows(new_ws_obj, old_ws);
+    }
+
+    applyPostSwitchFocus(new_ws, new_ws_obj, ptr_cookie);
+
+    bar.raiseBar();
+    bar.redrawInsideGrab();
+    utils.ungrabAndFlush(core.conn);
 }
 </file>
 
@@ -12776,1365 +14135,6 @@ fn retileAllWorkspaces() void {
         }
         tiling.retileCurrentWorkspace();
     }
-}
-</file>
-
-<file path="src/input/input.zig">
-//! User input handling
-//! Handles keyboard, mouse buttons, pointer motion, and drag operations.
-
-const std   = @import("std");
-const build = @import("build_options");
-
-// libc bindings for fork/exec/wait — no Zig stdlib wrappers exist for these low-level syscalls.
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("sys/wait.h");
-});
-
-const core      = @import("core");
-    const xcb   = core.xcb;
-const types     = @import("types");
-const utils     = @import("utils");
-const constants = @import("constants");
-
-const debug  = @import("debug");
-const config = @import("config");
-
-const window   = @import("window");
-const tracking = @import("tracking");
-const focus    = @import("focus");
-
-const fullscreen = if (build.has_fullscreen) @import("fullscreen") else struct {};
-const minimize   = if (build.has_minimize) @import("minimize") else struct {};
-const workspaces = if (build.has_workspaces) @import("workspaces") else struct {};
-const tiling     = if (build.has_tiling) @import("tiling") else struct {};
-const drag       = @import("drag");
-
-const xkbcommon = @import("xkbcommon");
-
-const bar = if (build.has_bar) @import("bar") else struct {
-    pub fn scheduleFullRedraw() void {}
-    pub fn scheduleRedraw() void {}
-    pub fn redrawInsideGrab() void {}
-    pub fn setBarState(_: anytype) void {}
-    pub fn toggleBarSegmentAnchor() void {}
-};
-
-const prompt = if (build.has_bar and build.has_prompt) @import("prompt") else struct {
-    pub fn handlePromptKeypress(_: anytype, _: anytype) bool { return false; }
-    pub fn toggle() void {}
-};
-
-/// Returns the workspaces.State pointer, or null when workspaces are compiled out.
-fn getWsState() ?*workspaces.State {
-    return if (comptime build.has_workspaces) workspaces.getState() else null;
-}
-inline fn switchToWs(ws: u8) void {
-    if (comptime build.has_workspaces) workspaces.switchTo(ws);
-}
-inline fn moveWindowToWs(win: u32, ws: u8) !void {
-    if (comptime build.has_workspaces) try workspaces.moveWindowTo(win, ws);
-}
-inline fn wsMoveWindowExclusive(win: u32, ws: u8) void {
-    if (comptime build.has_workspaces) workspaces.moveWindowExclusive(win, ws);
-}
-inline fn wsTagToggle(win: u32, ws: u8, p: bool) void {
-    if (comptime build.has_workspaces) workspaces.tagToggle(win, ws, p);
-}
-inline fn wsSwitchToAll() void {
-    if (comptime build.has_workspaces) workspaces.switchToAll();
-}
-inline fn wsMoveWindowToAll(win: u32) void {
-    if (comptime build.has_workspaces) workspaces.moveWindowToAll(win);
-}
-inline fn wsTagToggleAll(win: u32) void {
-    if (comptime build.has_workspaces) workspaces.tagToggleAll(win);
-}
-
-
-// Constants 
-
-const mouse_button_left:   u8 = 1;
-const mouse_button_middle: u8 = 2;
-const mouse_button_right:  u8 = 3;
-
-const mouse_buttons = [_]u8{ mouse_button_left, mouse_button_middle, mouse_button_right };
-
-// XKB state 
-
-var xkb_state: ?xkbcommon.XkbState = null;
-
-/// Initialises the XKB context, keymap, and key state
-/// from the server's current keyboard configuration.
-pub fn initXkb(conn: *xcb.xcb_connection_t) !void {
-    xkb_state = try xkbcommon.XkbState.init(conn);
-}
-
-/// Tears down XKB state.
-/// Must be called after all other deinit steps.
-pub fn deinitXkb() void {
-    if (xkb_state) |*s| s.deinit();
-    xkb_state = null;
-}
-
-/// Returns a pointer to the module-owned XkbState, 
-/// used by events.zig during config reloads.
-pub fn getXkbState() *xkbcommon.XkbState {
-    return &xkb_state.?;
-}
-
-// Grab setup 
-
-/// Grabs mouse buttons on the root window and applies the user's cursor theme.
-pub fn setup(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t, root: u32) void {
-    setupGrabs(conn, root);
-    XcbCursor.setupRoot(conn, screen);
-}
-
-/// Grabs Super+Button{1,2,3} on the root window.
-/// Button1 = move, Button3 = resize, Button2 = config-driven mouse binds.
-pub fn setupGrabs(conn: *xcb.xcb_connection_t, root: u32) void {
-    for (mouse_buttons) |button| {
-        _ = xcb.xcb_grab_button(
-            conn, 0, root,
-            xcb.XCB_EVENT_MASK_BUTTON_PRESS |
-                xcb.XCB_EVENT_MASK_BUTTON_RELEASE |
-                xcb.XCB_EVENT_MASK_POINTER_MOTION,
-            xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC,
-            root, xcb.XCB_NONE, button, constants.MOD_SUPER,
-        );
-    }
-    _ = xcb.xcb_flush(conn);
-}
-
-// Event handlers 
-
-pub fn handleKeyPress(event: *const xcb.xcb_key_press_event_t) void {
-    focus.setLastEventTime(event.time);
-
-    const mods = utils.normalizeModifiers(event.state);
-    const keysym = xkb_state.?.keycodeToKeysym(event.detail);
-
-    // O(1) keybinding dispatch via the persistent (modifiers << 32 | keysym) map
-    // built by config.resolveKeybindings.  Replaces the previous O(n) linear
-    // scan, eliminating up to 50 comparisons per key press.
-    const matched: ?*const types.Action = config.lookupKeybinding(mods, keysym);
-
-    // The prompt owns all key input while active; routing (including the
-    // close_window dismiss shortcut) is handled entirely inside it.
-    if (prompt.handlePromptKeypress(event, matched)) return;
-
-    debug.info("[KEY] keycode={} state=0x{x} mods=0x{x} keysym=0x{x}",
-        .{ event.detail, event.state, mods, keysym });
-
-    if (matched) |action| {
-        debug.info("[KEY] action={s}", .{@tagName(action.*)});
-        executeAction(action) catch |err| debug.err("action failed: {}", .{err});
-    } else {
-        debug.info("[KEY] no binding", .{});
-    }
-}
-
-/// Dispatches a priority order button-press event
-pub fn handleButtonPress(event: *const xcb.xcb_button_press_event_t) void {
-    focus.setLastEventTime(event.time);
-
-    // Ignore clicks on root / unknown windows
-    const clicked_window = if (event.child != 0) event.child else event.event;
-    const managed_window = window.findManagedWindow(core.conn, clicked_window, tracking.isManaged);
-
-    if (clicked_window == 0 or clicked_window == core.root or managed_window == 0) {
-        replayPointer(event.time);
-        return;
-    }
-
-    const super_held = (event.state & constants.MOD_SUPER) != 0;
-
-    // Config-driven mouse binds (Super + Key)
-    if (super_held) {
-        const mods = utils.normalizeModifiers(event.state);
-        for (core.config.mouse_bindings.items) |*mb| {
-            if (mb.modifiers == mods and mb.button == event.detail) {
-                executeMouseAction(&mb.action, managed_window) 
-                    catch |err| debug.err("mouse bind error: {}", .{err});
-                releaseGrab(event.time);
-                return;
-            }
-        }
-    }
-
-    // Super + Left/Right: Move or Resize
-    if (super_held and (event.detail == mouse_button_left or event.detail == mouse_button_right)) {
-        drag.startDrag(managed_window, event.detail, event.root_x, event.root_y);
-        releaseGrab(event.time); // Explicitly release and exit
-        return;
-    }
-
-    // Fallback: Any other click focuses and raises the window.
-    //
-    // The raise must be issued unconditionally here, before setFocus, because
-    // setFocus short-circuits when managed_window is already focused_window
-    // (the common case after hover-focus) and never reaches the raise inside
-    // commitFocusTransition.  Without this explicit raise, a window that holds
-    // focus but has been visually covered — by a newly-spawned window, a
-    // floating peer, or any stacking change that bypasses the focus path —
-    // stays buried despite the click.  The double-raise when setFocus also
-    // raises is a no-op from the server's perspective.
-    _ = xcb.xcb_configure_window(core.conn, managed_window,
-        xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
-    focus.setFocus(managed_window, .mouse_click);
-    releaseGrab(event.time);
-}
-
-/// Stops any active drag and updates the last event timestamp.
-pub fn handleButtonRelease(event: *const xcb.xcb_button_release_event_t) void {
-    focus.setLastEventTime(event.time);
-    if (drag.isDragging()) drag.stopDrag();
-}
-
-/// Forwards motion to the drag engine, clears focus suppression, and re-arms POINTER_MOTION_HINT.
-pub fn handleMotionNotify(event: *const xcb.xcb_motion_notify_event_t) void {
-    focus.setLastEventTime(event.time);
-
-    if (drag.isDragging()) {
-        drag.updateDrag(event.root_x, event.root_y);
-        return;
-    }
-
-    // Real pointer movement clears any active focus suppression.
-    if (focus.getSuppressReason() != .none) focus.setSuppressReason(.none);
-
-    // POINTER_MOTION_HINT delivers one event per gesture; re-arm by sending a
-    // QueryPointer. We fire and discard the reply — the server re-arms on
-    // receipt of the request, not the reply, so there's no need to block.
-    xcb.xcb_discard_reply(core.conn, xcb.xcb_query_pointer(core.conn, core.root).sequence);
-}
-
-// Window operations 
-
-/// Closes a window gracefully via WM_DELETE_WINDOW (ICCCM §4.1.2.7), falling
-/// back to xcb_destroy_window for clients that don't advertise the protocol.
-fn closeWindow(win: u32) void {
-    if (!window.supportsWMDeleteCached(core.conn, win)) {
-        _ = xcb.xcb_destroy_window(core.conn, win);
-        return;
-    }
-
-    const protocols_atom = utils.getAtomCached("WM_PROTOCOLS") catch return;
-    const delete_atom = utils.getAtomCached("WM_DELETE_WINDOW") catch return;
-
-    // Zero-initialise: XCB transmits raw bytes, so uninitialised padding
-    // would be undefined behaviour on the wire.
-    var event = std.mem.zeroes(xcb.xcb_client_message_event_t);
-    event.response_type = xcb.XCB_CLIENT_MESSAGE;
-    event.format = 32;
-    event.window = win;
-    event.type = protocols_atom;
-    event.data.data32[0] = delete_atom;
-    event.data.data32[1] = focus.getLastEventTime(); // ICCCM §4.1.7
-
-    _ = xcb.xcb_send_event(core.conn, 0, win, xcb.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&event));
-}
-
-// Action dispatch 
-
-fn executeAction(action: *const types.Action) !void {
-    switch (action.*) {
-        // Core 
-        .close_window  => if (focus.getFocused()) |win| closeWindow(win),
-        .reload_config => utils.reload(),
-        .dump_state    => dumpState(),
-        .exec          => |cmd| try executeShellCommand(cmd),
-        .sequence      => |acts| for (acts) |*a| try executeAction(a),
-
-        // Fullscreen 
-        .toggle_fullscreen => if (comptime build.has_fullscreen) fullscreen.toggle(),
-
-        // Tiling 
-        .toggle_floating_window => if (comptime build.has_tiling) {
-            if (focus.getFocused()) |win| tiling.toggleWindowFloat(win);
-            bar.scheduleFullRedraw();
-        },
-        .toggle_layout         => if (comptime build.has_tiling) { tiling.toggleLayout();        bar.scheduleRedraw(); },
-        .toggle_layout_reverse => if (comptime build.has_tiling) { tiling.toggleLayoutReverse(); bar.scheduleRedraw(); },
-        .cycle_layout_variants => if (comptime build.has_tiling) { tiling.stepLayoutVariant(); bar.scheduleRedraw(); },
-        .increase_master       => if (comptime build.has_tiling) tiling.increaseMasterWidth(),
-        .decrease_master       => if (comptime build.has_tiling) tiling.decreaseMasterWidth(),
-        .increase_master_count => if (comptime build.has_tiling) tiling.increaseMasterCount(),
-        .decrease_master_count => if (comptime build.has_tiling) tiling.decreaseMasterCount(),
-
-        .swap_master, .swap_master_focus_swap => if (comptime build.has_tiling) {
-            _ = xcb.xcb_grab_server(core.conn);
-            if (action.* == .swap_master) {
-                // Capture the focused window ID *before* the swap so we can
-                // pass it as defer_configure.  After swapWithMaster() the
-                // focused window is the new master (the growing window); by
-                // deferring its configure_window call to last inside every
-                // column/stack, the shrinking window (old master) fills its new
-                // stack slot before the growing window vacates its old one —
-                // eliminating the one-frame wallpaper gap (Fix 3).
-                const new_master = focus.getFocused();
-                tiling.swapWithMaster();
-                tiling.retileCurrentWorkspaceDeferred(new_master);
-            } else {
-                // For follow-focus: capture focused window, reorder, retile
-                // with deferred configure, then transfer focus — all inside
-                // the grab so the focus border change is part of the same flush.
-                const new_master = focus.getFocused();
-                const displaced = tiling.swapWithMasterFollowFocus();
-                tiling.retileCurrentWorkspaceDeferred(new_master);
-                if (displaced) |win| focus.setFocus(win, .tiling_operation);
-            }
-            // Use the async pointer-sync variant: it queues the xcb_query_pointer
-            // cookie without blocking, so no premature XCB buffer flush occurs
-            // inside the grab.  drainPointerSync() in the event loop will
-            // consume the reply and route focus on the next iteration.
-            focus.beginPointerSync();
-            window.updateWorkspaceBorders();
-            window.markBordersFlushed();
-            // redrawInsideGrab now renders to the off-screen pixmap via the bar
-            // thread (no xcb_flush) and queues xcb_copy_area without flushing.
-            // The blit is sent atomically with configure_window + xcb_ungrab_server
-            // by ungrabAndFlush() below — one compositor frame, no wallpaper flash.
-            bar.redrawInsideGrab();
-            utils.ungrabAndFlush(core.conn);
-        },
-
-        // Bar 
-        .toggle_bar_visibility => if (comptime build.has_bar) bar.setBarState(.toggle),
-        .toggle_bar_position   => if (comptime build.has_bar) bar.toggleBarSegmentAnchor(),
-
-        // Minimize 
-        .minimize_window => if (comptime build.has_minimize) minimize.minimizeWindow(),
-        .unminimize_lifo => if (comptime build.has_minimize) minimize.unminimize(.lifo),
-        .unminimize_fifo => if (comptime build.has_minimize) minimize.unminimize(.fifo),
-        .unminimize_all  => if (comptime build.has_minimize) minimize.unminimizeAll(),
-
-        // Workspaces 
-        .switch_workspace       => |ws| switchToWs(ws),
-        .move_to_workspace      => |ws| if (focus.getFocused()) |win| moveWindowToWs(win, ws) catch |e| debug.warnOnErr(e, "move_to_workspace"),
-        .move_window            => |ws| if (focus.getFocused()) |win| wsMoveWindowExclusive(win, ws),
-        .toggle_tag             => |ws| if (focus.getFocused()) |win| wsTagToggle(win, ws, true),
-        .all_workspaces         => wsSwitchToAll(),
-        .move_to_all_workspaces => if (focus.getFocused()) |win| wsMoveWindowToAll(win),
-        .toggle_tag_all         => if (focus.getFocused()) |win| wsTagToggleAll(win),
-
-        // Prompt 
-        .toggle_prompt => prompt.toggle(),
-
-        // Window focus cycling (dwm-style Mod+k / Mod+j)
-        .focus_next_window => focus.focusNext(),
-        .focus_prev_window => focus.focusPrev(),
-        // Window move in cycle (dwm-style Mod+Shift+k / Mod+Shift+j)
-        .move_window_next  => focus.moveWindowNext(),
-        .move_window_prev  => focus.moveWindowPrev(),
-    }
-}
-
-/// Like executeAction but acts on the clicked window rather than the
-/// keyboard-focused one. Used by the mouse bind dispatcher so that e.g.
-/// toggle_floating_window affects whichever window was actually clicked.
-fn executeMouseAction(action: *const types.Action, clicked_win: u32) !void {
-    switch (action.*) {
-        .toggle_floating_window => if (comptime build.has_tiling) tiling.toggleWindowFloat(clicked_win),
-        else             => try executeAction(action),
-    }
-}
-
-// Shell execution 
-//
-// Commands are launched via a double-fork so the grandchild is re-parented to
-// init and the WM never accumulates zombie processes.
-//
-// Two pipes co-ordinate the three processes:
-//   exec_pipe  – write end is FD_CLOEXEC; exec success closes it silently
-//                (EOF), exec failure writes a sentinel byte.
-//   pid_pipe   – intermediate child writes the grandchild PID before exiting,
-//                so the WM can register the spawn without racing.
-
-/// Grandchild: detaches from the session and execs the command.
-/// Writes a sentinel byte to exec_pipe_write on execvp failure.
-fn execAsGrandchild(exec_pipe_write: c_int, cmd_z: [*:0]const u8) noreturn {
-    _ = c.setsid();
-    _ = c.execvp("/bin/sh", @ptrCast(&[_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z, null }));
-    const sentinel: u8 = 1;
-    _ = c.write(exec_pipe_write, &sentinel, 1);
-    std.process.exit(1);
-}
-
-/// Intermediate child: forks the grandchild, forwards its PID over pid_pipe,
-/// then exits so the grandchild is re-parented to init.
-fn forkIntermediate(exec_pipe_write: c_int, pid_pipe_write: c_int, cmd_z: [*:0]const u8) noreturn {
-    const grandchild_pid = c.fork();
-    if (grandchild_pid < 0) {
-        debug.err("Second fork failed", .{});
-        std.process.exit(1);
-    }
-    if (grandchild_pid == 0) {
-        _ = c.close(pid_pipe_write); // don't leak into the spawned process
-        execAsGrandchild(exec_pipe_write, cmd_z);
-    }
-
-    const gp: c_int = grandchild_pid;
-    _ = c.write(pid_pipe_write, &gp, @sizeOf(c_int));
-    _ = c.close(pid_pipe_write);
-    _ = c.close(exec_pipe_write);
-    std.process.exit(0);
-}
-
-/// Spawns `cmd` as a detached grandchild (double-fork) so the WM never accumulates zombie processes.
-fn executeShellCommand(cmd: []const u8) !void {
-    // Snapshot the target workspace before any blocking syscalls.  In a
-    // single-threaded WM the value cannot change while we are blocked in
-    // waitpid/read, but capturing it here makes the intent explicit and
-    // correctly handles sequence actions of the form [exec, switch_workspace]
-    // where a later action in the same sequence mutates g_current before
-    // registerSpawn is called.
-    const spawn_ws = tracking.getCurrentWorkspace();
-
-    const cmd_z = try core.alloc.dupeZ(u8, cmd);
-    defer core.alloc.free(cmd_z);
-
-    var exec_fds: [2]c_int = undefined;
-    var pid_fds: [2]c_int = undefined;
-
-    // pipe2(O_CLOEXEC) sets close-on-exec atomically on both ends in a single
-    // syscall, closing the TOCTOU window that existed between the old pipe()
-    // and the subsequent fcntl(F_SETFD, FD_CLOEXEC) call.  Another thread
-    // could have fork()ed between those two calls, inheriting the write end
-    // of the exec pipe in the child before the flag was set.
-    const pipe2_flags = std.os.linux.O{ .CLOEXEC = true };
-    switch (std.posix.errno(std.os.linux.pipe2(&exec_fds, pipe2_flags))) {
-        .SUCCESS => {},
-        else => {
-            debug.err("pipe2() failed (exec_pipe): {s}", .{cmd});
-            return error.PipeFailed;
-        },
-    }
-    switch (std.posix.errno(std.os.linux.pipe2(&pid_fds, pipe2_flags))) {
-        .SUCCESS => {},
-        else => {
-            closePipe(exec_fds);
-            debug.err("pipe2() failed (pid_pipe): {s}", .{cmd});
-            return error.PipeFailed;
-        },
-    }
-    // exec_pipe write end is CLOEXEC via pipe2 — no separate fcntl needed.
-    // exec success silently closes it (EOF); exec failure writes a sentinel byte.
-
-    const pid = c.fork();
-    if (pid < 0) {
-        closePipe(exec_fds);
-        closePipe(pid_fds);
-        debug.err("First fork failed: {s}", .{cmd});
-        return error.ForkFailed;
-    }
-
-    if (pid == 0) {
-        _ = c.close(exec_fds[0]);
-        _ = c.close(pid_fds[0]);
-        forkIntermediate(exec_fds[1], pid_fds[1], cmd_z.ptr);
-    }
-
-    // WM: close write ends, then reap the intermediate child.
-    _ = c.close(exec_fds[1]);
-    _ = c.close(pid_fds[1]);
-
-    var status: c_int = 0;
-    if (c.waitpid(pid, &status, 0) == -1) {
-        _ = c.close(exec_fds[0]);
-        _ = c.close(pid_fds[0]);
-        debug.err("waitpid failed", .{});
-        return error.WaitpidFailed;
-    }
-
-    // The intermediate child writes the grandchild PID before exiting, so
-    // this read is guaranteed not to block by the time waitpid returns.
-    var grandchild_pid: c_int = -1;
-    _ = c.read(pid_fds[0], &grandchild_pid, @sizeOf(c_int));
-    _ = c.close(pid_fds[0]);
-
-    // EOF (n == 0) means exec succeeded; a sentinel byte means it failed.
-    var sentinel: u8 = 0;
-    const n = c.read(exec_fds[0], &sentinel, 1);
-    _ = c.close(exec_fds[0]);
-    if (n > 0) return; // exec failed; skip spawn registration
-
-    if (spawn_ws) |ws| {
-        const pid_u32: u32 = if (grandchild_pid > 0) @intCast(grandchild_pid) else 0;
-        window.registerSpawn(ws, pid_u32);
-    }
-}
-
-// Diagnostics 
-
-/// Logs a full WM state snapshot at info level. Used for diagnostics only.
-fn dumpState() void {
-    debug.info("========== STATE DUMP ==========", .{});
-    debug.info("Focused:        {?x}", .{focus.getFocused()});
-    debug.info("Total windows:  {}",   .{tracking.windowCount()});
-    debug.info("Suppress focus: {s}",  .{@tagName(focus.getSuppressReason())});
-    debug.info("Drag active:    {}",   .{drag.isDragging()});
-
-    if (comptime build.has_fullscreen) {
-        fullscreen.forEachFullscreen(struct {
-            fn cb(ws: u8, info: fullscreen.FullscreenInfo) void {
-                debug.info("Fullscreen on workspace {}: {x}", .{ ws, info.window });
-            }
-        }.cb);
-        if (!fullscreen.hasAnyFullscreen()) debug.info("Fullscreen: none", .{});
-    } else {
-        debug.info("Fullscreen: none", .{});
-    }
-
-    if (comptime build.has_workspaces) {
-        if (getWsState()) |ws_state| {
-            debug.info("Current workspace: {}", .{ws_state.current + 1});
-            for (ws_state.workspaces, 0..) |*ws, i| {
-                debug.info("  WS{}: {} windows", .{ i + 1, ws.windows.len });
-            }
-        }
-    }
-
-    if (comptime build.has_tiling) {
-        if (tiling.getStateOpt()) |t| {
-            debug.info("Tiling enabled: {}",     .{t.is_enabled});
-            debug.info("Tiling layout:  {s}",    .{@tagName(t.layout)});
-            debug.info("Tiled windows:  {}",     .{t.windows.len});
-            debug.info("Master count:   {}",     .{t.master_count});
-            debug.info("Master width:   {d:.2}", .{t.master_width});
-        }
-    }
-
-    debug.info("================================", .{});
-}
-
-// Helpers 
-
-/// Replays a frozen pointer event without releasing the keyboard grab.
-/// Always pass event.time — never XCB_CURRENT_TIME.
-inline fn replayPointer(time: u32) void {
-    _ = xcb.xcb_allow_events(core.conn, xcb.XCB_ALLOW_REPLAY_POINTER, time);
-    _ = xcb.xcb_flush(core.conn);
-}
-
-/// Releases both the pointer and keyboard SYNC grabs acquired on Super+click.
-/// Always pass event.time — never XCB_CURRENT_TIME.
-inline fn releaseGrab(time: u32) void {
-    _ = xcb.xcb_allow_events(core.conn, xcb.XCB_ALLOW_REPLAY_POINTER, time);
-    _ = xcb.xcb_allow_events(core.conn, xcb.XCB_ALLOW_ASYNC_KEYBOARD, time);
-    _ = xcb.xcb_flush(core.conn);
-}
-
-inline fn closePipe(p: [2]c_int) void {
-    _ = c.close(p[0]);
-    _ = c.close(p[1]);
-}
-
-// XcbCursor 
-//
-// Declared manually rather than via cImport because xcb_cursor_load_cursor is
-// a static inline function that cImport cannot bind.
-
-const XcbCursor = struct {
-    const Context = opaque {};
-
-    extern fn xcb_cursor_context_new(
-        conn: *xcb.xcb_connection_t,
-        screen: *xcb.xcb_screen_t,
-        ctx: *?*Context,
-    ) c_int;
-    extern fn xcb_cursor_load_cursor(ctx: *Context, name: [*:0]const u8) u32;
-    extern fn xcb_cursor_context_free(ctx: ?*Context) void;
-
-    /// Applies the user's cursor theme to the root window. Falls back silently
-    /// if xcb-cursor is unavailable or the cursor cannot be loaded.
-    fn setupRoot(conn: *xcb.xcb_connection_t, screen: *xcb.xcb_screen_t) void {
-        var cursor_ctx: ?*Context = null;
-        if (xcb_cursor_context_new(conn, screen, &cursor_ctx) < 0) return;
-        defer xcb_cursor_context_free(cursor_ctx);
-
-        const cursor = xcb_cursor_load_cursor(cursor_ctx.?, "left_ptr");
-        if (cursor == xcb.XCB_NONE) return;
-
-        const cookie = xcb.xcb_change_window_attributes_checked(
-            conn, screen.*.root, xcb.XCB_CW_CURSOR, &[_]u32{cursor},
-        );
-        if (xcb.xcb_request_check(conn, cookie)) |err| {
-            debug.err("Failed to set root cursor: {*}", .{err});
-            std.c.free(err);
-        }
-
-        // The server reference-counts cursors, so freeing our handle here is
-        // safe — it stays alive as long as the root window holds a reference.
-        _ = xcb.xcb_free_cursor(conn, cursor);
-    }
-};
-</file>
-
-<file path="src/window/modules/workspaces.zig">
-//! Workspace management — creation, window assignment, and workspace switching.
-
-const std   = @import("std");
-const build = @import("build_options");
-
-const core      = @import("core");
-    const xcb   = core.xcb;
-const utils     = @import("utils");
-const types     = @import("types");
-const constants = @import("constants");
-
-const debug = @import("debug");
-
-const window   = @import("window");
-const tracking = @import("tracking");
-const focus    = @import("focus");
-
-const fullscreen = if (build.has_fullscreen) @import("fullscreen") else struct {};
-const minimize   = if (build.has_minimize) @import("minimize") else struct {};
-
-const tiling       = if (build.has_tiling) @import("tiling") else struct {};
-const TilingLayout = if (build.has_tiling) tiling.Layout else u0; // u0 sentinel when tiling is absent: zero-size, never stored
-
-const bar = if (build.has_bar) @import("bar") else struct {
-    pub fn scheduleRedraw() void {}
-    pub fn raiseBar() void {}
-    pub fn redrawInsideGrab() void {}
-    pub fn setBarState(_: anytype) void {}
-};
-
-
-/// Shim so call-sites don't need to repeat the has_minimize comptime guard.
-/// Returns false when minimize is absent — windows are never considered minimized.
-inline fn isMinimized(win: u32) bool {
-    return if (comptime build.has_minimize) minimize.isMinimized(win) else false;
-}
-
-pub const Workspace = struct {
-    id:      u8,
-    windows: tracking.Tracking,
-    name:    []const u8,
-    // The tiling layout active on this workspace.
-    // Initialized from config; updated when the user switches layouts
-    // in per-workspace mode.
-    layout: TilingLayout,
-    // Optional layout variants override set via the layouts array in config.
-    // Applied on every workspace switch; null means use the global defaults.
-    variants: ?types.LayoutVariantOverride = null,
-    // Per-workspace master width override (master-stack layout).
-    // null = use the global default from tiling state.
-    // Set when the user adjusts master width in per-workspace layout mode;
-    // loaded back into tiling state on every workspace switch-in.
-    master_width: ?f32 = null,
-    // Per-workspace master count override (master-stack layout).
-    // null = use the global default from config / tiling state.
-    // Populated at init from [tiling.layouts.master-stack.counts] and updated
-    // when the user adjusts the count via keybind in per-workspace layout mode.
-    master_count: ?u8 = null,
-    // Last window that held focus on this workspace before the user left it.
-    // Restored on re-entry when the cursor is not hovering over any window.
-    last_focused: ?u32 = null,
-
-    pub fn init(id: u8, name: []const u8, default_layout: TilingLayout) Workspace {
-        return .{ .id = id, .windows = .{}, .name = name, .layout = default_layout };
-    }
-
-    /// Removes `win` from this workspace and clears last_focused if it pointed to it.
-    pub fn removeAndClearFocus(self: *Workspace, win: u32) void {
-        _ = self.windows.remove(win);
-        if (self.last_focused == win) self.last_focused = null;
-    }
-};
-
-pub const State = struct {
-    workspaces: []Workspace,
-    current:    u8,
-    allocator:  std.mem.Allocator,
-    /// Windows temporarily patched into the current workspace by switchToAll().
-    /// Non-empty iff all-workspaces view is active.
-    /// Cleared (and their bitmasks restored) on the next switchToAll() or switchTo().
-    all_view_temp_wins: std.ArrayListUnmanaged(u32) = .empty,
-};
-
-var g_state: ?State = null;
-
-pub inline fn getState() ?*State { return if (g_state) |*s| s else null; }
-
-/// Yields the index of each set bit in `mask`, lowest first.
-const SetBitIterator = struct {
-    bits: u64,
-    pub fn next(self: *SetBitIterator) ?u8 {
-        if (self.bits == 0) return null;
-        const idx: u8 = @intCast(@ctz(self.bits));
-        self.bits &= self.bits - 1;
-        return idx;
-    }
-};
-inline fn setBits(mask: u64) SetBitIterator { return .{ .bits = mask }; }
-
-/// Push `win` offscreen and evict its geometry cache entry.
-/// Used when a window leaves the current workspace.
-inline fn evictWindow(win: u32) void {
-    utils.pushWindowOffscreen(core.conn, win);
-    if (build.has_tiling) tiling.invalidateGeomCache(win);
-}
-
-/// Resolves a layout name (e.g. "master-stack", "monocle") to tiling.Layout.
-fn layoutFromName(name: []const u8) TilingLayout {
-    if (!build.has_tiling) return 0;
-    return if (std.mem.eql(u8, name, "master-stack")) .master
-        else std.meta.stringToEnum(tiling.Layout, name) orelse tiling.defaultLayout();
-}
-
-/// Initializes global workspace state.  Returns error.OutOfMemory if the
-/// workspace slice cannot be allocated; callers should treat this as fatal.
-pub fn init() !void {
-    const count = core.config.workspaces.count;
-    const wss   = try core.alloc.alloc(Workspace, count);
-
-    const default_layout: TilingLayout = if (build.has_tiling) tiling.getState().layout else 0;
-    const cfg_tiling = &core.config.tiling;
-
-    // Build a flat lookup table so each workspace's override is O(1) to find,
-    // instead of the original O(overrides) inner-loop scan per workspace.
-    // The u64 bitmask caps us at 64 workspaces, so a fixed-size array suffices.
-    const MAX_WS = 64;
-    const OverrideLookup = struct {
-        layout_idx: usize,
-        variant:    ?types.LayoutVariantOverride,
-    };
-    var override_lookup: [MAX_WS]?OverrideLookup = .{null} ** MAX_WS;
-    if (build.has_tiling) {
-        for (cfg_tiling.workspace_layout_overrides.items) |o| {
-            if (o.workspace_idx < MAX_WS)
-                override_lookup[o.workspace_idx] = .{
-                    .layout_idx = o.layout_idx,
-                    .variant    = o.variant,
-                };
-        }
-    }
-
-    // Per-workspace master count overrides from [tiling.layouts.master-stack.counts].
-    var master_count_lookup: [MAX_WS]?u8 = .{null} ** MAX_WS;
-    if (build.has_tiling) {
-        for (cfg_tiling.workspace_master_count_overrides.items) |o| {
-            if (o.workspace_idx < MAX_WS)
-                master_count_lookup[o.workspace_idx] = o.count;
-        }
-    }
-
-    for (wss, 0..) |*ws, i| {
-        const id: u8 = @intCast(i);
-        const name = if (i < tracking.WORKSPACE_LABELS.len) tracking.WORKSPACE_LABELS[i] else "?";
-
-        // Apply any workspace-specific layout + variants override from the
-        // layouts array (e.g. `"monocle", "gapless", "4,8"` in config.toml).
-        var ws_layout   = default_layout;
-        var ws_variant: ?types.LayoutVariantOverride = null;
-        if (build.has_tiling) {
-            if (override_lookup[id]) |o| {
-                if (o.layout_idx < cfg_tiling.layouts.items.len)
-                    ws_layout = layoutFromName(cfg_tiling.layouts.items[o.layout_idx]);
-                ws_variant = o.variant;
-            }
-        }
-
-        ws.* = Workspace.init(id, name, ws_layout);
-        ws.variants = ws_variant;
-        if (build.has_tiling) {
-            if (master_count_lookup[id]) |mc| ws.master_count = mc;
-        }
-    }
-
-    tracking.setWorkspaceCount(count);
-    tracking.setCurrentWorkspace(0);
-
-    g_state = .{
-        .workspaces = wss,
-        .current    = 0,
-        .allocator  = core.alloc,
-    };
-}
-
-pub fn deinit() void {
-    if (g_state) |*s| {
-        s.all_view_temp_wins.deinit(s.allocator);
-        s.allocator.free(s.workspaces);
-    }
-    g_state = null;
-    tracking.setWorkspaceCount(1);
-    tracking.setCurrentWorkspace(0);
-}
-
-pub fn removeWindow(win: u32) void {
-    const s = getState() orelse {
-        tracking.removeWindow(win);
-        return;
-    };
-    if (tracking.getWindowWorkspaceMask(win)) |mask| {
-        var it = setBits(mask);
-        while (it.next()) |ws_idx| {
-            if (ws_idx < s.workspaces.len)
-                s.workspaces[ws_idx].removeAndClearFocus(win);
-        }
-    }
-    tracking.removeWindow(win);
-}
-
-pub fn moveWindowTo(win: u32, target_ws: u8) !void {
-    const s = getState() orelse return;
-    if (target_ws >= s.workspaces.len) {
-        debug.err("Invalid target workspace: {}", .{target_ws});
-        return;
-    }
-
-    const mask = tracking.getWindowWorkspaceMask(win) orelse {
-        // Not yet tracked (new window): register in tracking and workspace list.
-        try tracking.registerWindow(win, target_ws);
-        s.workspaces[target_ws].windows.add(win);
-        return;
-    };
-
-    const target_bit = tracking.workspaceBit(target_ws);
-    if (mask == target_bit) return;
-
-    var new_mask = (mask & ~tracking.workspaceBit(s.current)) | target_bit;
-    if (new_mask == 0) new_mask = target_bit; // safety: never leave mask empty
-
-    // Route through setWindowMask so every workspace's window list stays in sync,
-    // including any extra workspaces the window was tagged to beyond the current one.
-    setWindowMask(s, win, new_mask);
-
-    if (isMinimized(win)) {
-        if (comptime build.has_minimize) minimize.moveToWorkspace(win, target_ws);
-    }
-
-    // If this window is fullscreen on the current workspace, clean up the
-    // fullscreen side-effects on the source workspace (bar, floating windows,
-    // border) and transfer the record to target_ws so the window is still
-    // fullscreen when you switch there.
-    if (comptime build.has_fullscreen) fs_blk: {
-        const src_ws = fullscreen.workspaceFor(win) orelse break :fs_blk;
-        if (src_ws != s.current) break :fs_blk;
-        fullscreen.cleanupFullscreenForMove(win, src_ws);
-        fullscreen.moveRecord(src_ws, target_ws);
-    }
-
-    evictWindow(win);
-    if (focus.getFocused() == win) focus.clearFocus();
-    if (build.has_tiling and core.config.tiling.enabled) tiling.markDirty();
-    bar.scheduleRedraw();
-    _ = xcb.xcb_flush(core.conn);
-}
-
-// Tag operations
-
-/// Low-level: set a window's workspace bitmask and keep every workspace
-/// Tracking consistent. Does NOT handle screen visibility or tiling.
-fn setWindowMask(s: *State, win: u32, new_mask: u64) void {
-    std.debug.assert(new_mask != 0);
-    const old_mask = tracking.getWindowWorkspaceMask(win) orelse 0;
-    tracking.setWindowMask(win, new_mask);
-
-    // Add to newly-set workspaces.
-    var added_it = setBits(new_mask & ~old_mask);
-    while (added_it.next()) |idx| {
-        if (idx < s.workspaces.len) s.workspaces[idx].windows.add(win);
-    }
-
-    // Remove from cleared workspaces.
-    var removed_it = setBits(old_mask & ~new_mask);
-    while (removed_it.next()) |idx| {
-        if (idx < s.workspaces.len)
-            s.workspaces[idx].removeAndClearFocus(win);
-    }
-}
-
-/// Retile the current workspace (when tiling is active), schedule a bar redraw,
-/// and flush pending XCB requests. Called at the tail of actions that modify
-/// workspace masks and need the display to reflect the change immediately.
-inline fn retileAndScheduleFlush() void {
-    if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
-    bar.scheduleRedraw();
-    _ = xcb.xcb_flush(core.conn);
-}
-
-/// `move_window` action — Mod+Shift+N. Hard-moves `win` to `target_ws` exclusively,
-/// clearing all other workspace bits. Pair with tagToggle (Mod+Alt+N) to add more.
-pub fn moveWindowExclusive(win: u32, target_ws: u8) void {
-    const s = getState() orelse return;
-    if (target_ws >= s.workspaces.len) return;
-    if (isMinimized(win)) return;
-
-    const mask = tracking.getWindowWorkspaceMask(win) orelse return;
-    if (mask == tracking.workspaceBit(target_ws)) return; // already exclusively on target — no-op
-
-    // Transfer fullscreen record to the target workspace so the window
-    // remains fullscreen wherever it lands, not just on the source workspace.
-    // When the window is actually leaving the current workspace (src_ws !=
-    // target_ws), also run the cleanup that exitFullscreenCommit would have
-    // done: restore the bar, bring back offscreen floating windows, and
-    // restore the window's border. Without this the bar stays hidden on the
-    // source workspace and floating peers remain invisible there indefinitely.
-    if (comptime build.has_fullscreen) fs_blk: {
-        const src_ws = fullscreen.workspaceFor(win) orelse break :fs_blk;
-        if (src_ws != target_ws) fullscreen.cleanupFullscreenForMove(win, src_ws);
-        fullscreen.moveRecord(src_ws, target_ws);
-    }
-
-    setWindowMask(s, win, tracking.workspaceBit(target_ws));
-
-    if (target_ws != s.current) {
-        evictWindow(win);
-        if (focus.getFocused() == win) focus.clearFocus();
-    }
-
-    retileAndScheduleFlush();
-}
-
-/// Toggle workspace tag N on `win` (Mod+Alt+N). Flips bit N in the window's mask;
-/// focus is not changed so the user can tag multiple workspaces in one gesture.
-/// When `protect_current` is true, adding a tag keeps the current workspace set too.
-/// The last remaining workspace tag is always protected and cannot be cleared.
-pub fn tagToggle(win: u32, target_ws: u8, protect_current: bool) void {
-    const s = getState() orelse return;
-    if (target_ws >= s.workspaces.len) return;
-    if (isMinimized(win)) return;
-
-    const current = s.current;
-    const mask = tracking.getWindowWorkspaceMask(win) orelse return;
-    const tbit = tracking.workspaceBit(target_ws);
-
-    if (mask & tbit != 0) {
-        // Remove tag N.
-        if (@popCount(mask) <= 1) return; // last workspace — protect
-        const new_mask = mask & ~tbit;
-        setWindowMask(s, win, new_mask);
-        if (target_ws == current) {
-            // Window is leaving the current workspace; if it was fullscreen here
-            // transfer the record to whichever workspace it still belongs to.
-            if (comptime build.has_fullscreen) {
-                if (fullscreen.workspaceFor(win)) |src_ws| {
-                    if (src_ws == current) {
-                        // Land on the lowest-set-bit workspace still in the new mask.
-                        const dst: u8 = @intCast(@ctz(new_mask));
-                        fullscreen.moveRecord(src_ws, dst);
-                    }
-                }
-            }
-            // Grab the server so the evict (offscreen move) and retile land in
-            // the same atomic batch — the compositor never sees a frame where
-            // the window has vanished but the remaining windows haven't reflowed.
-            _ = xcb.xcb_grab_server(core.conn);
-            evictWindow(win);
-            if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
-            bar.redrawInsideGrab();
-            utils.ungrabAndFlush(core.conn);
-        } else {
-            if (build.has_tiling) tiling.invalidateWsGeomBit(target_ws);
-            bar.scheduleRedraw();
-            _ = xcb.xcb_flush(core.conn);
-        }
-    } else {
-        // Add tag N. In protected mode, always keep the current workspace set too.
-        const new_mask = if (protect_current) mask | tbit | tracking.workspaceBit(current) else mask | tbit;
-        setWindowMask(s, win, new_mask);
-        if (target_ws == current) {
-            // Grab the server so the map and retile land in the same atomic
-            // batch — the compositor never sees a frame where the window is
-            // mapped but not yet positioned by the tiling engine.
-            _ = xcb.xcb_grab_server(core.conn);
-            _ = xcb.xcb_map_window(core.conn, win);
-            if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
-            bar.redrawInsideGrab();
-            utils.ungrabAndFlush(core.conn);
-        } else {
-            if (build.has_tiling) tiling.invalidateWsGeomBit(target_ws);
-            bar.scheduleRedraw();
-            _ = xcb.xcb_flush(core.conn);
-        }
-    }
-}
-
-// Workspace switch
-
-pub fn switchTo(ws_id: u8) void {
-    const s = getState() orelse return;
-    if (ws_id >= s.workspaces.len or ws_id == s.current) return;
-    exitAllWorkspacesView(s); // no-op when list is empty
-    const old = s.current;
-    s.current = ws_id;
-    tracking.setCurrentWorkspace(ws_id);
-    executeSwitch(old, ws_id);
-}
-
-/// Strips the current_ws bit from every window in `s.all_view_temp_wins`,
-/// evicts each one, and clears the list.  No-op when the list is empty.
-fn exitAllWorkspacesView(s: *State) void {
-    if (s.all_view_temp_wins.items.len == 0) return;
-    const current = s.current;
-    for (s.all_view_temp_wins.items) |win| {
-        const mask = tracking.getWindowWorkspaceMask(win) orelse continue;
-        const restored = mask & ~tracking.workspaceBit(current);
-        if (restored == 0) continue; // shouldn't happen, but never leave mask empty
-        setWindowMask(s, win, restored);
-        evictWindow(win);
-    }
-    s.all_view_temp_wins.clearRetainingCapacity();
-}
-
-/// `all_workspaces` action — Mod+5.
-/// Toggles a view where every window from every workspace is visible at once.
-///
-/// Enter: for each non-minimized window not already on the current workspace,
-///        adds the current-workspace bit to its tracking mask and appends it
-///        to `all_view_temp_wins`.  With all windows genuinely on the current
-///        workspace, `tiling.retileCurrentWorkspace()` tiles them normally.
-///
-/// Exit:  calls `exitAllWorkspacesView` which strips the temporary bit from
-///        each saved window and evicts it, then retiles to restore normal layout.
-pub fn switchToAll() void {
-    const s = getState() orelse return;
-
-    if (s.all_view_temp_wins.items.len > 0) {
-        // Exit all-workspaces view 
-        const ptr_cookie = xcb.xcb_query_pointer(core.conn, core.root);
-        _ = xcb.xcb_grab_server(core.conn);
-
-        exitAllWorkspacesView(s);
-
-        if (build.has_tiling and core.config.tiling.enabled) tiling.retileCurrentWorkspace();
-        applyPostSwitchFocus(s.current, &s.workspaces[s.current], ptr_cookie);
-        bar.raiseBar();
-        bar.redrawInsideGrab();
-        utils.ungrabAndFlush(core.conn);
-    } else {
-        // Enter all-workspaces view 
-        _ = xcb.xcb_grab_server(core.conn);
-
-        for (s.workspaces) |*ws| {
-            if (ws.id == s.current) continue;
-            for (ws.windows.items()) |win| {
-                if (tracking.isWindowOnWorkspace(win, s.current)) continue; // already here
-                if (isMinimized(win)) continue;
-
-                const mask = tracking.getWindowWorkspaceMask(win) orelse continue;
-                // Patch the mask: window is now genuinely on the current workspace,
-                // so tiling, focus, and every other subsystem sees it naturally.
-                setWindowMask(s, win, mask | tracking.workspaceBit(s.current));
-                s.all_view_temp_wins.append(s.allocator, win) catch {
-                    // OOM: undo the mask patch so we stay consistent.
-                    setWindowMask(s, win, mask);
-                    continue;
-                };
-            }
-        }
-
-        // All foreign windows are now genuinely on the current workspace.
-        // Retile handles mapping + positioning for tiled windows in one pass.
-        if (build.has_tiling and core.config.tiling.enabled) {
-            tiling.retileCurrentWorkspace();
-        } else {
-            // Floating layout: map and restore geometry manually.
-            for (s.all_view_temp_wins.items) |win| {
-                _ = xcb.xcb_map_window(core.conn, win);
-                window.restoreFloatGeom(win);
-            }
-        }
-
-        bar.scheduleRedraw();
-        utils.ungrabAndFlush(core.conn);
-    }
-}
-
-/// Common implementation for moveWindowToAll and tagToggleAll:
-/// toggles a window between "pinned to every workspace" and "current workspace only".
-fn pinToAllWorkspacesToggle(s: *State, win: u32) void {
-    const all_mask = tracking.allWorkspacesMask(s.workspaces.len);
-    const mask = tracking.getWindowWorkspaceMask(win) orelse return;
-
-    if (mask == all_mask) {
-        // Pinned everywhere — shrink back to current workspace only.
-        setWindowMask(s, win, tracking.workspaceBit(s.current));
-    } else {
-        // Pin to every workspace.
-        setWindowMask(s, win, all_mask);
-        _ = xcb.xcb_map_window(core.conn, win);
-    }
-
-    retileAndScheduleFlush();
-}
-
-/// `move_to_all_workspaces` action — Mod+Shift+5.
-/// Toggles the focused window between pinned-to-all-workspaces and current-workspace-only.
-/// First press: sets all workspace bits — the window appears on every workspace.
-/// Second press: clears back to just the current workspace bit.
-pub fn moveWindowToAll(win: u32) void {
-    const s = getState() orelse return;
-    if (isMinimized(win)) return;
-    pinToAllWorkspacesToggle(s, win);
-}
-
-/// `toggle_tag_all` action — Mod+Alt+5.  Identical semantics to moveWindowToAll.
-pub fn tagToggleAll(win: u32) void { moveWindowToAll(win); }
-
-/// Returns the workspace bitmask for `win`, or null if unmanaged.
-/// Delegates to tracking which owns the map.
-pub inline fn getWindowWorkspaceMask(win: u32) ?u64 {
-    return tracking.getWindowWorkspaceMask(win);
-}
-
-/// True when workspace `ws_idx` is set in `win`'s tag bitmask.
-pub inline fn isWindowOnWorkspace(win: u32, ws_idx: u8) bool {
-    return tracking.isWindowOnWorkspace(win, ws_idx);
-}
-
-/// Returns the first non-minimized window in `windows`, or null if all minimized.
-pub inline fn firstNonMinimized(windows: []const u32) ?u32 {
-    return tracking.firstNonMinimized(windows);
-}
-
-// Prefer the workspace's remembered focus target; fall back to firstNonMinimized.
-// Clears last_focused when it refers to a minimized window so the stale pointer
-// is not rechecked on every subsequent call.
-inline fn lastFocusedOrFirst(ws: *Workspace) ?u32 {
-    if (ws.last_focused) |win| {
-        if (!isMinimized(win)) return win;
-        ws.last_focused = null; // stale — clear so future calls skip it
-    }
-    return firstNonMinimized(ws.windows.items());
-}
-
-pub inline fn getCurrentWorkspace() ?u8 {
-    return tracking.getCurrentWorkspace();
-}
-
-pub inline fn isOnCurrentWorkspace(win: u32) bool {
-    return tracking.isOnCurrentWorkspace(win);
-}
-
-/// Returns true when `win` is on the current workspace and is not minimized.
-///
-/// The combined predicate used by focus.focusBestAvailable for post-unmanage
-/// and post-minimize focus recovery.  Combining the two checks into one
-/// function lets it serve as a typed *const fn(u32) bool without a closure.
-pub fn isOnCurrentWorkspaceAndVisible(win: u32) bool {
-    return tracking.isOnCurrentWorkspaceAndVisible(win);
-}
-
-pub inline fn getCurrentWorkspaceObject() ?*Workspace {
-    const s = getState() orelse return null;
-    return &s.workspaces[s.current];
-}
-
-pub inline fn getWorkspaceCount() usize {
-    const s = getState() orelse return 0;
-    return s.workspaces.len;
-}
-
-/// Returns the lowest-set-bit workspace index for `win`.
-pub inline fn getWorkspaceForWindow(win: u32) ?u8 {
-    return tracking.getWorkspaceForWindow(win);
-}
-
-pub fn isManaged(win: u32) bool {
-    return tracking.isManaged(win);
-}
-
-// Step 1 (of the workspace-switch pipeline): move old-workspace windows offscreen.
-// Windows ALSO tagged to `new_ws` stay on screen — they're visible on both.
-// Steps 2/3a are performed inside tiling.applyWorkspaceLayout and
-// tiling.restoreWorkspaceGeom, called from restoreWorkspaceWindows below.
-fn hideWorkspaceWindows(ws: *const Workspace, new_ws: u8) void {
-    // For each floating window leaving this workspace we need to save its geometry
-    // before it is pushed offscreen.  We fire all XCB geometry requests up-front,
-    // push every window offscreen in the same pass, then consume all replies by
-    // index — eliminating the iteration-order dependency of the old two-pass design.
-    // Windows beyond MAX_FLOAT still go offscreen; they just lose their saved geom.
-    const MAX_FLOAT = 64;
-    const GeomEntry = struct { win: u32, cookie: xcb.xcb_get_geometry_cookie_t };
-    var pending:   [MAX_FLOAT]GeomEntry = undefined;
-    var pending_n: usize                = 0;
-    var cap_warned                      = false;
-
-    for (ws.windows.items()) |win| {
-        if (tracking.isWindowOnWorkspace(win, new_ws)) continue; // stays visible
-
-        if ((!build.has_tiling or !tiling.isWindowActiveTiled(win)) and !isMinimized(win)) {
-            if (pending_n < MAX_FLOAT) {
-                pending[pending_n] = .{ .win = win, .cookie = xcb.xcb_get_geometry(core.conn, win) };
-                pending_n += 1;
-            } else if (!cap_warned) {
-                debug.warn("hideWorkspaceWindows: geometry-save cap ({d}) reached; " ++
-                    "additional floating windows will not have geometry saved", .{MAX_FLOAT});
-                cap_warned = true;
-            }
-        }
-
-        utils.pushWindowOffscreen(core.conn, win);
-        if (build.has_tiling and tiling.isWindowActiveTiled(win)) tiling.invalidateGeomCache(win);
-    }
-
-    // Consume geometry replies by index — independent of window iteration order.
-    for (pending[0..pending_n]) |e| {
-        if (xcb.xcb_get_geometry_reply(core.conn, e.cookie, null)) |geom| {
-            defer std.c.free(geom);
-            window.saveWindowGeom(e.win, .{
-                .x = geom.*.x, .y = geom.*.y,
-                .width = geom.*.width, .height = geom.*.height,
-            });
-        }
-    }
-}
-
-// Step 3b: restore geometry for the new workspace.
-fn restoreWorkspaceWindows(ws: *const Workspace, old_ws: u8) void {
-    const tiling_active = build.has_tiling and tiling.getState().is_enabled;
-
-    if (tiling_active) {
-        if (!core.config.tiling.global_layout) tiling.applyWorkspaceLayout(ws);
-
-        if (tiling.restoreWorkspaceGeom()) {
-            // Restore succeeded: invalidate only windows shared with the old workspace —
-            // their cache holds stale tiling positions from that workspace.
-            for (ws.windows.items()) |win| {
-                if (tiling.isWindowTiled(win) and tracking.isWindowOnWorkspace(win, old_ws))
-                    tiling.invalidateGeomCache(win);
-            }
-        } else {
-            // Restore failed: invalidate all tiled windows and force a full retile.
-            // (The shared-window subset above is a strict subset of this, so doing
-            // it unconditionally up-front would be wasted work on the success path.)
-            for (ws.windows.items()) |win| {
-                if (tiling.isWindowTiled(win)) tiling.invalidateGeomCache(win);
-            }
-            tiling.retileCurrentWorkspace();
-        }
-    } else if (build.has_tiling and tiling.isFloatingLayout()) {
-        // Floating layout: the tiling engine is disabled for window management
-        // but windows on inactive workspaces may have had their geometry cache
-        // zeroed the last time they were left while tiling was still active.
-        // Attempt a fast cache restore first; if that fails, run a silent retile
-        // that bypasses the !s.enabled guard to recompute the correct tiled
-        // positions without changing the active layout or moving any windows
-        // permanently.
-        if (!tiling.restoreWorkspaceGeom()) {
-            tiling.retileForRestore();
-        }
-    }
-
-    // Map every window; restore floating geometry for those not already on screen.
-    for (ws.windows.items()) |win| {
-        _ = xcb.xcb_map_window(core.conn, win);
-        if ((!build.has_tiling or !tiling.isWindowActiveTiled(win)) and !isMinimized(win) and
-            !tracking.isWindowOnWorkspace(win, old_ws))
-        {
-            window.restoreFloatGeom(win);
-        }
-    }
-}
-
-// Step 4: resolve the post-switch focus target and apply it.
-// Skips the mapped-check and stack raise that focus.setFocus would do —
-// all windows are already mapped and workspace_switch never raises.
-// `ptr_cookie` is pre-fired before the server grab to overlap the round-trip.
-fn applyPostSwitchFocus(new_ws: u8, new_ws_obj: *Workspace, ptr_cookie: xcb.xcb_query_pointer_cookie_t) void {
-    const focus_target: ?u32 = blk: {
-        const ptr = xcb.xcb_query_pointer_reply(core.conn, ptr_cookie, null)
-            orelse break :blk lastFocusedOrFirst(new_ws_obj);
-        defer std.c.free(ptr);
-        const child = ptr.*.child;
-        break :blk if (child != 0 and child != core.root and
-            tracking.isWindowOnWorkspace(child, new_ws) and !isMinimized(child))
-            child else lastFocusedOrFirst(new_ws_obj);
-    };
-
-    // Route through focus.setFocus / focus.clearFocus so that
-    // commitFocusTransition runs its full side-effect list:
-    //   • recordInHistory(old)       — MRU history kept correct for recovery
-    //   • tiling.updateWindowFocus   — tiling border state updated
-    //   • carousel.notifyFocusChanged — carousel UI notified
-    //   • advertiseActiveWindow      — _NET_ACTIVE_WINDOW on root updated
-    //   • grabButtons on old/new     — button grab ownership transferred
-    //   • xcb_set_input_focus        — X server notified
-    //
-    // The previous direct focus.setFocused() call bypassed all of these,
-    // leaving the MRU history stale and focus recovery broken after every
-    // workspace switch.
-    //
-    // .workspace_switch skips the mapped-check round-trip and never raises
-    // the window — both correct for this path since all windows are already
-    // mapped and the stacking order is set by hide/restoreWorkspaceWindows.
-    // bar.scheduleFocusRedraw() sets only a dirty bit here; the caller
-    // calls bar.redrawInsideGrab() for the actual synchronous redraw.
-    if (focus_target) |new_win| {
-        focus.setFocus(new_win, .workspace_switch);
-    } else {
-        focus.clearFocus();
-    }
-}
-
-fn executeSwitch(old_ws: u8, new_ws: u8) void {
-    const s          = getState() orelse return;
-    const new_ws_obj = &s.workspaces[new_ws];
-    const fs_info    = if (comptime build.has_fullscreen) fullscreen.getForWorkspace(new_ws) else null;
-
-    focus.setSuppressReason(.none);
-    s.workspaces[old_ws].last_focused = focus.getFocused();
-
-    // Pre-fire before the grab so the round-trip overlaps with hide+restore.
-    const ptr_cookie = xcb.xcb_query_pointer(core.conn, core.root);
-
-    _ = xcb.xcb_grab_server(core.conn);
-
-    hideWorkspaceWindows(&s.workspaces[old_ws], new_ws);
-
-    if (fs_info != null) bar.setBarState(.hide_fullscreen) else bar.setBarState(.show_fullscreen);
-
-    if (fs_info) |info| {
-        // Map and push offscreen every non-fullscreen window on this workspace.
-        //
-        // When a window is spawned onto an inactive workspace that already has
-        // an active fullscreen, executeSwitch takes this branch and skips
-        // restoreWorkspaceWindows — the only place that calls xcb_map_window
-        // on switch-in. The spawned window therefore stays unmapped. On
-        // fullscreen exit, tiling allocates a tile cell for it (it is in
-        // s.windows and on this workspace) but the cell is invisible, leaving
-        // an empty gap until the next workspace round-trip triggers a normal
-        // restoreWorkspaceWindows path.
-        //
-        // Fix: map every non-fullscreen workspace window here, then push it
-        // offscreen so it is hidden behind the fullscreen window. Invalidate
-        // the tiling cache entry for tiled windows so the next retile after
-        // fullscreen exit does not find a stale zero-rect and skip configure.
-        for (new_ws_obj.windows.items()) |win| {
-            if (win == info.window) continue;
-            _ = xcb.xcb_map_window(core.conn, win);
-            utils.pushWindowOffscreen(core.conn, win);
-            if (comptime build.has_tiling) {
-                if (tiling.isWindowActiveTiled(win)) tiling.invalidateGeomCache(win);
-            }
-        }
-        _ = xcb.xcb_configure_window(core.conn, info.window,
-            xcb.XCB_CONFIG_WINDOW_X     | xcb.XCB_CONFIG_WINDOW_Y     |
-            xcb.XCB_CONFIG_WINDOW_WIDTH | xcb.XCB_CONFIG_WINDOW_HEIGHT |
-            xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH,
-            &[_]u32{ 0, 0,
-                @intCast(core.screen.width_in_pixels),
-                @intCast(core.screen.height_in_pixels),
-                0 });
-        _ = xcb.xcb_configure_window(core.conn, info.window,
-            xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
-    } else {
-        restoreWorkspaceWindows(new_ws_obj, old_ws);
-    }
-
-    applyPostSwitchFocus(new_ws, new_ws_obj, ptr_cookie);
-
-    bar.raiseBar();
-    bar.redrawInsideGrab();
-    utils.ungrabAndFlush(core.conn);
 }
 </file>
 
