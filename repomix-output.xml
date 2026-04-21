@@ -442,6 +442,54 @@ pub fn fetchPropertyToBuffer(
 }
 </file>
 
+<file path="src/bar/modules/layout/variants.zig">
+//! Layout variants indicator bar segment.
+//!
+//! Displays the 3-character variants indicator for the active tiling layout.
+//! Can be placed independently from the layout icon in the bar layout config.
+
+const build = @import("build_options");
+
+const core  = @import("core");
+const types = @import("types");
+
+const drawing = @import("drawing");
+const tiling  = if (build.has_tiling) @import("tiling") else struct {};
+
+/// Draws the layout variants icon on the bar.
+pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
+    if (!build.has_tiling) return start_x;
+    const t_state = tiling.getStateOpt() orelse return start_x;
+    const indicator = getIndicator(t_state);
+    if (indicator.len == 0) return start_x;
+    return dc.drawSegment(start_x, height, indicator, config.scaledSegmentPadding(height), config.bg, config.fg);
+}
+
+/// Accessor for the icon of each layout's variants.
+/// Uses anytype so this function is only instantiated when tiling is present,
+/// keeping the no-tiling build from trying to resolve tiling.State.
+pub fn getIndicator(s: anytype) []const u8 {
+    return switch (s.layout) {
+        .master => switch (s.layout_variants.master) {
+            .lifo => "[N]",
+            .fifo => "=N=",
+        },
+
+        .monocle => switch (s.layout_variants.monocle) {
+            .gaps    => ">-<",
+            .gapless => "<->",
+        },
+
+        .grid => switch (s.layout_variants.grid) {
+            .relaxed => "[~]",
+            .rigid   => "[#]",
+        },
+
+        else => ""
+    };
+}
+</file>
+
 <file path="src/config/fallback.zig">
 //! Fallback configuration -- terminal and font auto-detection.
 
@@ -737,52 +785,344 @@ fn retryKeymap(ctx: *xkb_context, xcb_conn: *anyopaque, device_id: i32) !*xkb_ke
 }
 </file>
 
-<file path="src/bar/modules/layout/variants.zig">
-//! Layout variants indicator bar segment.
-//!
-//! Displays the 3-character variants indicator for the active tiling layout.
-//! Can be placed independently from the layout icon in the bar layout config.
+<file path="src/bar/modules/layout/layout.zig">
+//! Layout icon segment — shows the current tiling layout symbol.
+//! For the variants indicator see variants.zig.
 
-const build = @import("build_options");
-
-const core  = @import("core");
-const types = @import("types");
-
+const core    = @import("core");
+const types   = @import("types");
 const drawing = @import("drawing");
+const build   = @import("build_options");
 const tiling  = if (build.has_tiling) @import("tiling") else struct {};
 
-/// Draws the layout variants icon on the bar.
-pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
-    if (!build.has_tiling) return start_x;
-    const t_state = tiling.getStateOpt() orelse return start_x;
-    const indicator = getIndicator(t_state);
-    if (indicator.len == 0) return start_x;
-    return dc.drawSegment(start_x, height, indicator, config.scaledSegmentPadding(height), config.bg, config.fg);
-}
-
-/// Accessor for the icon of each layout's variants.
+/// Returns the icon string for the given layout.
 /// Uses anytype so this function is only instantiated when tiling is present,
-/// keeping the no-tiling build from trying to resolve tiling.State.
-pub fn getIndicator(s: anytype) []const u8 {
-    return switch (s.layout) {
-        .master => switch (s.layout_variants.master) {
-            .lifo => "[N]",
-            .fifo => "=N=",
-        },
-
-        .monocle => switch (s.layout_variants.monocle) {
-            .gaps    => ">-<",
-            .gapless => "<->",
-        },
-
-        .grid => switch (s.layout_variants.grid) {
-            .relaxed => "[~]",
-            .rigid   => "[#]",
-        },
-
-        else => ""
+/// keeping the no-tiling build from trying to resolve tiling.Layout.
+pub fn getIcon(layout: anytype) []const u8 {
+    return switch (layout) {
+        .master    => "[]=",
+        .monocle   => "[M]",
+        .grid      => "[+]",
+        .fibonacci => "[@]",
+        .floating  => "><>",
     };
 }
+
+/// Draws the layout icon on the bar. Returns the x position after the drawn segment.
+pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
+    // Without tiling all windows are floating by definition.
+    if (comptime !build.has_tiling)
+        return dc.drawSegment(start_x, height, "><>", config.scaledSegmentPadding(height), config.bg, config.fg);
+
+    const t_state = tiling.getStateOpt() orelse return start_x;
+    const icon    = getIcon(t_state.layout);
+    return dc.drawSegment(start_x, height, icon, config.scaledSegmentPadding(height), config.bg, config.fg);
+}
+</file>
+
+<file path="src/bar/modules/tags.zig">
+//! Workspace tag indicator segment.
+//!
+//! Owns the workspace segment cache: label pixel-widths and workspace cell width.
+//! Call `invalidate()` whenever the font, config, or DPI changes (i.e. on bar
+//! reload) so the next draw remeasures everything with the fresh DrawContext.
+//!
+//! draw() receives pre-computed workspace state from a BarSnapshot rather
+//! than reading the workspaces singleton directly, avoiding a data race with
+//! the main thread.
+
+const std     = @import("std");
+const core    = @import("core");
+const types   = @import("types");
+const drawing = @import("drawing");
+const tracking = @import("tracking");
+
+// Both arrays are capped at 20 entries, matching tracking.WORKSPACE_LABELS.
+// Workspaces beyond index 20 still render correctly: draw() falls back to
+// dc.measureTextWidth(label) on a cache miss.
+// Raise this cap if workspace count ever exceeds 20.
+var label_widths: [20]u16 = [_]u16{0} ** 20;
+var ws_width:          u16     = 0;
+var cache_valid:       bool    = false;
+/// Cached horizontal offset of the indicator glyph within a workspace cell.
+/// Added to the cell's start_x at draw time. Constant for all cells.
+var cached_ind_x_off:  u16     = 0;
+/// Cached vertical top position of the indicator glyph. Constant for all cells.
+var cached_ind_y:      u16     = 0;
+
+/// Returns the display label for workspace `i`, falling back through icons, labels, and "?".
+inline fn getLabel(i: usize, config: types.BarConfig) []const u8 {
+    if (i < config.workspace_icons.items.len) return config.workspace_icons.items[i];
+    if (i < tracking.WORKSPACE_LABELS.len)    return tracking.WORKSPACE_LABELS[i];
+    return "?";
+}
+
+/// Invalidates the segment cache; next draw() call will remeasure labels and cell widths.
+pub fn invalidate() void { cache_valid = false; }
+
+/// Returns the last-computed workspace cell width in pixels (0 until first draw).
+pub fn getCachedWorkspaceWidth() u16 { return ws_width; }
+
+/// Rebuilds the label-width and geometry cache if stale. No-op if cache_valid is true.
+fn ensureCache(dc: *drawing.DrawContext, config: types.BarConfig, height: u16) void {
+    if (cache_valid) return;
+    for (&label_widths, 0..) |*w, i| w.* = dc.measureTextWidth(getLabel(i, config));
+    ws_width    = config.scaledWorkspaceWidth(height);
+    cache_valid = true;
+
+    // Precompute the indicator glyph position within a cell. All geometry
+    // inputs (cell width, bar height, indicator size, location, padding) are
+    // constant between reloads, so the result is valid for the entire session
+    // until the next invalidate() + ensureCache() cycle.
+    const ind_size = config.scaledIndicatorSize(height);
+    const pos = indicatorPos(0, ws_width, height, ind_size, ind_size,
+        config.indicator_location, config.indicator_padding);
+    // pos.x is computed with cell_x = 0, so it is already the intra-cell offset.
+    cached_ind_x_off = pos.x;
+    cached_ind_y     = pos.y;
+}
+
+/// Computes the top-left pixel position of an indicator item within a workspace cell.
+fn indicatorPos(
+    cell_x:     u16,
+    cell_w:     u16,
+    bar_height: u16,
+    item_w:     u16,
+    item_h:     u16,
+    location:   types.IndicatorLocation,
+    padding:    f32,
+) struct { x: u16, y: u16 } {
+    const cw: f32 = @floatFromInt(cell_w);
+    const bh: f32 = @floatFromInt(bar_height);
+
+    const Corner = struct { x: f32, y: f32 };
+    const corner: Corner = switch (location) {
+        .left       => .{ .x = 0.0, .y = 0.5 },
+        .right      => .{ .x = 1.0, .y = 0.5 },
+        .up         => .{ .x = 0.5, .y = 0.0 },
+        .down       => .{ .x = 0.5, .y = 1.0 },
+        .up_left    => .{ .x = 0.0, .y = 0.0 },
+        .up_right   => .{ .x = 1.0, .y = 0.0 },
+        .down_left  => .{ .x = 0.0, .y = 1.0 },
+        .down_right => .{ .x = 1.0, .y = 1.0 },
+    };
+
+    const ax: f32 = corner.x + padding * (0.5 - corner.x);
+    const ay: f32 = corner.y + padding * (0.5 - corner.y);
+
+    const iw: f32 = @floatFromInt(item_w);
+    const ih: f32 = @floatFromInt(item_h);
+    const ix: u16 = @intCast(@max(0, @as(i32, @intFromFloat(@round(ax * cw - iw / 2.0)))));
+    const iy: u16 = @intCast(@max(0, @as(i32, @intFromFloat(@round(ay * bh - ih / 2.0)))));
+    return .{ .x = cell_x + ix, .y = iy };
+}
+
+/// Draw workspace tags.
+///
+/// `ws_current`     — index of the currently active workspace.
+/// `ws_has_windows` — one bool per workspace; true when that workspace has
+///                    at least one window (used to draw the indicator glyph).
+pub fn draw(
+    dc:             *drawing.DrawContext,
+    config:         types.BarConfig,
+    height:         u16,
+    start_x:        u16,
+    ws_current:     u8,
+    ws_has_windows: []const bool,
+    ws_all_active:  bool,
+) !u16 {
+    if (ws_has_windows.len == 0) return start_x;
+    ensureCache(dc, config, height);
+    const ind_size = config.scaledIndicatorSize(height);
+    var x = start_x;
+
+    // baselineY returns the same value for every cell — hoist it once outside the loop.
+    const baseline_y = dc.baselineY(height);
+
+    for (ws_has_windows, 0..) |has_windows, i| {
+        // Advance the cursor unconditionally, even when we skip indicator drawing below.
+        defer x += ws_width;
+
+        const is_current = ws_all_active or (i == ws_current);
+        const bg         = if (is_current) config.selected_bg else config.bg;
+        const fg         = if (is_current) config.selected_fg else config.fg;
+
+        dc.fillRect(x, 0, ws_width, height, bg);
+
+        const label   = getLabel(i, config);
+        const label_w = if (i < label_widths.len) label_widths[i] else dc.measureTextWidth(label);
+        const text_x  = x + (ws_width - label_w) / 2;
+        try dc.drawText(text_x, baseline_y, label, fg);
+
+        // No windows on this workspace — nothing more to draw for this cell.
+        if (!has_windows) continue;
+
+        const glyph = if (is_current) config.indicator_focused else config.indicator_unfocused;
+        const color = config.indicator_color orelse fg;
+        // Use the pre-cached intra-cell offset; avoids per-workspace float arithmetic.
+        try dc.drawTextSized(x + cached_ind_x_off, cached_ind_y, glyph, ind_size, color);
+    }
+    return x;
+}
+</file>
+
+<file path="src/bar/render.zig">
+//! Manual C bindings for the bar's rendering stack: Cairo, Pango, and GLib.
+//!
+//! Cairo and Pango are bound together because `pango_cairo_*` functions
+//! cross the boundary between the two libraries.  GLib's `g_object_unref`
+//! is included here because it is the correct way to release Pango objects
+//! that carry a GObject reference count.
+//!
+//! XCB types are imported from `core` rather than re-declared here.
+//! xcb-cursor bindings live in `window/cursor_bindings.zig` — they serve
+//! the window/floating layer, not the rendering stack.
+
+const core    = @import("core");
+    const xcb = core.xcb;
+
+const xcb_connection_t = xcb.xcb_connection_t;
+const xcb_pixmap_t     = xcb.xcb_pixmap_t;
+const xcb_visualtype_t = xcb.xcb_visualtype_t;
+
+// Cairo 
+
+pub const cairo_surface_t = opaque {};
+pub const cairo_t         = opaque {};
+
+/// Pixel formats understood by Cairo surfaces.
+/// Numeric values match the C ABI and must not be changed.
+pub const cairo_format_t = enum(c_int) {
+    ARGB32    = 0,
+    RGB24     = 1,
+    A8        = 2,
+    A1        = 3,
+    RGB16_565 = 4,
+    RGB30     = 5,
+};
+
+/// Compositing operators used during painting.
+/// Trimmed to the two operators hana actually uses (CLEAR, OVER);
+/// the full C enum has 29 variants.  Numeric values are unchanged.
+pub const cairo_operator_t = enum(c_int) {
+    CLEAR = 0,
+    OVER  = 2,
+};
+
+/// Creates a Cairo surface backed by an XCB pixmap.
+/// The pixmap must outlive the surface; destroy the surface before freeing it.
+pub extern fn cairo_xcb_surface_create(
+    connection: *xcb_connection_t,
+    pixmap:     xcb_pixmap_t,
+    visual:     *xcb_visualtype_t,
+    width:      c_int,
+    height:     c_int,
+) ?*cairo_surface_t;
+
+/// Creates an in-memory image surface with no X connection.
+/// Used for off-screen font measurement before committing to the screen.
+pub extern fn cairo_image_surface_create(
+    format: cairo_format_t,
+    width:  c_int,
+    height: c_int,
+) ?*cairo_surface_t;
+
+pub extern fn cairo_surface_destroy(surface: *cairo_surface_t) void;
+/// Flushes pending drawing operations, ensuring the pixmap reflects all paints.
+pub extern fn cairo_surface_flush(surface: *cairo_surface_t) void;
+
+pub extern fn cairo_create(surface: *cairo_surface_t) ?*cairo_t;
+pub extern fn cairo_destroy(cr: *cairo_t) void;
+
+pub extern fn cairo_set_source_rgba(cr: *cairo_t, red: f64, green: f64, blue: f64, alpha: f64) void;
+pub extern fn cairo_move_to(cr: *cairo_t, x: f64, y: f64) void;
+pub extern fn cairo_set_operator(cr: *cairo_t, op: cairo_operator_t) void;
+pub extern fn cairo_paint(cr: *cairo_t) void;
+
+/// Saves the current Cairo graphics state onto an internal stack.
+/// Used by the carousel text scroller to isolate clip regions.
+pub extern fn cairo_save(cr: *cairo_t) void;
+/// Restores the most recently saved graphics state, removing the active clip.
+pub extern fn cairo_restore(cr: *cairo_t) void;
+pub extern fn cairo_rectangle(cr: *cairo_t, x: f64, y: f64, width: f64, height: f64) void;
+pub extern fn cairo_clip(cr: *cairo_t) void;
+
+// Pango 
+
+pub const PangoLayout          = opaque {};
+pub const PangoContext         = opaque {};
+pub const PangoFontDescription = opaque {};
+pub const PangoFontMetrics     = opaque {};
+
+/// Conversion factor between Pango's internal fixed-point units and pixels.
+/// Divide a Pango unit value by PANGO_SCALE to get pixels.
+pub const PANGO_SCALE: c_int = 1024;
+
+pub const PangoEllipsizeMode = enum(c_int) {
+    NONE   = 0,
+    START  = 1,
+    MIDDLE = 2,
+    END    = 3,
+};
+
+pub const PangoRectangle = extern struct {
+    x:      c_int,
+    y:      c_int,
+    width:  c_int,
+    height: c_int,
+};
+
+/// Creates a PangoLayout pre-configured to render onto the given Cairo context.
+pub extern fn pango_cairo_create_layout(cr: *cairo_t) ?*PangoLayout;
+/// Renders the layout's current text onto the Cairo context at the current point.
+pub extern fn pango_cairo_show_layout(cr: *cairo_t, layout: *PangoLayout) void;
+/// Sets the DPI used for font resolution on this Pango context.
+pub extern fn pango_cairo_context_set_resolution(context: *PangoContext, dpi: f64) void;
+
+pub extern fn pango_layout_set_text(layout: *PangoLayout, text: [*]const u8, length: c_int) void;
+pub extern fn pango_layout_set_font_description(layout: *PangoLayout, desc: ?*PangoFontDescription) void;
+pub extern fn pango_layout_get_context(layout: *PangoLayout) *PangoContext;
+/// Writes the layout's pixel dimensions into `width` and/or `height`.
+/// Pass null for either dimension if it is not needed.
+pub extern fn pango_layout_get_pixel_size(layout: *PangoLayout, width: ?*c_int, height: ?*c_int) void;
+pub extern fn pango_layout_set_width(layout: *PangoLayout, width: c_int) void;
+pub extern fn pango_layout_set_ellipsize(layout: *PangoLayout, ellipsize: PangoEllipsizeMode) void;
+pub extern fn pango_layout_get_baseline(layout: *PangoLayout) c_int;
+
+/// Parses a Pango font description string (e.g. `"Sans Bold 12"`).
+pub extern fn pango_font_description_from_string(str: [*:0]const u8) ?*PangoFontDescription;
+pub extern fn pango_font_description_copy(desc: *PangoFontDescription) ?*PangoFontDescription;
+pub extern fn pango_font_description_free(desc: *PangoFontDescription) void;
+pub extern fn pango_font_description_get_size(desc: *PangoFontDescription) c_int;
+pub extern fn pango_font_description_get_size_is_absolute(desc: *PangoFontDescription) c_int;
+pub extern fn pango_font_description_set_size(desc: *PangoFontDescription, size: c_int) void;
+pub extern fn pango_font_description_set_absolute_size(desc: *PangoFontDescription, size: f64) void;
+
+/// Returns ink and logical extents of the layout in Pango units.
+/// Pass null for either rect if it is not needed.
+pub extern fn pango_layout_get_extents(
+    layout:       *PangoLayout,
+    ink_rect:     ?*PangoRectangle,
+    logical_rect: ?*PangoRectangle,
+) void;
+
+/// Returns font metrics for the given description and context.
+/// Pass null for `language` to use the default language.
+pub extern fn pango_context_get_metrics(
+    context:  *PangoContext,
+    desc:     ?*PangoFontDescription,
+    language: ?*anyopaque,
+) *PangoFontMetrics;
+
+pub extern fn pango_font_metrics_get_ascent(metrics: *PangoFontMetrics) c_int;
+pub extern fn pango_font_metrics_get_descent(metrics: *PangoFontMetrics) c_int;
+pub extern fn pango_font_metrics_unref(metrics: *PangoFontMetrics) void;
+
+// GLib / GObject 
+
+/// Decrements the GObject reference count of `object`, freeing it when it
+/// reaches zero.  Used to release PangoLayout and other GObject-based types.
+pub extern fn g_object_unref(object: *anyopaque) void;
 </file>
 
 <file path="src/core/input/input.zig">
@@ -1473,200 +1813,6 @@ const XcbCursor = struct {
 };
 </file>
 
-<file path="src/bar/modules/layout/layout.zig">
-//! Layout icon segment — shows the current tiling layout symbol.
-//! For the variants indicator see variants.zig.
-
-const core    = @import("core");
-const types   = @import("types");
-const drawing = @import("drawing");
-const build   = @import("build_options");
-const tiling  = if (build.has_tiling) @import("tiling") else struct {};
-
-/// Returns the icon string for the given layout.
-/// Uses anytype so this function is only instantiated when tiling is present,
-/// keeping the no-tiling build from trying to resolve tiling.Layout.
-pub fn getIcon(layout: anytype) []const u8 {
-    return switch (layout) {
-        .master    => "[]=",
-        .monocle   => "[M]",
-        .grid      => "[+]",
-        .fibonacci => "[@]",
-        .floating  => "><>",
-    };
-}
-
-/// Draws the layout icon on the bar. Returns the x position after the drawn segment.
-pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
-    // Without tiling all windows are floating by definition.
-    if (comptime !build.has_tiling)
-        return dc.drawSegment(start_x, height, "><>", config.scaledSegmentPadding(height), config.bg, config.fg);
-
-    const t_state = tiling.getStateOpt() orelse return start_x;
-    const icon    = getIcon(t_state.layout);
-    return dc.drawSegment(start_x, height, icon, config.scaledSegmentPadding(height), config.bg, config.fg);
-}
-</file>
-
-<file path="src/bar/render.zig">
-//! Manual C bindings for the bar's rendering stack: Cairo, Pango, and GLib.
-//!
-//! Cairo and Pango are bound together because `pango_cairo_*` functions
-//! cross the boundary between the two libraries.  GLib's `g_object_unref`
-//! is included here because it is the correct way to release Pango objects
-//! that carry a GObject reference count.
-//!
-//! XCB types are imported from `core` rather than re-declared here.
-//! xcb-cursor bindings live in `window/cursor_bindings.zig` — they serve
-//! the window/floating layer, not the rendering stack.
-
-const core    = @import("core");
-    const xcb = core.xcb;
-
-const xcb_connection_t = xcb.xcb_connection_t;
-const xcb_pixmap_t     = xcb.xcb_pixmap_t;
-const xcb_visualtype_t = xcb.xcb_visualtype_t;
-
-// Cairo 
-
-pub const cairo_surface_t = opaque {};
-pub const cairo_t         = opaque {};
-
-/// Pixel formats understood by Cairo surfaces.
-/// Numeric values match the C ABI and must not be changed.
-pub const cairo_format_t = enum(c_int) {
-    ARGB32    = 0,
-    RGB24     = 1,
-    A8        = 2,
-    A1        = 3,
-    RGB16_565 = 4,
-    RGB30     = 5,
-};
-
-/// Compositing operators used during painting.
-/// Trimmed to the two operators hana actually uses (CLEAR, OVER);
-/// the full C enum has 29 variants.  Numeric values are unchanged.
-pub const cairo_operator_t = enum(c_int) {
-    CLEAR = 0,
-    OVER  = 2,
-};
-
-/// Creates a Cairo surface backed by an XCB pixmap.
-/// The pixmap must outlive the surface; destroy the surface before freeing it.
-pub extern fn cairo_xcb_surface_create(
-    connection: *xcb_connection_t,
-    pixmap:     xcb_pixmap_t,
-    visual:     *xcb_visualtype_t,
-    width:      c_int,
-    height:     c_int,
-) ?*cairo_surface_t;
-
-/// Creates an in-memory image surface with no X connection.
-/// Used for off-screen font measurement before committing to the screen.
-pub extern fn cairo_image_surface_create(
-    format: cairo_format_t,
-    width:  c_int,
-    height: c_int,
-) ?*cairo_surface_t;
-
-pub extern fn cairo_surface_destroy(surface: *cairo_surface_t) void;
-/// Flushes pending drawing operations, ensuring the pixmap reflects all paints.
-pub extern fn cairo_surface_flush(surface: *cairo_surface_t) void;
-
-pub extern fn cairo_create(surface: *cairo_surface_t) ?*cairo_t;
-pub extern fn cairo_destroy(cr: *cairo_t) void;
-
-pub extern fn cairo_set_source_rgba(cr: *cairo_t, red: f64, green: f64, blue: f64, alpha: f64) void;
-pub extern fn cairo_move_to(cr: *cairo_t, x: f64, y: f64) void;
-pub extern fn cairo_set_operator(cr: *cairo_t, op: cairo_operator_t) void;
-pub extern fn cairo_paint(cr: *cairo_t) void;
-
-/// Saves the current Cairo graphics state onto an internal stack.
-/// Used by the carousel text scroller to isolate clip regions.
-pub extern fn cairo_save(cr: *cairo_t) void;
-/// Restores the most recently saved graphics state, removing the active clip.
-pub extern fn cairo_restore(cr: *cairo_t) void;
-pub extern fn cairo_rectangle(cr: *cairo_t, x: f64, y: f64, width: f64, height: f64) void;
-pub extern fn cairo_clip(cr: *cairo_t) void;
-
-// Pango 
-
-pub const PangoLayout          = opaque {};
-pub const PangoContext         = opaque {};
-pub const PangoFontDescription = opaque {};
-pub const PangoFontMetrics     = opaque {};
-
-/// Conversion factor between Pango's internal fixed-point units and pixels.
-/// Divide a Pango unit value by PANGO_SCALE to get pixels.
-pub const PANGO_SCALE: c_int = 1024;
-
-pub const PangoEllipsizeMode = enum(c_int) {
-    NONE   = 0,
-    START  = 1,
-    MIDDLE = 2,
-    END    = 3,
-};
-
-pub const PangoRectangle = extern struct {
-    x:      c_int,
-    y:      c_int,
-    width:  c_int,
-    height: c_int,
-};
-
-/// Creates a PangoLayout pre-configured to render onto the given Cairo context.
-pub extern fn pango_cairo_create_layout(cr: *cairo_t) ?*PangoLayout;
-/// Renders the layout's current text onto the Cairo context at the current point.
-pub extern fn pango_cairo_show_layout(cr: *cairo_t, layout: *PangoLayout) void;
-/// Sets the DPI used for font resolution on this Pango context.
-pub extern fn pango_cairo_context_set_resolution(context: *PangoContext, dpi: f64) void;
-
-pub extern fn pango_layout_set_text(layout: *PangoLayout, text: [*]const u8, length: c_int) void;
-pub extern fn pango_layout_set_font_description(layout: *PangoLayout, desc: ?*PangoFontDescription) void;
-pub extern fn pango_layout_get_context(layout: *PangoLayout) *PangoContext;
-/// Writes the layout's pixel dimensions into `width` and/or `height`.
-/// Pass null for either dimension if it is not needed.
-pub extern fn pango_layout_get_pixel_size(layout: *PangoLayout, width: ?*c_int, height: ?*c_int) void;
-pub extern fn pango_layout_set_width(layout: *PangoLayout, width: c_int) void;
-pub extern fn pango_layout_set_ellipsize(layout: *PangoLayout, ellipsize: PangoEllipsizeMode) void;
-pub extern fn pango_layout_get_baseline(layout: *PangoLayout) c_int;
-
-/// Parses a Pango font description string (e.g. `"Sans Bold 12"`).
-pub extern fn pango_font_description_from_string(str: [*:0]const u8) ?*PangoFontDescription;
-pub extern fn pango_font_description_copy(desc: *PangoFontDescription) ?*PangoFontDescription;
-pub extern fn pango_font_description_free(desc: *PangoFontDescription) void;
-pub extern fn pango_font_description_get_size(desc: *PangoFontDescription) c_int;
-pub extern fn pango_font_description_get_size_is_absolute(desc: *PangoFontDescription) c_int;
-pub extern fn pango_font_description_set_size(desc: *PangoFontDescription, size: c_int) void;
-pub extern fn pango_font_description_set_absolute_size(desc: *PangoFontDescription, size: f64) void;
-
-/// Returns ink and logical extents of the layout in Pango units.
-/// Pass null for either rect if it is not needed.
-pub extern fn pango_layout_get_extents(
-    layout:       *PangoLayout,
-    ink_rect:     ?*PangoRectangle,
-    logical_rect: ?*PangoRectangle,
-) void;
-
-/// Returns font metrics for the given description and context.
-/// Pass null for `language` to use the default language.
-pub extern fn pango_context_get_metrics(
-    context:  *PangoContext,
-    desc:     ?*PangoFontDescription,
-    language: ?*anyopaque,
-) *PangoFontMetrics;
-
-pub extern fn pango_font_metrics_get_ascent(metrics: *PangoFontMetrics) c_int;
-pub extern fn pango_font_metrics_get_descent(metrics: *PangoFontMetrics) c_int;
-pub extern fn pango_font_metrics_unref(metrics: *PangoFontMetrics) void;
-
-// GLib / GObject 
-
-/// Decrements the GObject reference count of `object`, freeing it when it
-/// reaches zero.  Used to release PangoLayout and other GObject-based types.
-pub extern fn g_object_unref(object: *anyopaque) void;
-</file>
-
 <file path="src/window/modules/floating/floating.zig">
 //! Floating layout — windows are left at their current positions.
 //!
@@ -1826,149 +1972,105 @@ pub fn tileWithOffset(
 }
 </file>
 
-<file path="src/bar/modules/tags.zig">
-//! Workspace tag indicator segment.
-//!
-//! Owns the workspace segment cache: label pixel-widths and workspace cell width.
-//! Call `invalidate()` whenever the font, config, or DPI changes (i.e. on bar
-//! reload) so the next draw remeasures everything with the fresh DrawContext.
-//!
-//! draw() receives pre-computed workspace state from a BarSnapshot rather
-//! than reading the workspaces singleton directly, avoiding a data race with
-//! the main thread.
+<file path="src/bar/modules/clock.zig">
+//! Clock segment
+//! Displays the current time and manages the update timer.
 
 const std     = @import("std");
 const core    = @import("core");
 const types   = @import("types");
 const drawing = @import("drawing");
-const tracking = @import("tracking");
+const bar     = @import("bar");
+const debug   = @import("debug");
 
-// Both arrays are capped at 20 entries, matching tracking.WORKSPACE_LABELS.
-// Workspaces beyond index 20 still render correctly: draw() falls back to
-// dc.measureTextWidth(label) on a cache miss.
-// Raise this cap if workspace count ever exceeds 20.
-var label_widths: [20]u16 = [_]u16{0} ** 20;
-var ws_width:          u16     = 0;
-var cache_valid:       bool    = false;
-/// Cached horizontal offset of the indicator glyph within a workspace cell.
-/// Added to the cell's start_x at draw time. Constant for all cells.
-var cached_ind_x_off:  u16     = 0;
-/// Cached vertical top position of the indicator glyph. Constant for all cells.
-var cached_ind_y:      u16     = 0;
+const c = @cImport(@cInclude("time.h"));
 
-/// Returns the display label for workspace `i`, falling back through icons, labels, and "?".
-inline fn getLabel(i: usize, config: types.BarConfig) []const u8 {
-    if (i < config.workspace_icons.items.len) return config.workspace_icons.items[i];
-    if (i < tracking.WORKSPACE_LABELS.len)    return tracking.WORKSPACE_LABELS[i];
-    return "?";
+pub const CLOCK_MEASURE_STRING: []const u8 = "0000-00-00 00:00:00";
+
+var timer_enabled:       bool    = false;
+var last_formatted_time: [20]u8  = undefined;
+var last_formatted_sec:  i64     = -1;
+
+/// Returns true when the bar is visible and has a clock segment configured.
+fn shouldClockRun() bool {
+    return bar.isVisible() and bar.hasClockSegment();
 }
 
-/// Invalidates the segment cache; next draw() call will remeasure labels and cell widths.
-pub fn invalidate() void { cache_valid = false; }
-
-/// Returns the last-computed workspace cell width in pixels (0 until first draw).
-pub fn getCachedWorkspaceWidth() u16 { return ws_width; }
-
-/// Rebuilds the label-width and geometry cache if stale. No-op if cache_valid is true.
-fn ensureCache(dc: *drawing.DrawContext, config: types.BarConfig, height: u16) void {
-    if (cache_valid) return;
-    for (&label_widths, 0..) |*w, i| w.* = dc.measureTextWidth(getLabel(i, config));
-    ws_width    = config.scaledWorkspaceWidth(height);
-    cache_valid = true;
-
-    // Precompute the indicator glyph position within a cell. All geometry
-    // inputs (cell width, bar height, indicator size, location, padding) are
-    // constant between reloads, so the result is valid for the entire session
-    // until the next invalidate() + ensureCache() cycle.
-    const ind_size = config.scaledIndicatorSize(height);
-    const pos = indicatorPos(0, ws_width, height, ind_size, ind_size,
-        config.indicator_location, config.indicator_padding);
-    // pos.x is computed with cell_x = 0, so it is already the intra-cell offset.
-    cached_ind_x_off = pos.x;
-    cached_ind_y     = pos.y;
-}
-
-/// Computes the top-left pixel position of an indicator item within a workspace cell.
-fn indicatorPos(
-    cell_x:     u16,
-    cell_w:     u16,
-    bar_height: u16,
-    item_w:     u16,
-    item_h:     u16,
-    location:   types.IndicatorLocation,
-    padding:    f32,
-) struct { x: u16, y: u16 } {
-    const cw: f32 = @floatFromInt(cell_w);
-    const bh: f32 = @floatFromInt(bar_height);
-
-    const Corner = struct { x: f32, y: f32 };
-    const corner: Corner = switch (location) {
-        .left       => .{ .x = 0.0, .y = 0.5 },
-        .right      => .{ .x = 1.0, .y = 0.5 },
-        .up         => .{ .x = 0.5, .y = 0.0 },
-        .down       => .{ .x = 0.5, .y = 1.0 },
-        .up_left    => .{ .x = 0.0, .y = 0.0 },
-        .up_right   => .{ .x = 1.0, .y = 0.0 },
-        .down_left  => .{ .x = 0.0, .y = 1.0 },
-        .down_right => .{ .x = 1.0, .y = 1.0 },
-    };
-
-    const ax: f32 = corner.x + padding * (0.5 - corner.x);
-    const ay: f32 = corner.y + padding * (0.5 - corner.y);
-
-    const iw: f32 = @floatFromInt(item_w);
-    const ih: f32 = @floatFromInt(item_h);
-    const ix: u16 = @intCast(@max(0, @as(i32, @intFromFloat(@round(ax * cw - iw / 2.0)))));
-    const iy: u16 = @intCast(@max(0, @as(i32, @intFromFloat(@round(ay * bh - ih / 2.0)))));
-    return .{ .x = cell_x + ix, .y = iy };
-}
-
-/// Draw workspace tags.
-///
-/// `ws_current`     — index of the currently active workspace.
-/// `ws_has_windows` — one bool per workspace; true when that workspace has
-///                    at least one window (used to draw the indicator glyph).
-pub fn draw(
-    dc:             *drawing.DrawContext,
-    config:         types.BarConfig,
-    height:         u16,
-    start_x:        u16,
-    ws_current:     u8,
-    ws_has_windows: []const bool,
-    ws_all_active:  bool,
-) !u16 {
-    if (ws_has_windows.len == 0) return start_x;
-    ensureCache(dc, config, height);
-    const ind_size = config.scaledIndicatorSize(height);
-    var x = start_x;
-
-    // baselineY returns the same value for every cell — hoist it once outside the loop.
-    const baseline_y = dc.baselineY(height);
-
-    for (ws_has_windows, 0..) |has_windows, i| {
-        // Advance the cursor unconditionally, even when we skip indicator drawing below.
-        defer x += ws_width;
-
-        const is_current = ws_all_active or (i == ws_current);
-        const bg         = if (is_current) config.selected_bg else config.bg;
-        const fg         = if (is_current) config.selected_fg else config.fg;
-
-        dc.fillRect(x, 0, ws_width, height, bg);
-
-        const label   = getLabel(i, config);
-        const label_w = if (i < label_widths.len) label_widths[i] else dc.measureTextWidth(label);
-        const text_x  = x + (ws_width - label_w) / 2;
-        try dc.drawText(text_x, baseline_y, label, fg);
-
-        // No windows on this workspace — nothing more to draw for this cell.
-        if (!has_windows) continue;
-
-        const glyph = if (is_current) config.indicator_focused else config.indicator_unfocused;
-        const color = config.indicator_color orelse fg;
-        // Use the pre-cached intra-cell offset; avoids per-workspace float arithmetic.
-        try dc.drawTextSized(x + cached_ind_x_off, cached_ind_y, glyph, ind_size, color);
+/// Enables or disables the clock timer based on whether the clock segment is active.
+/// Called whenever bar visibility or segment configuration changes.
+pub fn updateTimerState() void {
+    const enable = shouldClockRun();
+    if (enable != timer_enabled) {
+        timer_enabled = enable;
+        debug.info("Clock timer {s}", .{if (enable) "enabled" else "disabled"});
     }
-    return x;
+}
+
+/// Returns the number of milliseconds until the next whole-second boundary,
+/// or -1 if the clock is disabled (telling poll to block indefinitely).
+pub fn pollTimeoutMs() i32 {
+    if (!timer_enabled) return -1;
+    var now_ts: std.os.linux.timespec = undefined;
+    switch (std.posix.errno(std.os.linux.clock_gettime(.REALTIME, &now_ts))) {
+        .SUCCESS => {},
+        else     => return 1000,
+    }
+    const ns_remaining: u64 = @intCast(std.time.ns_per_s - now_ts.nsec);
+    // Round up to the nearest millisecond so we never fire slightly early.
+    return @intCast((ns_remaining + 999_999) / 1_000_000);
+}
+
+/// Draws the current time string on the bar. Returns the x position after the segment.
+pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
+    // Derive seconds from clock_gettime(REALTIME); sub-second precision is not needed for display.
+    var now_ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &now_ts);
+    const sec: i64 = now_ts.sec;
+
+    // Re-use the cached string when the second hasn't changed; format otherwise.
+    const time_str = if (sec == last_formatted_sec)
+        last_formatted_time[0..19]
+    else blk: {
+        const str = try formatTime(&last_formatted_time, sec);
+        last_formatted_sec = sec;
+        break :blk str;
+    };
+    return dc.drawSegment(start_x, height, time_str, config.scaledSegmentPadding(height), config.bg, config.fg);
+}
+
+/// Formats `sec` (seconds since the Unix epoch) into `buf` as "YYYY-MM-DD HH:MM:SS".
+/// Tries localtime_r first for local timezone; falls back to inline UTC arithmetic if it
+/// returns null (e.g. timezone data unavailable). localtime_r is POSIX-guaranteed reentrant,
+/// making this safe to call from the bar render thread.
+fn formatTime(buf: []u8, sec: i64) ![]const u8 {
+    const TIME_FMT = "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}";
+    var raw_sec: c.time_t = @intCast(sec);
+    var tm_buf: c.struct_tm = undefined;
+    if (c.localtime_r(&raw_sec, &tm_buf)) |local_ts| {
+        return try std.fmt.bufPrint(buf, TIME_FMT, .{
+            @as(u32, @intCast(local_ts.*.tm_year + 1900)),
+            @as(u32, @intCast(local_ts.*.tm_mon  + 1)),
+            @as(u32, @intCast(local_ts.*.tm_mday)),
+            @as(u32, @intCast(local_ts.*.tm_hour)),
+            @as(u32, @intCast(local_ts.*.tm_min)),
+            @as(u32, @intCast(local_ts.*.tm_sec)),
+        });
+    }
+
+    // UTC fallback — localtime_r() returned null (timezone data unavailable).
+    const epoch_day = @divFloor(sec, std.time.s_per_day);
+    const day_sec   = @mod(sec, std.time.s_per_day);
+    const civil_day = std.time.epoch.EpochDay{ .day = @intCast(epoch_day) };
+    const year_day  = civil_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    const hour: u32 = @intCast(@divFloor(day_sec, std.time.s_per_hour));
+    const min:  u32 = @intCast(@divFloor(@mod(day_sec, std.time.s_per_hour), std.time.s_per_min));
+    const secs: u32 = @intCast(@mod(day_sec, std.time.s_per_min));
+
+    return try std.fmt.bufPrint(buf, TIME_FMT, .{
+        year_day.year, month_day.month.numeric(), month_day.day_index + 1, hour, min, secs,
+    });
 }
 </file>
 
@@ -2844,108 +2946,6 @@ fn pushBackgroundWindowsOffscreen(ctx: *const layouts.LayoutCtx, background: []c
 }
 </file>
 
-<file path="src/bar/modules/clock.zig">
-//! Clock segment
-//! Displays the current time and manages the update timer.
-
-const std     = @import("std");
-const core    = @import("core");
-const types   = @import("types");
-const drawing = @import("drawing");
-const bar     = @import("bar");
-const debug   = @import("debug");
-
-const c = @cImport(@cInclude("time.h"));
-
-pub const CLOCK_MEASURE_STRING: []const u8 = "0000-00-00 00:00:00";
-
-var timer_enabled:       bool    = false;
-var last_formatted_time: [20]u8  = undefined;
-var last_formatted_sec:  i64     = -1;
-
-/// Returns true when the bar is visible and has a clock segment configured.
-fn shouldClockRun() bool {
-    return bar.isVisible() and bar.hasClockSegment();
-}
-
-/// Enables or disables the clock timer based on whether the clock segment is active.
-/// Called whenever bar visibility or segment configuration changes.
-pub fn updateTimerState() void {
-    const enable = shouldClockRun();
-    if (enable != timer_enabled) {
-        timer_enabled = enable;
-        debug.info("Clock timer {s}", .{if (enable) "enabled" else "disabled"});
-    }
-}
-
-/// Returns the number of milliseconds until the next whole-second boundary,
-/// or -1 if the clock is disabled (telling poll to block indefinitely).
-pub fn pollTimeoutMs() i32 {
-    if (!timer_enabled) return -1;
-    var now_ts: std.os.linux.timespec = undefined;
-    switch (std.posix.errno(std.os.linux.clock_gettime(.REALTIME, &now_ts))) {
-        .SUCCESS => {},
-        else     => return 1000,
-    }
-    const ns_remaining: u64 = @intCast(std.time.ns_per_s - now_ts.nsec);
-    // Round up to the nearest millisecond so we never fire slightly early.
-    return @intCast((ns_remaining + 999_999) / 1_000_000);
-}
-
-/// Draws the current time string on the bar. Returns the x position after the segment.
-pub fn draw(dc: *drawing.DrawContext, config: types.BarConfig, height: u16, start_x: u16) !u16 {
-    // Derive seconds from clock_gettime(REALTIME); sub-second precision is not needed for display.
-    var now_ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.REALTIME, &now_ts);
-    const sec: i64 = now_ts.sec;
-
-    // Re-use the cached string when the second hasn't changed; format otherwise.
-    const time_str = if (sec == last_formatted_sec)
-        last_formatted_time[0..19]
-    else blk: {
-        const str = try formatTime(&last_formatted_time, sec);
-        last_formatted_sec = sec;
-        break :blk str;
-    };
-    return dc.drawSegment(start_x, height, time_str, config.scaledSegmentPadding(height), config.bg, config.fg);
-}
-
-/// Formats `sec` (seconds since the Unix epoch) into `buf` as "YYYY-MM-DD HH:MM:SS".
-/// Tries localtime_r first for local timezone; falls back to inline UTC arithmetic if it
-/// returns null (e.g. timezone data unavailable). localtime_r is POSIX-guaranteed reentrant,
-/// making this safe to call from the bar render thread.
-fn formatTime(buf: []u8, sec: i64) ![]const u8 {
-    const TIME_FMT = "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}";
-    var raw_sec: c.time_t = @intCast(sec);
-    var tm_buf: c.struct_tm = undefined;
-    if (c.localtime_r(&raw_sec, &tm_buf)) |local_ts| {
-        return try std.fmt.bufPrint(buf, TIME_FMT, .{
-            @as(u32, @intCast(local_ts.*.tm_year + 1900)),
-            @as(u32, @intCast(local_ts.*.tm_mon  + 1)),
-            @as(u32, @intCast(local_ts.*.tm_mday)),
-            @as(u32, @intCast(local_ts.*.tm_hour)),
-            @as(u32, @intCast(local_ts.*.tm_min)),
-            @as(u32, @intCast(local_ts.*.tm_sec)),
-        });
-    }
-
-    // UTC fallback — localtime_r() returned null (timezone data unavailable).
-    const epoch_day = @divFloor(sec, std.time.s_per_day);
-    const day_sec   = @mod(sec, std.time.s_per_day);
-    const civil_day = std.time.epoch.EpochDay{ .day = @intCast(epoch_day) };
-    const year_day  = civil_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    const hour: u32 = @intCast(@divFloor(day_sec, std.time.s_per_hour));
-    const min:  u32 = @intCast(@divFloor(@mod(day_sec, std.time.s_per_hour), std.time.s_per_min));
-    const secs: u32 = @intCast(@mod(day_sec, std.time.s_per_min));
-
-    return try std.fmt.bufPrint(buf, TIME_FMT, .{
-        year_day.year, month_day.month.numeric(), month_day.day_index + 1, hour, min, secs,
-    });
-}
-</file>
-
 <file path="src/core/modules/debug.zig">
 //! Debug logging and error helpers.
 //!
@@ -3347,6 +3347,76 @@ fn detectRefreshRate(conn: *xcb.xcb_connection_t) f64 {
 }
 </file>
 
+<file path="src/core/core.zig">
+//! Shared type definitions
+//! Includes XCB handles, geometry, input state, DPI info, and process-wide globals.
+
+const std = @import("std");
+
+const constants = @import("constants");
+
+// Importing xcb centrally and re-exporting it avoids repeated @cImport translation
+// on every compilation unit that needs XCB types.
+pub const xcb = @cImport(@cInclude("xcb/xcb.h"));
+
+
+// X11 keysym constants
+//
+// Centralised here so key-handling modules reference a single definition and cannot drift.
+// Values match <X11/keysymdef.h> (stable since X11R1).
+pub const XK_BackSpace : xcb.xcb_keysym_t = 0xff08;
+pub const XK_Tab       : xcb.xcb_keysym_t = 0xff09;
+pub const XK_Return    : xcb.xcb_keysym_t = 0xff0d;
+pub const XK_Escape    : xcb.xcb_keysym_t = 0xff1b;
+pub const XK_Delete    : xcb.xcb_keysym_t = 0xffff;
+pub const XK_Left      : xcb.xcb_keysym_t = 0xff51;
+pub const XK_Right     : xcb.xcb_keysym_t = 0xff53;
+pub const XK_Home      : xcb.xcb_keysym_t = 0xff50;
+pub const XK_End       : xcb.xcb_keysym_t = 0xff57;
+
+/// Type alias for XCB window identifiers.
+pub const WindowId = u32;
+
+// Core geometric type
+
+/// Geometry snapshot used by both fullscreen and minimize.
+pub const WindowGeometry = struct {
+    x:            i16,
+    y:            i16,
+    width:        u16,
+    height:       u16,
+    border_width: u16,
+};
+
+/// Focus suppression reason for context-aware behavior.
+pub const FocusSuppressReason = enum {
+    none,             // normal operation: focus follows mouse
+    window_spawn,     // just spawned a window: don't let cursor steal focus
+    tiling_operation, // currently tiling: don't let cursor steal focus
+};
+
+/// DPI and scale factor detected at startup.
+/// Defined here so all modules can reference the type via core without
+/// importing scale. scale.zig re-exports this and populates it via detect().
+pub const DpiInfo = struct {
+    dpi:          f32,
+    scale_factor: f32,
+
+    /// Constructs a DpiInfo from a raw DPI value, computing scale_factor relative to BASELINE_DPI.
+    pub fn fromDpi(dpi: f32) DpiInfo {
+        return .{ .dpi = dpi, .scale_factor = dpi / @import("constants").BASELINE_DPI };
+    }
+};
+
+// Process-wide singletons, initialised in main before any other module runs.
+pub var conn:     *xcb.xcb_connection_t   = undefined;
+pub var screen:   *xcb.xcb_screen_t       = undefined;
+pub var root:     WindowId                = undefined;
+pub var alloc:    std.mem.Allocator       = undefined;
+pub var config:   @import("types").Config = undefined;
+pub var dpi_info: DpiInfo                 = .{ .dpi = 96.0, .scale_factor = 1.0 };
+</file>
+
 <file path="src/window/modules/tiling/modules/master.zig">
 //! Master-stack tiling layout.
 //!
@@ -3546,76 +3616,6 @@ inline fn calcInnerWidth(full_w: u16, left_margin: u16, right_margin: u16) u16 {
     else
         constants.MIN_WINDOW_DIM;
 }
-</file>
-
-<file path="src/core/core.zig">
-//! Shared type definitions
-//! Includes XCB handles, geometry, input state, DPI info, and process-wide globals.
-
-const std = @import("std");
-
-const constants = @import("constants");
-
-// Importing xcb centrally and re-exporting it avoids repeated @cImport translation
-// on every compilation unit that needs XCB types.
-pub const xcb = @cImport(@cInclude("xcb/xcb.h"));
-
-
-// X11 keysym constants
-//
-// Centralised here so key-handling modules reference a single definition and cannot drift.
-// Values match <X11/keysymdef.h> (stable since X11R1).
-pub const XK_BackSpace : xcb.xcb_keysym_t = 0xff08;
-pub const XK_Tab       : xcb.xcb_keysym_t = 0xff09;
-pub const XK_Return    : xcb.xcb_keysym_t = 0xff0d;
-pub const XK_Escape    : xcb.xcb_keysym_t = 0xff1b;
-pub const XK_Delete    : xcb.xcb_keysym_t = 0xffff;
-pub const XK_Left      : xcb.xcb_keysym_t = 0xff51;
-pub const XK_Right     : xcb.xcb_keysym_t = 0xff53;
-pub const XK_Home      : xcb.xcb_keysym_t = 0xff50;
-pub const XK_End       : xcb.xcb_keysym_t = 0xff57;
-
-/// Type alias for XCB window identifiers.
-pub const WindowId = u32;
-
-// Core geometric type
-
-/// Geometry snapshot used by both fullscreen and minimize.
-pub const WindowGeometry = struct {
-    x:            i16,
-    y:            i16,
-    width:        u16,
-    height:       u16,
-    border_width: u16,
-};
-
-/// Focus suppression reason for context-aware behavior.
-pub const FocusSuppressReason = enum {
-    none,             // normal operation: focus follows mouse
-    window_spawn,     // just spawned a window: don't let cursor steal focus
-    tiling_operation, // currently tiling: don't let cursor steal focus
-};
-
-/// DPI and scale factor detected at startup.
-/// Defined here so all modules can reference the type via core without
-/// importing scale. scale.zig re-exports this and populates it via detect().
-pub const DpiInfo = struct {
-    dpi:          f32,
-    scale_factor: f32,
-
-    /// Constructs a DpiInfo from a raw DPI value, computing scale_factor relative to BASELINE_DPI.
-    pub fn fromDpi(dpi: f32) DpiInfo {
-        return .{ .dpi = dpi, .scale_factor = dpi / @import("constants").BASELINE_DPI };
-    }
-};
-
-// Process-wide singletons, initialised in main before any other module runs.
-pub var conn:     *xcb.xcb_connection_t   = undefined;
-pub var screen:   *xcb.xcb_screen_t       = undefined;
-pub var root:     WindowId                = undefined;
-pub var alloc:    std.mem.Allocator       = undefined;
-pub var config:   @import("types").Config = undefined;
-pub var dpi_info: DpiInfo                 = .{ .dpi = 96.0, .scale_factor = 1.0 };
 </file>
 
 <file path="src/config/types.zig">
@@ -4073,356 +4073,391 @@ pub const Config = struct {
 };
 </file>
 
-<file path="src/core/events.zig">
-//! X event dispatch, signal handling, config reload, and the main event loop.
+<file path="src/window/modules/floating/drag.zig">
+//! Window dragging and resizing via pointer button grabs.
 
 const std   = @import("std");
 const build = @import("build_options");
 
 const core      = @import("core");
     const xcb   = core.xcb;
-const utils     = @import("utils");
 const constants = @import("constants");
-
-const debug = @import("debug");
-
-const config = @import("config");
-
-const input = @import("input");
+const utils     = @import("utils");
 
 const window = @import("window");
 const focus  = @import("focus");
 
-const tiling = if (build.has_tiling) @import("tiling");
+const tiling     = if (build.has_tiling) @import("tiling") else struct {};
+const fullscreen = if (build.has_fullscreen) @import("fullscreen") else struct {};
 
-const bar = if (build.has_bar) @import("bar");
 
-const prompt = if (build.has_bar and build.has_prompt) @import("prompt");
-
-// Indices into the poll fd array.
-const FD_XCB    = 0;
-const FD_SIGNAL = 1;
-
-// Event dispatch constants — alias to the canonical definitions in constants.zig.
-const EVENT_DISPATCH_TABLE = constants.Limits.EVENT_DISPATCH_TABLE;
-const MAX_KEYBIND_COOKIES  = constants.Limits.MAX_KEYBIND_COOKIES;
-const LOCK_MODIFIERS       = constants.LOCK_MODIFIERS;
-
-// Self-pipe for portable signal delivery.
-// Signal handlers write to [1]; the event loop polls [0].
-var signal_pipe: [2]std.posix.fd_t = .{ -1, -1 };
-
-// Dispatch table
-
-const EventHandler = *const fn (event: *anyopaque) void;
-
-/// Coerces a concrete handler fn to EventHandler at comptime with zero runtime cost.
-inline fn asHandler(comptime f: anytype) EventHandler {
-    return @ptrCast(&f);
-}
-
-/// Fans out PropertyNotify to both bar (title) and window (WM_PROTOCOLS cache).
-fn handlePropertyNotify(event: *anyopaque) void {
-    const e: *xcb.xcb_property_notify_event_t = @ptrCast(@alignCast(event));
-    if (build.has_bar) bar.handlePropertyNotify(e);
-    window.handlePropertyNotify(e);
-}
-
-/// O(1) dispatch via a comptime-built table indexed by XCB event type (low 7 bits).
-const dispatch_table = blk: {
-    var table = [_]?EventHandler{null} ** EVENT_DISPATCH_TABLE;
-    table[xcb.XCB_ENTER_NOTIFY] = asHandler(window.handleEnterNotify);
-    table[xcb.XCB_LEAVE_NOTIFY] = asHandler(window.handleLeaveNotify);
-
-    table[xcb.XCB_MAP_REQUEST]       = asHandler(window.handleMapRequest);
-    table[xcb.XCB_CONFIGURE_REQUEST] = asHandler(window.handleConfigureRequest);
-    table[xcb.XCB_UNMAP_NOTIFY]      = asHandler(window.handleUnmapNotify);
-    table[xcb.XCB_DESTROY_NOTIFY]    = asHandler(window.handleDestroyNotify);
-    table[xcb.XCB_CLIENT_MESSAGE]    = asHandler(window.handleClientMessage);
-
-    table[xcb.XCB_KEY_PRESS]       = asHandler(input.handleKeyPress);
-    table[xcb.XCB_BUTTON_PRESS]    = asHandler(input.handleButtonPress);
-    table[xcb.XCB_BUTTON_RELEASE]  = asHandler(input.handleButtonRelease);
-    table[xcb.XCB_MOTION_NOTIFY]   = asHandler(input.handleMotionNotify);
-    table[xcb.XCB_FOCUS_IN]        = asHandler(focus.handleFocusIn);
-    table[xcb.XCB_PROPERTY_NOTIFY] = asHandler(handlePropertyNotify);
-
-    if (build.has_bar) table[xcb.XCB_EXPOSE] = asHandler(bar.handleExpose);
-
-    break :blk table;
+const bar = if (build.has_bar) @import("bar") else struct {
+    pub fn isVisible() bool { return false; }
+    pub fn getBarHeight() u16 { return 0; }
+    pub fn isBarWindow(_: u32) bool { return false; }
 };
 
-pub inline fn dispatch(event_type: u8, event: *anyopaque) void {
-    const idx = event_type & 0x7F; // strip XCB synthetic-event bit
-    if (dispatch_table[idx]) |handler| handler(event);
-}
+// Drag state types
 
-// Signal handling
+pub const DragMode = enum { move, resize };
 
-/// Derive the correct signal number parameter type directly from what
-/// std.posix.Sigaction's handler field actually expects, so this stays
-/// correct regardless of future stdlib changes.
-const SigNumType = param: {
-    const handler_field_type = @FieldType(@FieldType(std.posix.Sigaction, "handler"), "handler");
-    const handler_sig        = @typeInfo(@typeInfo(handler_field_type).optional.child).pointer.child;
-    break :param @typeInfo(handler_sig).@"fn".params[0].type.?;
+/// Which corner of the window is being dragged during a resize.
+///
+/// Determined at drag-start by comparing the cursor position to the window
+/// centre.  The chosen corner is the one closest to the cursor:
+///
+///   top_left     | top_right
+///   -------------|------------
+///   bottom_left  | bottom_right
+///
+/// During updateDrag the opposite (anchor) corner is held fixed.  The window
+/// always spans from min→max of anchor and current cursor, so when the cursor
+/// crosses the anchor horizontally or vertically the resize wraps: the window
+/// begins growing toward the opposite side instead of collapsing.  The
+/// effective dragged corner therefore mirrors itself across the midpoint.
+pub const ResizeCorner = enum { top_left, top_right, bottom_left, bottom_right };
+
+pub const DragState = struct {
+    active:           bool          = false,
+    window:           core.WindowId = 0,
+    mode:             DragMode      = .move,
+    resize_corner:    ResizeCorner  = .bottom_right,
+    start_x:          i16           = 0,
+    start_y:          i16           = 0,
+    start_win_x:      i16           = 0,
+    start_win_y:      i16           = 0,
+    start_win_width:  u16           = 0,
+    start_win_height: u16           = 0,
+    /// Last geometry applied by updateDrag; saved to the geometry cache by
+    /// stopDrag so workspace-switch float-restore finds the post-drag position.
+    /// Zero (default) means no motion event arrived during this drag.
+    last_rect:        utils.Rect    = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
 };
 
-/// Converts any signal value — enum or integer — to its raw u8 number.
-/// Used by both signalHandler (runtime) and handleSignalPipe (comptime prongs).
-inline fn sigToU8(sig: anytype) u8 {
-    return switch (@typeInfo(@TypeOf(sig))) {
-        .@"enum" => @intCast(@intFromEnum(sig)),
-        else     => @intCast(sig),
+// Named work-area type 
+// A named struct makes the return type of workArea() referenceable in
+// variable declarations and future doc-comments, unlike an anonymous return
+// struct whose type cannot be spelled anywhere else in the code.
+const WorkArea = struct { left: i32, right: i32, top: i32, bottom: i32 };
+
+// Snap helpers 
+
+/// Resolve snap_distance from config into pixels.
+/// Percentage values are relative to screen width (the primary drag axis).
+/// Returns 0 when snapping is disabled.
+///
+/// Note: a misconfigured negative value degrades safely — snapAxis's
+/// abs-comparison is never satisfied when snap < 0, so no snap fires.
+/// Zero is the canonical "disabled" sentinel.
+fn snapDistance() i32 {
+    const sv = core.config.snap_distance;
+    if (sv.value == 0) return 0;
+    if (sv.is_percentage) {
+        const sw: f32 = @floatFromInt(core.screen.width_in_pixels);
+        return @intFromFloat(@round(sv.value / 100.0 * sw));
+    }
+    return @intFromFloat(@round(sv.value));
+}
+
+/// Compute the work area edges accounting for bar height/position.
+///
+/// Border correction: X positions the window's content area, not its outer
+/// border. To align the outer border flush with a far boundary, we subtract
+/// 2 * border_width from that edge (total footprint = pos + dim + 2*bw).
+/// Near edges need no correction because the outer border is already at pos.
+fn workArea() WorkArea {
+    const sw: i32  = core.screen.width_in_pixels;
+    const sh: i32  = core.screen.height_in_pixels;
+    const bh: i32  = if (bar.isVisible()) bar.getBarHeight() else 0;
+    const bw2: i32 = @as(i32, window.getBorderWidth()) * 2;
+    // bar_at_bottom only has observable effect when bh > 0 (bar is visible).
+    // When bh == 0 both branches of the ternaries below produce identical
+    // results, so evaluating it unconditionally is harmless.
+    const bar_at_bottom = core.config.bar.bar_position == .bottom;
+    return .{
+        .left   = 0,
+        .right  = sw - bw2,
+        .top    = if (bar_at_bottom) 0 else bh,
+        .bottom = (if (bar_at_bottom) sh - bh else sh) - bw2,
     };
 }
 
-/// Async-signal-safe handler: writes the signal number as a byte to the pipe.
-/// write(2) is async-signal-safe on all POSIX platforms.
-fn signalHandler(signo: SigNumType) callconv(.c) void {
-    _ = std.os.linux.write(signal_pipe[1], &[_]u8{sigToU8(signo)}, 1);
+/// Snap a window origin on one axis toward the near or far work-area boundary.
+///
+/// Snapping engages when a window edge comes within `snap` pixels of a
+/// boundary.  It disengages as soon as the raw position would push the edge
+/// past the boundary — the user is intentionally crossing it.
+///
+/// Precondition: all inputs are within normal window-coordinate range
+/// (i.e. well within ±32 767).  The subtractions `pos - near` and
+/// `(pos + dim) - far` are not overflow-guarded; wrapping cannot occur
+/// for any real screen geometry.
+///
+/// `pos`  — raw window origin on this axis
+/// `dim`  — window size on this axis (width or height), excluding borders
+/// `near` — work-area near boundary (left or top)
+/// `far`  — work-area far boundary (right or bottom)
+inline fn snapAxis(pos: i32, dim: i32, near: i32, far: i32, snap: i32) i32 {
+    if (@abs(pos - near) < snap) return near;
+    if (@abs((pos + dim) - far) < snap) return far - dim;
+    return pos;
 }
 
-/// Creates a pipe with O_NONBLOCK | O_CLOEXEC set on both ends atomically via pipe2(2).
-fn createPipe() ![2]std.posix.fd_t {
-    var fds: [2]std.posix.fd_t = undefined;
+/// Snap a single edge position toward `boundary` if within `snap` pixels of it.
+/// Used for both near (left/top) and far (right/bottom) edges during resize.
+inline fn snapEdge(edge: i32, boundary: i32, snap: i32) i32 {
+    if (snap > 0 and @abs(edge - boundary) < snap) return boundary;
+    return edge;
+}
 
-    const flags = std.os.linux.O{ .CLOEXEC = true, .NONBLOCK = true };
-    switch (std.posix.errno(std.os.linux.pipe2(&fds, flags))) {
-        .SUCCESS => {},
-        .MFILE   => return error.ProcessFdQuotaExceeded,
-        .NFILE   => return error.SystemFdQuotaExceeded,
-        else     => |err| return std.posix.unexpectedErrno(err),
+// snapNearEdge and snapFarEdge are identical in implementation; use snapEdge directly.
+
+// Module state 
+
+const State = struct {
+    drag:          DragState = .{},
+    pending_float: bool      = false,
+};
+
+var g_state: State = .{};
+
+// Public API 
+
+/// Begins a move (button 1) or resize (button 3) drag on `win` at pointer position (x, y).
+/// No-op when a drag is already active, or for bar/fullscreen windows.
+pub fn startDrag(win: u32, button: u8, x: i16, y: i16) void {
+    if (g_state.drag.active) return;
+    if (bar.isBarWindow(win)) return;
+    // Fullscreen windows must not be drag-resized: they occupy the entire
+    // screen and resizing them would corrupt their fullscreen geometry record.
+    if (comptime build.has_fullscreen) {
+        if (fullscreen.isFullscreen(win)) return;
     }
-
-    return fds;
-}
-
-/// Creates the signal self-pipe and installs handlers for SIGHUP/SIGTERM/SIGINT.
-pub fn setupSignalPipe() !void {
-    signal_pipe = try createPipe();
-
-    const sa: std.posix.Sigaction = .{
-        .handler = .{ .handler = signalHandler },
-        .mask    = std.posix.sigemptyset(),
-        .flags   = std.posix.SA.RESTART,
+    // Geometry source priority: prefer the tiling-cached geometry over a live
+    // XCB round-trip.  The tiling engine keeps this up-to-date after every
+    // retile, so it reflects the window's current position without a server
+    // round-trip.  The live fallback covers purely floating windows that were
+    // never tracked by the tiling engine.
+    const geom = blk: {
+        if (comptime build.has_tiling) {
+            if (tiling.getWindowGeom(win)) |g| break :blk g;
+        }
+        break :blk window.getGeometry(core.conn, win) orelse return;
     };
 
-    std.posix.sigaction(std.posix.SIG.HUP,  &sa, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
-    std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
-}
+    // For resize drags, determine which corner of the window is closest to the
+    // cursor.  Comparing the cursor to the window centre gives four quadrants
+    // that map cleanly onto the four corners.
+    const resize_corner: ResizeCorner = corner: {
+        if (button == 1) break :corner .bottom_right; // move — corner unused
+        const cx: i32 = @as(i32, geom.x) + @divTrunc(@as(i32, geom.width),  2);
+        const cy: i32 = @as(i32, geom.y) + @divTrunc(@as(i32, geom.height), 2);
+        const cursor_x: i32 = x;
+        const cursor_y: i32 = y;
+        if (cursor_x < cx and cursor_y < cy) break :corner .top_left;
+        if (cursor_x >= cx and cursor_y < cy) break :corner .top_right;
+        if (cursor_x < cx and cursor_y >= cy) break :corner .bottom_left;
+        break :corner .bottom_right;
+    };
 
-/// Closes both ends of the signal pipe.
-pub fn deinitSignalPipe() void {
-    for (&signal_pipe) |*fd| {
-        if (fd.* == -1) continue;
-        _ = std.os.linux.close(fd.*);
-        fd.* = -1;
-    }
-}
-
-/// Drains the non-blocking signal pipe and dispatches each signal.
-fn handleSignalPipe(fd: std.posix.fd_t) void {
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const rc = std.os.linux.read(fd, &byte, 1);
-        if (std.posix.errno(rc) != .SUCCESS) break;
-        switch (byte[0]) {
-            sigToU8(std.posix.SIG.HUP)  => utils.reload(),
-            sigToU8(std.posix.SIG.TERM),
-            sigToU8(std.posix.SIG.INT)  => utils.quit(),
-            else => {},
-        }
-    }
-}
-
-// Keybindings
-
-/// Ungrabs all keys, then re-grabs every configured keybinding across all LOCK_MODIFIERS combinations.
-/// Fires all xcb_grab_key cookies before reading any reply to reduce round-trips.
-pub fn grabKeybindings() !void {
-    _ = xcb.xcb_ungrab_key(core.conn, xcb.XCB_GRAB_ANY, core.root, xcb.XCB_MOD_MASK_ANY);
-    const CookieEntry = struct { cookie: xcb.xcb_void_cookie_t, keycode: u8 };
-    var cookies: [MAX_KEYBIND_COOKIES]CookieEntry = undefined;
-    var n: usize = 0;
-    outer: for (core.config.keybindings.items) |kb| {
-        const keycode = kb.keycode orelse continue;
-        for (LOCK_MODIFIERS) |lock| {
-            if (n >= cookies.len) {
-                debug.warn("Too many keybindings. Increase MAX_KEYBIND_COOKIES (currently {})", .{MAX_KEYBIND_COOKIES});
-                break :outer;
-            }
-            cookies[n] = .{
-                .cookie = xcb.xcb_grab_key_checked(
-                    core.conn, 0, core.root, @intCast(kb.modifiers | lock), keycode,
-                    xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC,
-                ),
-                .keycode = keycode,
-            };
-            n += 1;
-        }
-    }
-    var failed: usize = 0;
-    for (cookies[0..n]) |entry| {
-        if (xcb.xcb_request_check(core.conn, entry.cookie)) |err| {
-            std.c.free(err);
-            debug.warn("Failed to grab keycode: {}", .{entry.keycode});
-            failed += 1;
-        }
-    }
-    if (failed > 0) debug.warn("{} keybinding(s) failed to grab", .{failed});
+    // pending_float is set for any drag (move *or* resize) on a tiled window
+    // in a non-floating layout.  On the first motion event it triggers tiling
+    // detach and a full retile of the workspace.
+    // For .move specifically, the first event after detach also skips snap to
+    // prevent the window appearing frozen when its tiled position coincides
+    // with a screen edge (see updateDrag's was_pending_float guard).
+    g_state = .{
+        .drag = .{
+            .active           = true,
+            .window           = win,
+            .mode             = if (button == 1) .move else .resize,
+            .resize_corner    = resize_corner,
+            .start_x          = x,
+            .start_y          = y,
+            .start_win_x      = geom.x,
+            .start_win_y      = geom.y,
+            .start_win_width  = geom.width,
+            .start_win_height = geom.height,
+        },
+        .pending_float = if (comptime build.has_tiling)
+            tiling.isWindowTiled(win) and !tiling.isFloatingLayout()
+        else
+            false,
+    };
+    focus.setFocus(win, .user_command);
+    // Raise the window to the top of the stack.  The cookie is intentionally
+    // discarded — XCB errors surface only via xcb_request_check, which we do
+    // not call here; a stack-raise failure is non-fatal.
+    _ = xcb.xcb_configure_window(core.conn, win,
+        xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
     _ = xcb.xcb_flush(core.conn);
 }
 
-// Config reload
+/// Applies pointer motion to the active drag, updating window position or size.
+/// No-op when no drag is active.
+pub fn updateDrag(x: i16, y: i16) void {
+    if (!g_state.drag.active) return;
+    const drag = &g_state.drag;
 
-/// Triggers a config reload if one has been requested via the signal pipe. No-op otherwise.
-inline fn maybeReload() void {
-    if (utils.consumeReload())
-        handleConfigReload() catch |err| debug.err("Reload failed: {}", .{err});
-}
-
-/// Loads and validates a new config, then applies it atomically.
-/// On failure, the old config remains active.
-fn handleConfigReload() !void {
-    debug.info("Reload requested", .{});
-
-    var new_config = config.loadConfigDefault(core.alloc) catch |err| {
-        debug.err("Failed to load: {}, keeping old", .{err});
-        return err;
-    };
-    errdefer new_config.deinit(core.alloc);
-
-    try validateConfig(&new_config);
-    try applyConfig(&new_config);
-
-    var old_config = core.config;
-    core.config = new_config;
-    old_config.deinit(core.alloc);
-
-    // Rebuild the workspace-rule fast-lookup map now that core.config points
-    // at the new config.  Must happen AFTER the swap so the borrowed key slices
-    // in g_rules_map point into the new config's allocations, not the freed old ones.
-    window.rebuildRulesMap();
-
-    debug.info("Reload complete", .{});
-}
-
-/// Validates config constraints that cannot be checked at parse time.
-fn validateConfig(cfg: *const @import("types").Config) !void {
-    if (cfg.tiling.master_count == 0) {
-        debug.err("Invalid config: master_count must be > 0, keeping old", .{});
-        return error.InvalidConfig;
-    }
-}
-
-/// Applies a validated config: resolves keybindings, swaps globals, re-grabs keys,
-/// and notifies all subsystems of the change.  window.rebuildRulesMap() is called
-/// by the caller (handleConfigReload) after core.config is swapped, not here,
-/// because the map borrows key slices from the live config allocation.
-fn applyConfig(new_config: *@import("types").Config) !void {
-    config.resolveKeybindings(new_config.keybindings.items, input.getXkbState(), core.alloc);
-    config.finalizeConfig(new_config, core.screen);
-
-    grabKeybindings() catch |err| {
-        debug.err("Keybind grab failed: {}, reverting", .{err});
-        return err;
-    };
-
-    window.reloadBorders();
-    if (build.has_tiling) tiling.reloadConfig();
-
-    if (build.has_bar) {
-        bar.updateTimerState();
-        bar.reload();
+    const was_pending_float = g_state.pending_float;
+    if (g_state.pending_float) {
+        g_state.pending_float = false;
+        // Grab the server to suppress intermediate renders during the detach +
+        // retile sequence.  A failed grab is intentionally ignored — it is a
+        // visual nicety, not a correctness requirement; the retile proceeds
+        // regardless.
+        _ = xcb.xcb_grab_server(core.conn);
+        if (comptime build.has_tiling) {
+            tiling.removeWindow(drag.window);
+            tiling.retileCurrentWorkspace();
+        }
+        utils.ungrabAndFlush(core.conn);
     }
 
-    // No xcb_flush here: tiling.reloadConfig() ends with ungrabAndFlush,
-    // which already drains the buffer atomically.  Any remaining requests
-    // from window.reloadBorders() or bar.reload() that arrived after that
-    // flush are covered by the event-loop's end-of-batch xcb_flush.
-    // The previous flush was a no-op in the common case and is removed to
-    // keep the flush discipline consistent across all call sites.
-}
+    const dx = x - drag.start_x;
+    const dy = y - drag.start_y;
 
-// Event loop
+    // Compute snap threshold and work area once, shared by both switch arms.
+    // workArea() is only evaluated when snapping is active; when snap == 0
+    // the zero-value sentinel is never read (all snap logic short-circuits).
+    const snap = snapDistance();
+    const wa: WorkArea = if (snap > 0) workArea() else .{ .left = 0, .right = 0, .top = 0, .bottom = 0 };
 
-/// Returns the shortest timeout across all subsystems that need periodic wakeups,
-/// or -1 if nothing needs one right now (block indefinitely).
-fn combinedTimeoutMs(blink_ms: i32) i32 {
-    if (!build.has_bar) return -1;
+    const rect = switch (drag.mode) {
+        .move => blk: {
+            const raw_x: i32 = @as(i32, drag.start_win_x) + @as(i32, dx);
+            const raw_y: i32 = @as(i32, drag.start_win_y) + @as(i32, dy);
+            // Skip snap on the first motion after a tiled-to-float transition:
+            // the tiled position may coincide with a screen edge, which would
+            // make the window appear frozen on the first drag movement.
+            if (was_pending_float) break :blk utils.Rect{
+                .x      = @intCast(raw_x),
+                .y      = @intCast(raw_y),
+                .width  = drag.start_win_width,
+                .height = drag.start_win_height,
+            };
+            const win_w: i32 = drag.start_win_width;
+            const win_h: i32 = drag.start_win_height;
+            break :blk utils.Rect{
+                .x      = @intCast(snapAxis(raw_x, win_w, wa.left, wa.right,  snap)),
+                .y      = @intCast(snapAxis(raw_y, win_h, wa.top,  wa.bottom, snap)),
+                .width  = drag.start_win_width,
+                .height = drag.start_win_height,
+            };
+        },
+        .resize => blk: {
+            // was_pending_float triggered the tiling detach above.  No
+            // snap-skip is needed here: the "frozen at edge" problem only
+            // arises during move (window origin snaps to a tiled edge);
+            // resize starts from the current size and is unaffected.
+            //
+            // Anchor-based resizing with automatic corner wrapping.
+            //
+            // The anchor is the corner diagonally opposite the one being
+            // dragged; it stays fixed throughout the drag.  The moving corner
+            // follows the cursor.  The window always spans min→max of anchor
+            // and moving on each axis, so:
+            //
+            //   • While the cursor is on the same side as the original corner
+            //     the behaviour is identical to the old per-corner code.
+            //
+            //   • When the cursor crosses the anchor horizontally the
+            //     left/right roles swap automatically — the window begins
+            //     growing toward the opposite horizontal side.
+            //
+            //   • The same applies vertically, and both axes are independent,
+            //     so all four quadrant transitions are handled.
+            //
+            // Snapping is applied to the moving edge toward whichever
+            // work-area boundary (near or far) it is closest to.  The anchor
+            // edge is fixed and never snapped.
 
-    const clock_ms = bar.pollTimeoutMs();
-    if (clock_ms < 0) return blink_ms;
-    if (blink_ms < 0) return clock_ms;
+            const start_x: i32 = drag.start_win_x;
+            const start_y: i32 = drag.start_win_y;
+            const start_w: i32 = drag.start_win_width;
+            const start_h: i32 = drag.start_win_height;
 
-    return @min(clock_ms, blink_ms);
-}
+            // Anchor: the edge that stays fixed (opposite side from the
+            // initially-dragged corner).
+            const anchor_x: i32 = switch (drag.resize_corner) {
+                .top_left,    .bottom_left  => start_x + start_w, // anchor = right edge
+                .top_right,   .bottom_right => start_x,            // anchor = left  edge
+            };
+            const anchor_y: i32 = switch (drag.resize_corner) {
+                .top_left,    .top_right    => start_y + start_h, // anchor = bottom edge
+                .bottom_left, .bottom_right => start_y,            // anchor = top   edge
+            };
 
-pub fn run() !void {
-    const x_fd: std.posix.fd_t      = xcb.xcb_get_file_descriptor(core.conn);
-    const signal_fd: std.posix.fd_t = signal_pipe[0];
+            // Moving corner: initial position of the edge under the cursor.
+            const moving_x0: i32 = switch (drag.resize_corner) {
+                .top_left,    .bottom_left  => start_x,            // moving = left  edge
+                .top_right,   .bottom_right => start_x + start_w, // moving = right edge
+            };
+            const moving_y0: i32 = switch (drag.resize_corner) {
+                .top_left,    .top_right    => start_y,            // moving = top    edge
+                .bottom_left, .bottom_right => start_y + start_h, // moving = bottom edge
+            };
 
-    var fds = [_]std.posix.pollfd{
-        .{ .fd = x_fd,      .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = signal_fd, .events = std.posix.POLL.IN, .revents = 0 },
+            // Apply cursor delta then snap toward whichever work-area
+            // boundary the moving edge is closest to.
+            const raw_moving_x: i32 = moving_x0 + @as(i32, dx);
+            const raw_moving_y: i32 = moving_y0 + @as(i32, dy);
+
+            const moving_x: i32 = snapEdge(snapEdge(raw_moving_x, wa.left, snap), wa.right,  snap);
+            const moving_y: i32 = snapEdge(snapEdge(raw_moving_y, wa.top,  snap), wa.bottom, snap);
+
+            // The four edges are simply the min/max of anchor and moving on
+            // each axis.  Crossing the anchor wraps the resize direction.
+            const new_left:   i32 = @min(anchor_x, moving_x);
+            const new_right:  i32 = @max(anchor_x, moving_x);
+            const new_top:    i32 = @min(anchor_y, moving_y);
+            const new_bottom: i32 = @max(anchor_y, moving_y);
+
+            const new_w = new_right  - new_left;
+            const new_h = new_bottom - new_top;
+
+            break :blk utils.Rect{
+                .x      = @intCast(new_left),
+                .y      = @intCast(new_top),
+                .width  = @intCast(std.math.clamp(new_w, constants.MIN_WINDOW_DIM, std.math.maxInt(u16))),
+                .height = @intCast(std.math.clamp(new_h, constants.MIN_WINDOW_DIM, std.math.maxInt(u16))),
+            };
+        },
     };
-
-    while (utils.running.load(.acquire)) {
-        const blink_ms = if (build.has_prompt) prompt.blinkPollTimeoutMs() else -1;
-        const cursor_is_blinking = blink_ms >= 0;
-        const poll_rc = std.os.linux.poll(&fds, fds.len, combinedTimeoutMs(blink_ms));
-        const ready: usize = switch (std.posix.errno(poll_rc)) {
-            .SUCCESS => @intCast(poll_rc),
-            .INTR    => continue,
-            else     => |err| {
-                debug.err("poll error: {s}", .{@errorName(std.posix.unexpectedErrno(err))});
-                break;
-            },
-        };
-
-        if (build.has_bar and ready == 0) {
-            bar.checkClockUpdate();
-            if (cursor_is_blinking) {
-                prompt.blinkTick();
-                bar.submitDraw();
-            }
-            // Timer-driven paths (clock tick, cursor blink) queue xcb_copy_area
-            // requests but the event loop's end-of-batch xcb_flush only runs when
-            // X events arrive (ready > 0).  On an idle desktop the copy_area would
-            // sit in the XCB client buffer indefinitely.  Flush explicitly here so
-            // the compositor sees the updated pixmap immediately after every timeout.
-            _ = xcb.xcb_flush(core.conn);
-            continue;
-        }
-
-        if ((fds[FD_XCB].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
-            debug.err("X11 connection error, shutting down", .{});
-            break;
-        }
-
-        if ((fds[FD_XCB].revents & std.posix.POLL.IN) != 0) {
-            while (xcb.xcb_poll_for_event(core.conn)) |event| {
-                defer std.c.free(event);
-                dispatch(@as(*u8, @ptrCast(event)).*, event);
-            }
-
-            if (build.has_tiling) tiling.retileIfDirty();
-            focus.drainPendingConfirm();
-            focus.drainPointerSync();
-            window.updateWorkspaceBordersIfNeeded();
-            if (build.has_bar) bar.updateIfDirty() catch |err| debug.err("Failed to update bar: {}", .{err});
-
-            _ = xcb.xcb_flush(core.conn);
-        }
-
-        if ((fds[FD_SIGNAL].revents & std.posix.POLL.IN) != 0) {
-            handleSignalPipe(signal_fd);
-            maybeReload();
-        }
-    }
+    drag.last_rect = rect;
+    utils.configureWindow(core.conn, drag.window, rect);
+    _ = xcb.xcb_flush(core.conn);
 }
+
+/// Ends the active drag and resets all drag state.
+pub fn stopDrag() void {
+    // Save the final geometry so workspace-switch float-restore finds the
+    // drag-moved position rather than the pre-drag tiling or default position.
+    // last_rect is zero when no motion event arrived during this drag (a bare
+    // click-and-release), in which case the cached geometry is already correct.
+    const drag = &g_state.drag;
+    if (drag.active and drag.last_rect.width != 0) {
+        window.saveWindowGeom(drag.window, drag.last_rect);
+    }
+    // No flush needed: the last updateDrag call already flushed all pending
+    // geometry changes before this function is reached.
+    g_state = .{};
+}
+
+pub inline fn isDragging() bool { return g_state.drag.active; }
+
+/// Returns true when a resize drag is active on the given window.
+/// Use this in handleConfigureRequest to deny min-size requests from the
+/// window being resized, preventing flicker between the client minimum and
+/// the WM-enforced size.
+pub inline fn isResizingWindow(win: u32) bool {
+    return g_state.drag.active and g_state.drag.mode == .resize and g_state.drag.window == win;
+}
+
+/// Returns the rect last applied during the active drag.
+/// Only meaningful when isDragging() is true and at least one motion event
+/// has arrived (last_rect.width != 0).
+pub inline fn getDragLastRect() utils.Rect { return g_state.drag.last_rect; }
 </file>
 
 <file path="src/window/modules/minimize.zig">
@@ -7419,393 +7454,6 @@ pub fn deinitFontCache(allocator: std.mem.Allocator) void {
 }
 </file>
 
-<file path="src/window/modules/floating/drag.zig">
-//! Window dragging and resizing via pointer button grabs.
-
-const std   = @import("std");
-const build = @import("build_options");
-
-const core      = @import("core");
-    const xcb   = core.xcb;
-const constants = @import("constants");
-const utils     = @import("utils");
-
-const window = @import("window");
-const focus  = @import("focus");
-
-const tiling     = if (build.has_tiling) @import("tiling") else struct {};
-const fullscreen = if (build.has_fullscreen) @import("fullscreen") else struct {};
-
-
-const bar = if (build.has_bar) @import("bar") else struct {
-    pub fn isVisible() bool { return false; }
-    pub fn getBarHeight() u16 { return 0; }
-    pub fn isBarWindow(_: u32) bool { return false; }
-};
-
-// Drag state types
-
-pub const DragMode = enum { move, resize };
-
-/// Which corner of the window is being dragged during a resize.
-///
-/// Determined at drag-start by comparing the cursor position to the window
-/// centre.  The chosen corner is the one closest to the cursor:
-///
-///   top_left     | top_right
-///   -------------|------------
-///   bottom_left  | bottom_right
-///
-/// During updateDrag the opposite (anchor) corner is held fixed.  The window
-/// always spans from min→max of anchor and current cursor, so when the cursor
-/// crosses the anchor horizontally or vertically the resize wraps: the window
-/// begins growing toward the opposite side instead of collapsing.  The
-/// effective dragged corner therefore mirrors itself across the midpoint.
-pub const ResizeCorner = enum { top_left, top_right, bottom_left, bottom_right };
-
-pub const DragState = struct {
-    active:           bool          = false,
-    window:           core.WindowId = 0,
-    mode:             DragMode      = .move,
-    resize_corner:    ResizeCorner  = .bottom_right,
-    start_x:          i16           = 0,
-    start_y:          i16           = 0,
-    start_win_x:      i16           = 0,
-    start_win_y:      i16           = 0,
-    start_win_width:  u16           = 0,
-    start_win_height: u16           = 0,
-    /// Last geometry applied by updateDrag; saved to the geometry cache by
-    /// stopDrag so workspace-switch float-restore finds the post-drag position.
-    /// Zero (default) means no motion event arrived during this drag.
-    last_rect:        utils.Rect    = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
-};
-
-// Named work-area type 
-// A named struct makes the return type of workArea() referenceable in
-// variable declarations and future doc-comments, unlike an anonymous return
-// struct whose type cannot be spelled anywhere else in the code.
-const WorkArea = struct { left: i32, right: i32, top: i32, bottom: i32 };
-
-// Snap helpers 
-
-/// Resolve snap_distance from config into pixels.
-/// Percentage values are relative to screen width (the primary drag axis).
-/// Returns 0 when snapping is disabled.
-///
-/// Note: a misconfigured negative value degrades safely — snapAxis's
-/// abs-comparison is never satisfied when snap < 0, so no snap fires.
-/// Zero is the canonical "disabled" sentinel.
-fn snapDistance() i32 {
-    const sv = core.config.snap_distance;
-    if (sv.value == 0) return 0;
-    if (sv.is_percentage) {
-        const sw: f32 = @floatFromInt(core.screen.width_in_pixels);
-        return @intFromFloat(@round(sv.value / 100.0 * sw));
-    }
-    return @intFromFloat(@round(sv.value));
-}
-
-/// Compute the work area edges accounting for bar height/position.
-///
-/// Border correction: X positions the window's content area, not its outer
-/// border. To align the outer border flush with a far boundary, we subtract
-/// 2 * border_width from that edge (total footprint = pos + dim + 2*bw).
-/// Near edges need no correction because the outer border is already at pos.
-fn workArea() WorkArea {
-    const sw: i32  = core.screen.width_in_pixels;
-    const sh: i32  = core.screen.height_in_pixels;
-    const bh: i32  = if (bar.isVisible()) bar.getBarHeight() else 0;
-    const bw2: i32 = @as(i32, window.getBorderWidth()) * 2;
-    // bar_at_bottom only has observable effect when bh > 0 (bar is visible).
-    // When bh == 0 both branches of the ternaries below produce identical
-    // results, so evaluating it unconditionally is harmless.
-    const bar_at_bottom = core.config.bar.bar_position == .bottom;
-    return .{
-        .left   = 0,
-        .right  = sw - bw2,
-        .top    = if (bar_at_bottom) 0 else bh,
-        .bottom = (if (bar_at_bottom) sh - bh else sh) - bw2,
-    };
-}
-
-/// Snap a window origin on one axis toward the near or far work-area boundary.
-///
-/// Snapping engages when a window edge comes within `snap` pixels of a
-/// boundary.  It disengages as soon as the raw position would push the edge
-/// past the boundary — the user is intentionally crossing it.
-///
-/// Precondition: all inputs are within normal window-coordinate range
-/// (i.e. well within ±32 767).  The subtractions `pos - near` and
-/// `(pos + dim) - far` are not overflow-guarded; wrapping cannot occur
-/// for any real screen geometry.
-///
-/// `pos`  — raw window origin on this axis
-/// `dim`  — window size on this axis (width or height), excluding borders
-/// `near` — work-area near boundary (left or top)
-/// `far`  — work-area far boundary (right or bottom)
-inline fn snapAxis(pos: i32, dim: i32, near: i32, far: i32, snap: i32) i32 {
-    if (@abs(pos - near) < snap) return near;
-    if (@abs((pos + dim) - far) < snap) return far - dim;
-    return pos;
-}
-
-/// Snap a single edge position toward `boundary` if within `snap` pixels of it.
-/// Used for both near (left/top) and far (right/bottom) edges during resize.
-inline fn snapEdge(edge: i32, boundary: i32, snap: i32) i32 {
-    if (snap > 0 and @abs(edge - boundary) < snap) return boundary;
-    return edge;
-}
-
-// snapNearEdge and snapFarEdge are identical in implementation; use snapEdge directly.
-
-// Module state 
-
-const State = struct {
-    drag:          DragState = .{},
-    pending_float: bool      = false,
-};
-
-var g_state: State = .{};
-
-// Public API 
-
-/// Begins a move (button 1) or resize (button 3) drag on `win` at pointer position (x, y).
-/// No-op when a drag is already active, or for bar/fullscreen windows.
-pub fn startDrag(win: u32, button: u8, x: i16, y: i16) void {
-    if (g_state.drag.active) return;
-    if (bar.isBarWindow(win)) return;
-    // Fullscreen windows must not be drag-resized: they occupy the entire
-    // screen and resizing them would corrupt their fullscreen geometry record.
-    if (comptime build.has_fullscreen) {
-        if (fullscreen.isFullscreen(win)) return;
-    }
-    // Geometry source priority: prefer the tiling-cached geometry over a live
-    // XCB round-trip.  The tiling engine keeps this up-to-date after every
-    // retile, so it reflects the window's current position without a server
-    // round-trip.  The live fallback covers purely floating windows that were
-    // never tracked by the tiling engine.
-    const geom = blk: {
-        if (comptime build.has_tiling) {
-            if (tiling.getWindowGeom(win)) |g| break :blk g;
-        }
-        break :blk window.getGeometry(core.conn, win) orelse return;
-    };
-
-    // For resize drags, determine which corner of the window is closest to the
-    // cursor.  Comparing the cursor to the window centre gives four quadrants
-    // that map cleanly onto the four corners.
-    const resize_corner: ResizeCorner = corner: {
-        if (button == 1) break :corner .bottom_right; // move — corner unused
-        const cx: i32 = @as(i32, geom.x) + @divTrunc(@as(i32, geom.width),  2);
-        const cy: i32 = @as(i32, geom.y) + @divTrunc(@as(i32, geom.height), 2);
-        const cursor_x: i32 = x;
-        const cursor_y: i32 = y;
-        if (cursor_x < cx and cursor_y < cy) break :corner .top_left;
-        if (cursor_x >= cx and cursor_y < cy) break :corner .top_right;
-        if (cursor_x < cx and cursor_y >= cy) break :corner .bottom_left;
-        break :corner .bottom_right;
-    };
-
-    // pending_float is set for any drag (move *or* resize) on a tiled window
-    // in a non-floating layout.  On the first motion event it triggers tiling
-    // detach and a full retile of the workspace.
-    // For .move specifically, the first event after detach also skips snap to
-    // prevent the window appearing frozen when its tiled position coincides
-    // with a screen edge (see updateDrag's was_pending_float guard).
-    g_state = .{
-        .drag = .{
-            .active           = true,
-            .window           = win,
-            .mode             = if (button == 1) .move else .resize,
-            .resize_corner    = resize_corner,
-            .start_x          = x,
-            .start_y          = y,
-            .start_win_x      = geom.x,
-            .start_win_y      = geom.y,
-            .start_win_width  = geom.width,
-            .start_win_height = geom.height,
-        },
-        .pending_float = if (comptime build.has_tiling)
-            tiling.isWindowTiled(win) and !tiling.isFloatingLayout()
-        else
-            false,
-    };
-    focus.setFocus(win, .user_command);
-    // Raise the window to the top of the stack.  The cookie is intentionally
-    // discarded — XCB errors surface only via xcb_request_check, which we do
-    // not call here; a stack-raise failure is non-fatal.
-    _ = xcb.xcb_configure_window(core.conn, win,
-        xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
-    _ = xcb.xcb_flush(core.conn);
-}
-
-/// Applies pointer motion to the active drag, updating window position or size.
-/// No-op when no drag is active.
-pub fn updateDrag(x: i16, y: i16) void {
-    if (!g_state.drag.active) return;
-    const drag = &g_state.drag;
-
-    const was_pending_float = g_state.pending_float;
-    if (g_state.pending_float) {
-        g_state.pending_float = false;
-        // Grab the server to suppress intermediate renders during the detach +
-        // retile sequence.  A failed grab is intentionally ignored — it is a
-        // visual nicety, not a correctness requirement; the retile proceeds
-        // regardless.
-        _ = xcb.xcb_grab_server(core.conn);
-        if (comptime build.has_tiling) {
-            tiling.removeWindow(drag.window);
-            tiling.retileCurrentWorkspace();
-        }
-        utils.ungrabAndFlush(core.conn);
-    }
-
-    const dx = x - drag.start_x;
-    const dy = y - drag.start_y;
-
-    // Compute snap threshold and work area once, shared by both switch arms.
-    // workArea() is only evaluated when snapping is active; when snap == 0
-    // the zero-value sentinel is never read (all snap logic short-circuits).
-    const snap = snapDistance();
-    const wa: WorkArea = if (snap > 0) workArea() else .{ .left = 0, .right = 0, .top = 0, .bottom = 0 };
-
-    const rect = switch (drag.mode) {
-        .move => blk: {
-            const raw_x: i32 = @as(i32, drag.start_win_x) + @as(i32, dx);
-            const raw_y: i32 = @as(i32, drag.start_win_y) + @as(i32, dy);
-            // Skip snap on the first motion after a tiled-to-float transition:
-            // the tiled position may coincide with a screen edge, which would
-            // make the window appear frozen on the first drag movement.
-            if (was_pending_float) break :blk utils.Rect{
-                .x      = @intCast(raw_x),
-                .y      = @intCast(raw_y),
-                .width  = drag.start_win_width,
-                .height = drag.start_win_height,
-            };
-            const win_w: i32 = drag.start_win_width;
-            const win_h: i32 = drag.start_win_height;
-            break :blk utils.Rect{
-                .x      = @intCast(snapAxis(raw_x, win_w, wa.left, wa.right,  snap)),
-                .y      = @intCast(snapAxis(raw_y, win_h, wa.top,  wa.bottom, snap)),
-                .width  = drag.start_win_width,
-                .height = drag.start_win_height,
-            };
-        },
-        .resize => blk: {
-            // was_pending_float triggered the tiling detach above.  No
-            // snap-skip is needed here: the "frozen at edge" problem only
-            // arises during move (window origin snaps to a tiled edge);
-            // resize starts from the current size and is unaffected.
-            //
-            // Anchor-based resizing with automatic corner wrapping.
-            //
-            // The anchor is the corner diagonally opposite the one being
-            // dragged; it stays fixed throughout the drag.  The moving corner
-            // follows the cursor.  The window always spans min→max of anchor
-            // and moving on each axis, so:
-            //
-            //   • While the cursor is on the same side as the original corner
-            //     the behaviour is identical to the old per-corner code.
-            //
-            //   • When the cursor crosses the anchor horizontally the
-            //     left/right roles swap automatically — the window begins
-            //     growing toward the opposite horizontal side.
-            //
-            //   • The same applies vertically, and both axes are independent,
-            //     so all four quadrant transitions are handled.
-            //
-            // Snapping is applied to the moving edge toward whichever
-            // work-area boundary (near or far) it is closest to.  The anchor
-            // edge is fixed and never snapped.
-
-            const start_x: i32 = drag.start_win_x;
-            const start_y: i32 = drag.start_win_y;
-            const start_w: i32 = drag.start_win_width;
-            const start_h: i32 = drag.start_win_height;
-
-            // Anchor: the edge that stays fixed (opposite side from the
-            // initially-dragged corner).
-            const anchor_x: i32 = switch (drag.resize_corner) {
-                .top_left,    .bottom_left  => start_x + start_w, // anchor = right edge
-                .top_right,   .bottom_right => start_x,            // anchor = left  edge
-            };
-            const anchor_y: i32 = switch (drag.resize_corner) {
-                .top_left,    .top_right    => start_y + start_h, // anchor = bottom edge
-                .bottom_left, .bottom_right => start_y,            // anchor = top   edge
-            };
-
-            // Moving corner: initial position of the edge under the cursor.
-            const moving_x0: i32 = switch (drag.resize_corner) {
-                .top_left,    .bottom_left  => start_x,            // moving = left  edge
-                .top_right,   .bottom_right => start_x + start_w, // moving = right edge
-            };
-            const moving_y0: i32 = switch (drag.resize_corner) {
-                .top_left,    .top_right    => start_y,            // moving = top    edge
-                .bottom_left, .bottom_right => start_y + start_h, // moving = bottom edge
-            };
-
-            // Apply cursor delta then snap toward whichever work-area
-            // boundary the moving edge is closest to.
-            const raw_moving_x: i32 = moving_x0 + @as(i32, dx);
-            const raw_moving_y: i32 = moving_y0 + @as(i32, dy);
-
-            const moving_x: i32 = snapEdge(snapEdge(raw_moving_x, wa.left, snap), wa.right,  snap);
-            const moving_y: i32 = snapEdge(snapEdge(raw_moving_y, wa.top,  snap), wa.bottom, snap);
-
-            // The four edges are simply the min/max of anchor and moving on
-            // each axis.  Crossing the anchor wraps the resize direction.
-            const new_left:   i32 = @min(anchor_x, moving_x);
-            const new_right:  i32 = @max(anchor_x, moving_x);
-            const new_top:    i32 = @min(anchor_y, moving_y);
-            const new_bottom: i32 = @max(anchor_y, moving_y);
-
-            const new_w = new_right  - new_left;
-            const new_h = new_bottom - new_top;
-
-            break :blk utils.Rect{
-                .x      = @intCast(new_left),
-                .y      = @intCast(new_top),
-                .width  = @intCast(std.math.clamp(new_w, constants.MIN_WINDOW_DIM, std.math.maxInt(u16))),
-                .height = @intCast(std.math.clamp(new_h, constants.MIN_WINDOW_DIM, std.math.maxInt(u16))),
-            };
-        },
-    };
-    drag.last_rect = rect;
-    utils.configureWindow(core.conn, drag.window, rect);
-    _ = xcb.xcb_flush(core.conn);
-}
-
-/// Ends the active drag and resets all drag state.
-pub fn stopDrag() void {
-    // Save the final geometry so workspace-switch float-restore finds the
-    // drag-moved position rather than the pre-drag tiling or default position.
-    // last_rect is zero when no motion event arrived during this drag (a bare
-    // click-and-release), in which case the cached geometry is already correct.
-    const drag = &g_state.drag;
-    if (drag.active and drag.last_rect.width != 0) {
-        window.saveWindowGeom(drag.window, drag.last_rect);
-    }
-    // No flush needed: the last updateDrag call already flushed all pending
-    // geometry changes before this function is reached.
-    g_state = .{};
-}
-
-pub inline fn isDragging() bool { return g_state.drag.active; }
-
-/// Returns true when a resize drag is active on the given window.
-/// Use this in handleConfigureRequest to deny min-size requests from the
-/// window being resized, preventing flicker between the client minimum and
-/// the WM-enforced size.
-pub inline fn isResizingWindow(win: u32) bool {
-    return g_state.drag.active and g_state.drag.mode == .resize and g_state.drag.window == win;
-}
-
-/// Returns the rect last applied during the active drag.
-/// Only meaningful when isDragging() is true and at least one motion event
-/// has arrived (last_rect.width != 0).
-pub inline fn getDragLastRect() utils.Rect { return g_state.drag.last_rect; }
-</file>
-
 <file path="src/config/config.zig">
 //! Configuration interpreter
 //! Loads, parses, and validates TOML config files.
@@ -8913,6 +8561,920 @@ fn parseRules(allocator: std.mem.Allocator, doc: *const parser.Document, cfg: *t
 }
 </file>
 
+<file path="src/bar/modules/title/title.zig">
+//! Title segment — shows the focused window title, or a split view for
+//! multiple windows.
+//!
+//! `draw()` and `drawCached()` receive a pre-computed `TitleSnapshot` captured
+//! on the main thread, making it safe to call from the bar rendering thread.
+//!
+//! Threading contract
+//!
+//! All data in `TitleSnapshot` must be captured on the main thread before
+//! being handed to the render thread.  This module makes zero blocking X11
+//! calls on the render thread.  Both `focused_title` and `minimized_title`
+//! are pre-fetched via `fetchWindowTitleInto` by `bar.captureIntoSlot` on
+//! the main thread.
+//!
+//! Carousel logic lives in carousel.zig.
+//! Monitor refresh-rate detection lives in carousel.zig.
+
+const std = @import("std");
+
+const core    = @import("core");
+    const xcb = core.xcb;
+const utils   = @import("utils");
+const scale   = @import("scale");
+
+const types = @import("types");
+
+const drawing  = @import("drawing");
+const carousel = @import("carousel");
+const tiling   = if (@import("build_options").has_tiling) @import("tiling") else struct {
+    pub fn getWindowGeom(_: u32) ?@import("utils").Rect { return null; }
+};
+
+
+// Module constants
+
+/// Fixed left indent applied inside every title cell, independent of
+/// `scaledSegmentPadding`.  Provides visual breathing room between the
+/// segment edge and the title text.
+const title_lead_px: u16 = 4;
+
+/// Maximum number of windows rendered in split-view.
+/// Stack-allocated arrays in `drawSegmentedTitles` are bounded by this value.
+/// Windows beyond this index are silently omitted from the bar.
+/// 128 covers any practical workspace size while keeping stack usage bounded.
+const max_visible_windows: usize = 128;
+
+// Atom cache
+
+const Atoms = struct {
+    /// null until successfully resolved, to avoid XCB_ATOM_NONE's sentinel (0).
+    net_wm_name:    ?u32 = null,
+    utf8_string:    ?u32 = null,
+    is_initialized: bool = false,
+
+    /// Resolves and caches the X11 atoms needed for title fetching.
+    /// Subsequent calls are a no-op.
+    fn ensureResolved(self: *Atoms) void {
+        if (self.is_initialized) return;
+        self.is_initialized = true;
+        self.net_wm_name    = utils.getAtomCached("_NET_WM_NAME") catch null;
+        self.utf8_string    = utils.getAtomCached("UTF8_STRING")  catch null;
+    }
+
+    /// Returns the UTF-8 atom when available, falling back to XCB_ATOM_STRING.
+    inline fn utf8AtomType(self: *const Atoms) u32 {
+        return self.utf8_string orelse xcb.XCB_ATOM_STRING;
+    }
+};
+
+var atoms: Atoms = .{};
+
+// Internal types
+
+const WindowInfo = struct {
+    window:    u32,
+    x:         i16,
+    y:         i16,
+    title:     []const u8,
+    minimized: bool,
+};
+
+// Public input types
+
+/// Stable per-call rendering context: geometry, draw state, and connection.
+/// Constructed once per bar frame and shared between `draw()` and `drawCached()`.
+pub const TitleRenderContext = struct {
+    dc:      *drawing.DrawContext,
+    config:  types.BarConfig,
+    height:  u16,
+    start_x: u16,
+    width:   u16,
+    conn:    *xcb.xcb_connection_t,
+};
+
+/// Per-frame volatile snapshot captured on the main thread.
+///
+/// `focused_title` and `minimized_title` must be pre-fetched on the main
+/// thread via `fetchWindowTitleInto` before the render thread runs `draw()`.
+///
+/// `minimized_title` is only used in the single-window-minimized case.  Pass
+/// an empty slice when that case cannot occur (e.g. the `drawCached` fast path,
+/// which has no cached minimized title).
+pub const TitleSnapshot = struct {
+    focused_window:  ?u32,
+    focused_title:   []const u8,
+    minimized_title: []const u8,
+    current_ws_wins: []const u32,
+    minimized_set:   *const std.AutoHashMapUnmanaged(u32, void),
+
+    /// Pre-fetched window titles captured on the main thread (Issue #2).
+    /// Flat byte buffer; `window_title_ends[i]` is the exclusive end offset of
+    /// the i-th title inside `window_title_data`.  Empty slices signal that no
+    /// pre-fetched data is available (e.g. the drawCached fast path before the
+    /// title cache has been populated with multi-window data).
+    window_title_data: []const u8  = &.{},
+    window_title_ends: []const u32 = &.{},
+
+    /// Returns the pre-fetched title for `current_ws_wins[idx]`, or an empty
+    /// slice when pre-fetched data is unavailable or `idx` is out of range.
+    pub fn windowTitle(self: *const TitleSnapshot, idx: usize) []const u8 {
+        if (idx >= self.window_title_ends.len) return &.{};
+        const end:   usize = self.window_title_ends[idx];
+        const start: usize = if (idx == 0) 0 else self.window_title_ends[idx - 1];
+        if (start > self.window_title_data.len or end > self.window_title_data.len) return &.{};
+        return self.window_title_data[start..end];
+    }
+};
+
+/// Mutable title cache owned by the bar slot.
+///
+/// `cached_title`        — backing buffer updated by `draw()` on each full
+///                          render; the bar passes its contents as
+///                          `snapshot.focused_title` in subsequent `drawCached()`
+///                          calls.
+/// `cached_title_window` — window ID the buffer was fetched for; used to
+///                          detect when `focused_title` belongs to a new window.
+pub const TitleCache = struct {
+    cached_title:        *std.ArrayListUnmanaged(u8),
+    cached_title_window: *?u32,
+};
+
+// Public API — draw entry points
+
+/// Draw the title segment.
+///
+/// Updates `cache` as a side-effect so `drawCached()` has a valid slice on
+/// the next tick.
+///
+/// `title_invalidated` must be true whenever the focused window's title
+/// property changed since the last draw.
+pub fn draw(
+    ctx:               TitleRenderContext,
+    snapshot:          TitleSnapshot,
+    cache:             TitleCache,
+    allocator:         std.mem.Allocator,
+    title_invalidated: bool,
+) !u16 {
+    scale.ensureRefreshRateDetected(ctx.conn);
+    const window_count = snapshot.current_ws_wins.len;
+    if (emptyWorkspace(ctx, window_count)) |end_x| return end_x;
+
+    if (window_count == 1) {
+        try drawSingleWindow(ctx, snapshot, cache, allocator, title_invalidated);
+    } else {
+        try drawSegmentedTitles(ctx, snapshot, allocator, title_invalidated);
+    }
+
+    return ctx.start_x + ctx.width;
+}
+
+/// Draw the title segment using already-cached state.
+///
+/// Called from the bar thread's fast-path redraw (focus-only or carousel tick).
+/// Unlike `draw()`, this function:
+///   - uses `snapshot.focused_title` as a read-only slice; the caller is
+///     responsible for passing the bar slot's cached buffer contents here.
+///   - never updates the title cache (`draw()` is responsible for keeping it current).
+///   - always passes `title_invalidated = false` to the carousel, since this
+///     path only re-renders existing state.
+///   - passes `minimized_title = ""` in the snapshot (the minimized title is not
+///     cached by the bar slot; the full `draw()` path handles it).
+pub fn drawCached(
+    ctx:       TitleRenderContext,
+    snapshot:  TitleSnapshot,
+    allocator: std.mem.Allocator,
+) !u16 {
+    scale.ensureRefreshRateDetected(ctx.conn);
+    const window_count = snapshot.current_ws_wins.len;
+    if (emptyWorkspace(ctx, window_count)) |end_x| return end_x;
+
+    if (window_count == 1) {
+        // null cache — this path never updates the cache.
+        try drawSingleWindow(ctx, snapshot, null, allocator, false);
+    } else {
+        try drawSegmentedTitles(ctx, snapshot, allocator, false);
+    }
+
+    return ctx.start_x + ctx.width;
+}
+
+// Public API — title pre-fetch (main thread only)
+
+/// Fetch the title of `win` into `buf`, reusing its existing capacity.
+///
+/// Must be called on the MAIN THREAD.  Used for both focused and minimized
+/// windows so the bar render thread never makes blocking X11 round-trips.
+///
+/// `bar.captureIntoSlot` should call this once for the focused window and,
+/// when the workspace has exactly one window and it is minimized, once for
+/// that minimized window — storing the results in `TitleSnapshot.focused_title`
+/// and `TitleSnapshot.minimized_title` respectively.
+pub fn fetchWindowTitleInto(
+    conn:      *xcb.xcb_connection_t,
+    win:       u32,
+    buf:       *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    atoms.ensureResolved();
+    const utf_type = atoms.utf8AtomType();
+
+    if (atoms.net_wm_name) |na| {
+        if (utils.fetchPropertyToBuffer(conn, win, na, utf_type, buf, allocator) catch null) |t| {
+            if (t.len > 0) return;
+        }
+    }
+    _ = utils.fetchPropertyToBuffer(
+        conn, win, xcb.XCB_ATOM_WM_NAME, xcb.XCB_ATOM_STRING, buf, allocator,
+    ) catch {};
+}
+
+// Private — empty workspace fast path
+
+/// If `count` is zero: tears down the carousel, fills the segment background,
+/// and returns the segment's end x so the caller can return immediately.
+/// Returns null when there are windows present and rendering should proceed.
+inline fn emptyWorkspace(ctx: TitleRenderContext, count: usize) ?u16 {
+    if (count != 0) return null;
+    // No windows on this workspace — tear down any live carousel immediately
+    // so it does not keep scrolling invisibly in the background.
+    carousel.deinitCarousel();
+    ctx.dc.fillRect(ctx.start_x, 0, ctx.width, ctx.height, ctx.config.bg);
+    return ctx.start_x + ctx.width;
+}
+
+// Private — single-window rendering
+
+/// Shared rendering logic for both `draw()` and `drawCached()`.
+///
+/// `cache` is non-null on the `draw()` path and is updated as a side-effect.
+/// `cache` is null on the `drawCached()` path (read-only; no cache update).
+/// `title_invalidated` is always false on the `drawCached()` path.
+fn drawSingleWindow(
+    ctx:               TitleRenderContext,
+    snapshot:          TitleSnapshot,
+    cache:             ?TitleCache,
+    allocator:         std.mem.Allocator,
+    title_invalidated: bool,
+) !void {
+    // Free the segmented carousel: the single and segmented paths are
+    // mutually exclusive.  Leaving render.seg alive after a workspace switch
+    // from a multi-window workspace keeps carousel.isCarouselActive() true,
+    // which drives the bar thread to call drawCached on every carousel tick.
+    // drawCached passes minimized_title = "" (it has no cache for it), so
+    // drawSingleWindow would fill the accent background but draw no text —
+    // erasing the correctly rendered minimized title after the first full draw
+    // and leaving a blank rectangle for as long as render.seg survives.
+    // Mirrors the deinitSingleCarousel() call in drawSegmentedTitles.
+    carousel.deinitSegmentedCarousel();
+
+    const single_win   = snapshot.current_ws_wins[0];
+    const is_minimized = snapshot.minimized_set.contains(single_win);
+    // `has_focus` is true when any window on this workspace is focused,
+    // meaning the segment gets the accent colour rather than plain bg.
+    const has_focus    = snapshot.focused_window != null;
+
+    const accent = if (is_minimized)
+        ctx.config.title_minimized_accent
+    else if (has_focus)
+        ctx.config.title_accent_color
+    else
+        ctx.config.bg;
+    ctx.dc.fillRect(ctx.start_x, 0, ctx.width, ctx.height, accent);
+
+    const scaled_padding = ctx.config.scaledSegmentPadding(ctx.height);
+    const baseline_y     = ctx.dc.baselineY(ctx.height);
+    const text_x         = ctx.start_x + scaled_padding + title_lead_px;
+    // Saturating arithmetic guards against extreme padding values before the
+    // saturating subtraction, preventing a u16 wrap in the intermediate result.
+    const avail_w        = ctx.width -| scaled_padding *| 2 -| title_lead_px;
+    const geom           = carousel.SegmentGeometry{
+        .seg_x   = ctx.start_x,
+        .seg_w   = ctx.width,
+        .text_x  = text_x,
+        .avail_w = avail_w,
+    };
+
+    if (is_minimized) {
+        // Pre-fetched on the main thread via fetchWindowTitleInto — zero X11
+        // I/O here, upholding the render-thread threading contract.
+        if (snapshot.minimized_title.len > 0)
+            try carousel.drawScrollingTitle(
+                ctx.dc, baseline_y, geom,
+                snapshot.minimized_title, accent, ctx.config.fg,
+                single_win, false,
+            );
+        return;
+    }
+
+    if (snapshot.focused_title.len == 0) return;
+
+    // Update the bar slot's title cache for the next drawCached() tick.
+    // Only the draw() path passes a non-null cache.
+    if (cache) |slot| {
+        if (title_invalidated or slot.cached_title_window.* != snapshot.focused_window) {
+            slot.cached_title.clearRetainingCapacity();
+            slot.cached_title.appendSlice(allocator, snapshot.focused_title) catch {};
+            slot.cached_title_window.* = snapshot.focused_window;
+        }
+    }
+
+    const fg = if (has_focus) ctx.config.selected_fg else ctx.config.fg;
+    try carousel.drawScrollingTitle(
+        ctx.dc, baseline_y, geom,
+        snapshot.focused_title, accent, fg,
+        snapshot.focused_window, title_invalidated,
+    );
+}
+
+// Private — split-view segmented titles
+
+/// Renders one title segment per window in a horizontal split-view layout.
+/// Windows are sorted spatially so each segment position is stable across focus changes.
+fn drawSegmentedTitles(
+    ctx:               TitleRenderContext,
+    snapshot:          TitleSnapshot,
+    allocator:         std.mem.Allocator,
+    title_invalidated: bool,
+) !void {
+    const windows = snapshot.current_ws_wins;
+    if (windows.len == 0) return;
+
+    const win_count = @min(windows.len, max_visible_windows);
+
+    // Free the single-window carousel: the single and segmented paths are
+    // mutually exclusive.  Leaving it alive would cause the carousel timer
+    // to blit the stale single-window pixmap over the correct split view.
+    carousel.deinitSingleCarousel();
+
+    // Prune the seg-carousel if its window has left the workspace so we never
+    // blit a title for a window that was closed or moved to another workspace.
+    if (carousel.getSegmentedCarouselWindow()) |tracked_win| {
+        if (std.mem.indexOfScalar(u32, windows[0..win_count], tracked_win) == null)
+            carousel.deinitSegmentedCarousel();
+    }
+
+    // Determine whether pre-fetched title data is available.
+    // When window_title_ends is populated with the correct count of entries,
+    // all N title round-trips are skipped on the render thread (they were
+    // already fetched on the main thread in captureStateIntoSlot).
+    const has_prefetched_titles = snapshot.window_title_ends.len >= win_count;
+
+    atoms.ensureResolved();
+    const net_atom = atoms.net_wm_name;
+    const utf_type = atoms.utf8AtomType();
+
+    // XCB cookie arrays — only populated for windows whose titles are not
+    // available from the pre-fetched snapshot data.
+    var net_wm_cookies: [max_visible_windows]xcb.xcb_get_property_cookie_t = undefined;
+    var geom_cookies:   [max_visible_windows]xcb.xcb_get_geometry_cookie_t = undefined;
+    var needs_xcb_title:    [max_visible_windows]bool = @splat(false);
+    var needs_xcb_geometry: [max_visible_windows]bool = @splat(false);
+    var is_minimized:       [max_visible_windows]bool = @splat(false);
+
+    // Phase 1 — fire only the cookies we actually need.
+    // Tiled windows: geometry comes from the tiling CacheMap (zero round-trips).
+    // Pre-fetched titles: skip xcb_get_property entirely.
+    for (windows[0..win_count], 0..) |win, i| {
+        is_minimized[i] = snapshot.minimized_set.contains(win);
+
+        if (!has_prefetched_titles) {
+            if (net_atom) |na|
+                net_wm_cookies[i] = xcb.xcb_get_property(ctx.conn, 0, win, na, utf_type, 0, 8192);
+            needs_xcb_title[i] = true;
+        }
+
+        if (!is_minimized[i]) {
+            // Tiling cache hit: geometry is already known, no round-trip needed.
+            if (tiling.getWindowGeom(win) == null) {
+                geom_cookies[i]       = xcb.xcb_get_geometry(ctx.conn, win);
+                needs_xcb_geometry[i] = true;
+            }
+        }
+    }
+
+    // Phase 2 — collect _NET_WM_NAME replies; queue WM_NAME fallbacks.
+    var titles:          [max_visible_windows]?[]const u8                   = @splat(null);
+    var fallback_cookies:[max_visible_windows]xcb.xcb_get_property_cookie_t = undefined;
+    var needs_fallback:  [max_visible_windows]bool                          = @splat(false);
+
+    if (!has_prefetched_titles) {
+        for (windows[0..win_count], 0..) |win, i| {
+            got: {
+                if (net_atom != null) {
+                    const r = xcb.xcb_get_property_reply(ctx.conn, net_wm_cookies[i], null) orelse break :got;
+                    defer std.c.free(r);
+                    const len = xcb.xcb_get_property_value_length(r);
+                    if (len > 0) {
+                        const ptr: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(r));
+                        titles[i] = try allocator.dupe(u8, ptr[0..@intCast(len)]);
+                        break :got;
+                    }
+                }
+                fallback_cookies[i] = xcb.xcb_get_property(
+                    ctx.conn, 0, win, xcb.XCB_ATOM_WM_NAME, xcb.XCB_ATOM_STRING, 0, 8192);
+                needs_fallback[i] = true;
+            }
+        }
+
+        // Phase 3 — collect WM_NAME fallback replies.
+        for (0..win_count) |i| {
+            if (!needs_fallback[i]) continue;
+            const r = xcb.xcb_get_property_reply(ctx.conn, fallback_cookies[i], null) orelse continue;
+            defer std.c.free(r);
+            const len = xcb.xcb_get_property_value_length(r);
+            if (len > 0) {
+                const ptr: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(r));
+                titles[i] = try allocator.dupe(u8, ptr[0..@intCast(len)]);
+            }
+        }
+    }
+    defer for (titles[0..win_count]) |t| if (t) |s| allocator.free(s);
+
+    // Build WindowInfo list.
+    // Geometry: tiling cache → xcb_get_geometry reply → offscreen sentinel.
+    var window_info_buf: [max_visible_windows]WindowInfo = undefined;
+    var info_count:      usize                           = 0;
+
+    for (windows[0..win_count], 0..) |win, i| {
+        const geom: utils.Rect = if (is_minimized[i])
+            .{ .x = std.math.maxInt(i16), .y = std.math.maxInt(i16), .width = 0, .height = 0 }
+        else if (tiling.getWindowGeom(win)) |cached|
+            cached
+        else if (needs_xcb_geometry[i]) blk: {
+            const r = xcb.xcb_get_geometry_reply(ctx.conn, geom_cookies[i], null) orelse continue;
+            defer std.c.free(r);
+            break :blk utils.Rect{
+                .x      = @intCast(r.*.x),
+                .y      = @intCast(r.*.y),
+                .width  = r.*.width,
+                .height = r.*.height,
+            };
+        } else .{ .x = std.math.maxInt(i16), .y = std.math.maxInt(i16), .width = 0, .height = 0 };
+
+        const title_str: []const u8 = if (has_prefetched_titles)
+            snapshot.windowTitle(i)
+        else
+            titles[i] orelse "";
+
+        window_info_buf[info_count] = .{
+            .window    = win,
+            .x         = geom.x,
+            .y         = geom.y,
+            .title     = title_str,
+            .minimized = is_minimized[i],
+        };
+        info_count += 1;
+    }
+
+    if (info_count == 0) return;
+
+    const window_infos = window_info_buf[0..info_count];
+    // void context: sort order is purely spatial + window ID, never dependent
+    // on focus (see `compareWindows`).  This prevents segment reordering on
+    // focus changes, which would be visually jarring.
+    std.mem.sort(WindowInfo, window_infos, {}, compareWindows);
+
+    const window_count:    u32 = @intCast(window_infos.len);
+    const scaled_padding       = ctx.config.scaledSegmentPadding(ctx.height);
+    const baseline_y           = ctx.dc.baselineY(ctx.height);
+
+    for (window_infos, 0..) |info, i| {
+        // Pixel-perfect tiling: segment i spans [i*W/n, (i+1)*W/n).
+        const x0: u16 = @intCast(@divFloor(@as(u32, @intCast(i))     * ctx.width, window_count));
+        const x1: u16 = @intCast(@divFloor(@as(u32, @intCast(i + 1)) * ctx.width, window_count));
+        const segment_x:     u16 = ctx.start_x + x0;
+        const segment_width: u16 = x1 - x0;
+        if (segment_width == 0) continue;
+
+        const is_focused_win = snapshot.focused_window == info.window;
+
+        const accent = if (is_focused_win)  ctx.config.title_accent_color
+            else if (info.minimized)         ctx.config.title_minimized_accent
+            else                             ctx.config.title_unfocused_accent;
+
+        ctx.dc.fillRect(segment_x, 0, segment_width, ctx.height, accent);
+
+        if (info.title.len == 0 or segment_width <= scaled_padding *| 2) continue;
+
+        const text_x  = segment_x + scaled_padding + title_lead_px;
+        const avail_w = segment_width -| scaled_padding *| 2 -| title_lead_px;
+        const text_fg = if (is_focused_win) ctx.config.selected_fg else ctx.config.fg;
+        const text_w  = ctx.dc.measureTextWidth(info.title);
+        const geom    = carousel.SegmentGeometry{
+            .seg_x   = segment_x,
+            .seg_w   = segment_width,
+            .text_x  = text_x,
+            .avail_w = avail_w,
+        };
+
+        if (is_focused_win and carousel.isCarouselEnabled()) {
+            // Focused + carousel enabled: pass full segment bounds so
+            // the scroll covers the entire segment width.
+            const scrolled = try carousel.drawSegmentedCarousel(
+                ctx.dc, baseline_y, geom, text_w,
+                info.title, accent, text_fg, info.window, title_invalidated,
+            );
+            if (!scrolled) {
+                // Text fits — draw it inset with normal padding.
+                try ctx.dc.drawText(text_x, baseline_y, info.title, text_fg);
+            }
+        } else {
+            // Non-focused or carousel disabled: ellipsis on overflow.
+            if (text_w <= avail_w)
+                try ctx.dc.drawText(text_x, baseline_y, info.title, text_fg)
+            else
+                try ctx.dc.drawTextEllipsis(text_x, baseline_y, info.title, avail_w, text_fg);
+        }
+    }
+}
+
+// Private helpers — window sorting
+
+/// Sort order for the split-view segment layout:
+///
+///   1. Non-minimized windows before minimized windows (minimized are shown
+///      last/rightmost, matching their visual demotion in tiling).
+///   2. On-screen windows before off-screen windows.  Windows with negative x
+///      are off-screen (monocle background windows); demoting them prevents
+///      artificial coordinates from overriding real spatial ordering.
+///   3. Left-to-right by x, then top-to-bottom by y.  Preserves the spatial
+///      order of tiled windows so each window's segment is stable across
+///      focus changes.
+///   4. Tie-break by window ID for deterministic ordering.
+///
+/// Focus is intentionally NOT a sort key.  Using focus as a tie-break would
+/// cause segments to reorder when two windows share identical coordinates
+/// (e.g. in a future stacking mode), making the bar jump on every focus
+/// change.  The focused window is highlighted via accent colour instead.
+fn compareWindows(_: void, a: WindowInfo, b: WindowInfo) bool {
+    if (a.minimized != b.minimized) return !a.minimized;
+    const a_offscreen = a.x < 0;
+    const b_offscreen = b.x < 0;
+    if (a_offscreen != b_offscreen) return !a_offscreen;
+    if (a.x != b.x) return a.x < b.x;
+    if (a.y != b.y) return a.y < b.y;
+    return a.window < b.window;
+}
+</file>
+
+<file path="src/core/events.zig">
+//! X event dispatch, signal handling, config reload, and the main event loop.
+
+const std   = @import("std");
+const build = @import("build_options");
+
+const core      = @import("core");
+    const xcb   = core.xcb;
+const utils     = @import("utils");
+const constants = @import("constants");
+const types     = @import("types");
+
+const debug  = @import("debug");
+const config = @import("config");
+const input  = @import("input");
+const window = @import("window");
+const focus  = @import("focus");
+
+const tiling = if (build.has_tiling) @import("tiling");
+const bar    = if (build.has_bar) @import("bar");
+const prompt = if (build.has_prompt and build.has_bar) @import("prompt");
+
+// Indices into the poll fd array.
+const FD_XCB    = 0;
+const FD_SIGNAL = 1;
+
+// Aliases to canonical definitions in constants.zig.
+const EVENT_DISPATCH_TABLE = constants.Limits.EVENT_DISPATCH_TABLE;
+const MAX_KEYBIND_COOKIES  = constants.Limits.MAX_KEYBIND_COOKIES;
+const LOCK_MODIFIERS       = constants.LOCK_MODIFIERS;
+
+// Self-pipe for portable signal delivery.
+// Signal handlers write to [1]; the event loop polls [0].
+var signal_pipe: [2]std.posix.fd_t = .{ -1, -1 };
+
+// Dispatch table
+
+const EventHandler = *const fn (event: *anyopaque) void;
+
+inline fn asHandler(comptime f: anytype) EventHandler {
+    return @ptrCast(&f);
+}
+
+/// Fans out PropertyNotify to both bar (title) and window (WM_PROTOCOLS cache).
+fn handlePropertyNotify(event: *anyopaque) void {
+    const e: *xcb.xcb_property_notify_event_t = @ptrCast(@alignCast(event));
+    if (build.has_bar) bar.handlePropertyNotify(e);
+    window.handlePropertyNotify(e);
+}
+
+/// O(1) dispatch via a comptime-built table indexed by XCB event type (low 7 bits).
+const dispatch_table = blk: {
+    var table = [_]?EventHandler{null} ** EVENT_DISPATCH_TABLE;
+
+    table[xcb.XCB_ENTER_NOTIFY] = asHandler(window.handleEnterNotify);
+    table[xcb.XCB_LEAVE_NOTIFY] = asHandler(window.handleLeaveNotify);
+
+    table[xcb.XCB_MAP_REQUEST]       = asHandler(window.handleMapRequest);
+    table[xcb.XCB_CONFIGURE_REQUEST] = asHandler(window.handleConfigureRequest);
+    table[xcb.XCB_UNMAP_NOTIFY]      = asHandler(window.handleUnmapNotify);
+    table[xcb.XCB_DESTROY_NOTIFY]    = asHandler(window.handleDestroyNotify);
+    table[xcb.XCB_CLIENT_MESSAGE]    = asHandler(window.handleClientMessage);
+
+    table[xcb.XCB_KEY_PRESS]       = asHandler(input.handleKeyPress);
+    table[xcb.XCB_BUTTON_PRESS]    = asHandler(input.handleButtonPress);
+    table[xcb.XCB_BUTTON_RELEASE]  = asHandler(input.handleButtonRelease);
+    table[xcb.XCB_MOTION_NOTIFY]   = asHandler(input.handleMotionNotify);
+    table[xcb.XCB_FOCUS_IN]        = asHandler(focus.handleFocusIn);
+    table[xcb.XCB_PROPERTY_NOTIFY] = asHandler(handlePropertyNotify);
+
+    if (build.has_bar) table[xcb.XCB_EXPOSE] = asHandler(bar.handleExpose);
+
+    break :blk table;
+};
+
+pub fn dispatch(event_type: u8, event: *anyopaque) void {
+    const idx = event_type & 0x7F; // strip XCB synthetic-event bit
+    if (dispatch_table[idx]) |handler| handler(event);
+}
+
+// Signal handling
+
+/// Converts any signal value — enum or integer — to its raw u8 number.
+inline fn sigToU8(sig: anytype) u8 {
+    return switch (@typeInfo(@TypeOf(sig))) {
+        .@"enum" => @intCast(@intFromEnum(sig)),
+        else     => @intCast(sig),
+    };
+}
+
+/// Async-signal-safe handler: writes the signal number as a byte to the pipe.
+/// sigToU8 accepts the SIG enum used by Zig master's Sigaction signature.
+fn signalHandler(signo: std.os.linux.SIG) callconv(.c) void {
+    _ = std.os.linux.write(signal_pipe[1], &[_]u8{sigToU8(signo)}, 1);
+}
+
+/// Creates a pipe with O_NONBLOCK | O_CLOEXEC on both ends via pipe2(2).
+fn createPipe() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    const flags = std.os.linux.O{ .CLOEXEC = true, .NONBLOCK = true };
+    switch (std.posix.errno(std.os.linux.pipe2(&fds, flags))) {
+        .SUCCESS => {},
+        .MFILE   => return error.ProcessFdQuotaExceeded,
+        .NFILE   => return error.SystemFdQuotaExceeded,
+        else     => |err| return std.posix.unexpectedErrno(err),
+    }
+    return fds;
+}
+
+/// Creates the signal self-pipe and installs handlers for SIGHUP/SIGTERM/SIGINT.
+pub fn setupSignalPipe() !void {
+    signal_pipe = try createPipe();
+
+    const sa: std.posix.Sigaction = .{
+        .handler = .{ .handler = signalHandler },
+        .mask    = std.posix.sigemptyset(),
+        .flags   = std.posix.SA.RESTART,
+    };
+
+    std.posix.sigaction(std.posix.SIG.HUP,  &sa, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
+}
+
+/// Closes both ends of the signal pipe.
+pub fn deinitSignalPipe() void {
+    for (&signal_pipe) |*fd| {
+        if (fd.* == -1) continue;
+        _ = std.os.linux.close(fd.*);
+        fd.* = -1;
+    }
+}
+
+/// Dispatches a single signal byte to the appropriate handler.
+inline fn dispatchSignal(byte: u8) void {
+    switch (byte) {
+        sigToU8(std.posix.SIG.HUP)  => utils.reload(),
+        sigToU8(std.posix.SIG.TERM),
+        sigToU8(std.posix.SIG.INT)  => utils.quit(),
+        else => {},
+    }
+}
+
+const SIGNAL_DRAIN_BUF = 16; // drain a burst in one syscall rather than one per byte
+
+/// Drains the non-blocking signal pipe and dispatches each signal.
+fn handleSignalPipe(fd: std.posix.fd_t) void {
+    var buf: [SIGNAL_DRAIN_BUF]u8 = undefined;
+    while (true) {
+        const rc = std.os.linux.read(fd, &buf, buf.len);
+        if (std.posix.errno(rc) != .SUCCESS) break;
+        const n: usize = @intCast(rc);
+        for (buf[0..n]) |byte| dispatchSignal(byte);
+    }
+}
+
+// Keybindings
+
+const CookieEntry = struct { cookie: xcb.xcb_void_cookie_t, keycode: u8 };
+
+/// Fills `cookies` with one grab request per (keybinding × lock modifier) pair.
+/// Returns the number of entries written.
+fn fillGrabCookies(cookies: []CookieEntry) usize {
+    var n: usize = 0;
+    for (core.config.keybindings.items) |kb| {
+        const keycode = kb.keycode orelse continue;
+
+        // Check once per keybinding that the full lock-modifier set fits.
+        // Avoids a per-lock branch and prevents partial grabs if the buffer is nearly full.
+        if (n + LOCK_MODIFIERS.len > cookies.len) {
+            debug.warn("Too many keybindings. Increase MAX_KEYBIND_COOKIES (currently {})", .{MAX_KEYBIND_COOKIES});
+            break;
+        }
+
+        for (LOCK_MODIFIERS) |lock| {
+            cookies[n] = .{
+                .cookie = xcb.xcb_grab_key_checked(
+                    core.conn, 0, core.root, @intCast(kb.modifiers | lock), keycode,
+                    xcb.XCB_GRAB_MODE_ASYNC, xcb.XCB_GRAB_MODE_ASYNC,
+                ),
+                .keycode = keycode,
+            };
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Checks each cookie for an XCB error. Returns the number of failures.
+fn checkGrabCookies(cookies: []const CookieEntry) usize {
+    var failed: usize = 0;
+    for (cookies) |entry| {
+        if (xcb.xcb_request_check(core.conn, entry.cookie)) |err| {
+            std.c.free(err);
+            debug.warn("Failed to grab keycode: {}", .{entry.keycode});
+            failed += 1;
+        }
+    }
+    return failed;
+}
+
+/// Ungrabs all keys, then re-grabs every configured keybinding across all lock modifier combinations.
+/// Fires all grab cookies before reading any reply to reduce round-trips.
+pub fn grabKeybindings() !void {
+    _ = xcb.xcb_ungrab_key(core.conn, xcb.XCB_GRAB_ANY, core.root, xcb.XCB_MOD_MASK_ANY);
+
+    var cookies: [MAX_KEYBIND_COOKIES]CookieEntry = undefined;
+    const n = fillGrabCookies(&cookies);
+
+    const failed = checkGrabCookies(cookies[0..n]);
+    if (failed > 0) debug.warn("{} keybinding(s) failed to grab", .{failed});
+
+    _ = xcb.xcb_flush(core.conn);
+}
+
+// Config reload
+
+/// Validates config constraints that cannot be checked at parse time.
+fn validateConfig(cfg: *const types.Config) !void {
+    if (cfg.tiling.master_count == 0) {
+        debug.err("Invalid config: master_count must be > 0, keeping old", .{});
+        return error.InvalidConfig;
+    }
+}
+
+/// Applies a validated config: resolves keybindings, re-grabs keys,
+/// and notifies all subsystems of the change.
+fn applyConfig(new_config: *types.Config) !void {
+    config.resolveKeybindings(new_config.keybindings.items, input.getXkbState(), core.alloc);
+    config.finalizeConfig(new_config, core.screen);
+
+    try grabKeybindings();
+
+    window.reloadBorders();
+    if (build.has_tiling) tiling.reloadConfig();
+    if (build.has_bar) {
+        bar.updateTimerState();
+        bar.reload();
+    }
+}
+
+/// Loads and validates a new config, then applies it atomically.
+/// On failure, the old config remains active.
+fn handleConfigReload() !void {
+    debug.info("Reload requested", .{});
+
+    var new_config = config.loadConfigDefault(core.alloc) catch |err| {
+        debug.err("Failed to load: {}, keeping old", .{err});
+        return err;
+    };
+    errdefer new_config.deinit(core.alloc);
+
+    try validateConfig(&new_config);
+    try applyConfig(&new_config);
+
+    var old_config = core.config;
+    core.config = new_config;
+    old_config.deinit(core.alloc);
+
+    // Rebuild after the swap so borrowed key slices point into the new config's memory.
+    window.rebuildRulesMap();
+
+    debug.info("Reload complete", .{});
+}
+
+// Event loop
+
+/// Returns the shortest timeout across all subsystems, or -1 to block indefinitely.
+fn combinedTimeoutMs(blink_ms: i32) i32 {
+    if (!build.has_bar) return -1;
+
+    const clock_ms = bar.pollTimeoutMs();
+    if (clock_ms < 0) return blink_ms;
+    if (blink_ms < 0) return clock_ms;
+
+    return @min(clock_ms, blink_ms);
+}
+
+/// Ticks the clock and cursor blink on poll timeout, then flushes to the compositor.
+fn handleTimerEvents(cursor_is_blinking: bool) void {
+    if (build.has_bar) {
+        var drew = false;
+
+        if (bar.checkClockUpdate()) drew = true;
+
+        if (cursor_is_blinking) {
+            prompt.blinkTick();
+            bar.submitDraw();
+            drew = true;
+        }
+
+        if (drew) _ = xcb.xcb_flush(core.conn);
+    }
+}
+
+/// Drains all pending XCB events for this batch, then runs post-batch housekeeping.
+fn handleXcbEvents() void {
+    while (xcb.xcb_poll_for_event(core.conn)) |event| {
+        defer std.c.free(event);
+        dispatch(@as(*u8, @ptrCast(event)).*, event);
+    }
+
+    if (build.has_tiling) tiling.retileIfDirty();
+    focus.drainPendingConfirm();
+    focus.drainPointerSync();
+    window.updateWorkspaceBordersIfNeeded();
+    if (build.has_bar) bar.updateIfDirty() catch |err| debug.err("Failed to update bar: {}", .{err});
+
+    _ = xcb.xcb_flush(core.conn);
+}
+
+pub fn run() !void {
+    const x_fd: std.posix.fd_t      = xcb.xcb_get_file_descriptor(core.conn);
+    const signal_fd: std.posix.fd_t = signal_pipe[0];
+
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = x_fd,      .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = signal_fd, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+
+    while (utils.running.load(.acquire)) {
+        const blink_ms = if (build.has_prompt) prompt.blinkPollTimeoutMs() else -1;
+        const cursor_is_blinking = blink_ms >= 0;
+        const poll_rc = std.os.linux.poll(&fds, fds.len, combinedTimeoutMs(blink_ms));
+        const ready: usize = switch (std.posix.errno(poll_rc)) {
+            .SUCCESS => @intCast(poll_rc),
+            .INTR    => continue,
+            else     => |err| {
+                debug.err("poll error: {s}", .{@errorName(std.posix.unexpectedErrno(err))});
+                break;
+            },
+        };
+
+        if (ready == 0) {
+            handleTimerEvents(cursor_is_blinking);
+            continue;
+        }
+
+        if ((fds[FD_XCB].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP)) != 0) {
+            debug.err("X11 connection error, shutting down", .{});
+            break;
+        }
+
+        if ((fds[FD_XCB].revents & std.posix.POLL.IN) != 0) handleXcbEvents();
+
+        if ((fds[FD_SIGNAL].revents & std.posix.POLL.IN) != 0) {
+            handleSignalPipe(signal_fd);
+            if (utils.consumeReload())
+                handleConfigReload() catch |err| debug.err("Reload failed: {}", .{err});
+        }
+    }
+}
+</file>
+
 <file path="src/window/modules/fullscreen.zig">
 //! Fullscreen management — enter, exit, toggle, and state queries.
 //!
@@ -9457,555 +10019,6 @@ pub fn toggle() void {
         enterFullscreenCommit(win, current_ws, geom);
         utils.ungrabAndFlush(core.conn);
     }
-}
-</file>
-
-<file path="src/bar/modules/title/title.zig">
-//! Title segment — shows the focused window title, or a split view for
-//! multiple windows.
-//!
-//! `draw()` and `drawCached()` receive a pre-computed `TitleSnapshot` captured
-//! on the main thread, making it safe to call from the bar rendering thread.
-//!
-//! Threading contract
-//!
-//! All data in `TitleSnapshot` must be captured on the main thread before
-//! being handed to the render thread.  This module makes zero blocking X11
-//! calls on the render thread.  Both `focused_title` and `minimized_title`
-//! are pre-fetched via `fetchWindowTitleInto` by `bar.captureIntoSlot` on
-//! the main thread.
-//!
-//! Carousel logic lives in carousel.zig.
-//! Monitor refresh-rate detection lives in carousel.zig.
-
-const std = @import("std");
-
-const core    = @import("core");
-    const xcb = core.xcb;
-const utils   = @import("utils");
-const scale   = @import("scale");
-
-const types = @import("types");
-
-const drawing  = @import("drawing");
-const carousel = @import("carousel");
-const tiling   = if (@import("build_options").has_tiling) @import("tiling") else struct {
-    pub fn getWindowGeom(_: u32) ?@import("utils").Rect { return null; }
-};
-
-
-// Module constants
-
-/// Fixed left indent applied inside every title cell, independent of
-/// `scaledSegmentPadding`.  Provides visual breathing room between the
-/// segment edge and the title text.
-const title_lead_px: u16 = 4;
-
-/// Maximum number of windows rendered in split-view.
-/// Stack-allocated arrays in `drawSegmentedTitles` are bounded by this value.
-/// Windows beyond this index are silently omitted from the bar.
-/// 128 covers any practical workspace size while keeping stack usage bounded.
-const max_visible_windows: usize = 128;
-
-// Atom cache
-
-const Atoms = struct {
-    /// null until successfully resolved, to avoid XCB_ATOM_NONE's sentinel (0).
-    net_wm_name:    ?u32 = null,
-    utf8_string:    ?u32 = null,
-    is_initialized: bool = false,
-
-    /// Resolves and caches the X11 atoms needed for title fetching.
-    /// Subsequent calls are a no-op.
-    fn ensureResolved(self: *Atoms) void {
-        if (self.is_initialized) return;
-        self.is_initialized = true;
-        self.net_wm_name    = utils.getAtomCached("_NET_WM_NAME") catch null;
-        self.utf8_string    = utils.getAtomCached("UTF8_STRING")  catch null;
-    }
-
-    /// Returns the UTF-8 atom when available, falling back to XCB_ATOM_STRING.
-    inline fn utf8AtomType(self: *const Atoms) u32 {
-        return self.utf8_string orelse xcb.XCB_ATOM_STRING;
-    }
-};
-
-var atoms: Atoms = .{};
-
-// Internal types
-
-const WindowInfo = struct {
-    window:    u32,
-    x:         i16,
-    y:         i16,
-    title:     []const u8,
-    minimized: bool,
-};
-
-// Public input types
-
-/// Stable per-call rendering context: geometry, draw state, and connection.
-/// Constructed once per bar frame and shared between `draw()` and `drawCached()`.
-pub const TitleRenderContext = struct {
-    dc:      *drawing.DrawContext,
-    config:  types.BarConfig,
-    height:  u16,
-    start_x: u16,
-    width:   u16,
-    conn:    *xcb.xcb_connection_t,
-};
-
-/// Per-frame volatile snapshot captured on the main thread.
-///
-/// `focused_title` and `minimized_title` must be pre-fetched on the main
-/// thread via `fetchWindowTitleInto` before the render thread runs `draw()`.
-///
-/// `minimized_title` is only used in the single-window-minimized case.  Pass
-/// an empty slice when that case cannot occur (e.g. the `drawCached` fast path,
-/// which has no cached minimized title).
-pub const TitleSnapshot = struct {
-    focused_window:  ?u32,
-    focused_title:   []const u8,
-    minimized_title: []const u8,
-    current_ws_wins: []const u32,
-    minimized_set:   *const std.AutoHashMapUnmanaged(u32, void),
-
-    /// Pre-fetched window titles captured on the main thread (Issue #2).
-    /// Flat byte buffer; `window_title_ends[i]` is the exclusive end offset of
-    /// the i-th title inside `window_title_data`.  Empty slices signal that no
-    /// pre-fetched data is available (e.g. the drawCached fast path before the
-    /// title cache has been populated with multi-window data).
-    window_title_data: []const u8  = &.{},
-    window_title_ends: []const u32 = &.{},
-
-    /// Returns the pre-fetched title for `current_ws_wins[idx]`, or an empty
-    /// slice when pre-fetched data is unavailable or `idx` is out of range.
-    pub fn windowTitle(self: *const TitleSnapshot, idx: usize) []const u8 {
-        if (idx >= self.window_title_ends.len) return &.{};
-        const end:   usize = self.window_title_ends[idx];
-        const start: usize = if (idx == 0) 0 else self.window_title_ends[idx - 1];
-        if (start > self.window_title_data.len or end > self.window_title_data.len) return &.{};
-        return self.window_title_data[start..end];
-    }
-};
-
-/// Mutable title cache owned by the bar slot.
-///
-/// `cached_title`        — backing buffer updated by `draw()` on each full
-///                          render; the bar passes its contents as
-///                          `snapshot.focused_title` in subsequent `drawCached()`
-///                          calls.
-/// `cached_title_window` — window ID the buffer was fetched for; used to
-///                          detect when `focused_title` belongs to a new window.
-pub const TitleCache = struct {
-    cached_title:        *std.ArrayListUnmanaged(u8),
-    cached_title_window: *?u32,
-};
-
-// Public API — draw entry points
-
-/// Draw the title segment.
-///
-/// Updates `cache` as a side-effect so `drawCached()` has a valid slice on
-/// the next tick.
-///
-/// `title_invalidated` must be true whenever the focused window's title
-/// property changed since the last draw.
-pub fn draw(
-    ctx:               TitleRenderContext,
-    snapshot:          TitleSnapshot,
-    cache:             TitleCache,
-    allocator:         std.mem.Allocator,
-    title_invalidated: bool,
-) !u16 {
-    scale.ensureRefreshRateDetected(ctx.conn);
-    const window_count = snapshot.current_ws_wins.len;
-    if (emptyWorkspace(ctx, window_count)) |end_x| return end_x;
-
-    if (window_count == 1) {
-        try drawSingleWindow(ctx, snapshot, cache, allocator, title_invalidated);
-    } else {
-        try drawSegmentedTitles(ctx, snapshot, allocator, title_invalidated);
-    }
-
-    return ctx.start_x + ctx.width;
-}
-
-/// Draw the title segment using already-cached state.
-///
-/// Called from the bar thread's fast-path redraw (focus-only or carousel tick).
-/// Unlike `draw()`, this function:
-///   - uses `snapshot.focused_title` as a read-only slice; the caller is
-///     responsible for passing the bar slot's cached buffer contents here.
-///   - never updates the title cache (`draw()` is responsible for keeping it current).
-///   - always passes `title_invalidated = false` to the carousel, since this
-///     path only re-renders existing state.
-///   - passes `minimized_title = ""` in the snapshot (the minimized title is not
-///     cached by the bar slot; the full `draw()` path handles it).
-pub fn drawCached(
-    ctx:       TitleRenderContext,
-    snapshot:  TitleSnapshot,
-    allocator: std.mem.Allocator,
-) !u16 {
-    scale.ensureRefreshRateDetected(ctx.conn);
-    const window_count = snapshot.current_ws_wins.len;
-    if (emptyWorkspace(ctx, window_count)) |end_x| return end_x;
-
-    if (window_count == 1) {
-        // null cache — this path never updates the cache.
-        try drawSingleWindow(ctx, snapshot, null, allocator, false);
-    } else {
-        try drawSegmentedTitles(ctx, snapshot, allocator, false);
-    }
-
-    return ctx.start_x + ctx.width;
-}
-
-// Public API — title pre-fetch (main thread only)
-
-/// Fetch the title of `win` into `buf`, reusing its existing capacity.
-///
-/// Must be called on the MAIN THREAD.  Used for both focused and minimized
-/// windows so the bar render thread never makes blocking X11 round-trips.
-///
-/// `bar.captureIntoSlot` should call this once for the focused window and,
-/// when the workspace has exactly one window and it is minimized, once for
-/// that minimized window — storing the results in `TitleSnapshot.focused_title`
-/// and `TitleSnapshot.minimized_title` respectively.
-pub fn fetchWindowTitleInto(
-    conn:      *xcb.xcb_connection_t,
-    win:       u32,
-    buf:       *std.ArrayListUnmanaged(u8),
-    allocator: std.mem.Allocator,
-) !void {
-    atoms.ensureResolved();
-    const utf_type = atoms.utf8AtomType();
-
-    if (atoms.net_wm_name) |na| {
-        if (utils.fetchPropertyToBuffer(conn, win, na, utf_type, buf, allocator) catch null) |t| {
-            if (t.len > 0) return;
-        }
-    }
-    _ = utils.fetchPropertyToBuffer(
-        conn, win, xcb.XCB_ATOM_WM_NAME, xcb.XCB_ATOM_STRING, buf, allocator,
-    ) catch {};
-}
-
-// Private — empty workspace fast path
-
-/// If `count` is zero: tears down the carousel, fills the segment background,
-/// and returns the segment's end x so the caller can return immediately.
-/// Returns null when there are windows present and rendering should proceed.
-inline fn emptyWorkspace(ctx: TitleRenderContext, count: usize) ?u16 {
-    if (count != 0) return null;
-    // No windows on this workspace — tear down any live carousel immediately
-    // so it does not keep scrolling invisibly in the background.
-    carousel.deinitCarousel();
-    ctx.dc.fillRect(ctx.start_x, 0, ctx.width, ctx.height, ctx.config.bg);
-    return ctx.start_x + ctx.width;
-}
-
-// Private — single-window rendering
-
-/// Shared rendering logic for both `draw()` and `drawCached()`.
-///
-/// `cache` is non-null on the `draw()` path and is updated as a side-effect.
-/// `cache` is null on the `drawCached()` path (read-only; no cache update).
-/// `title_invalidated` is always false on the `drawCached()` path.
-fn drawSingleWindow(
-    ctx:               TitleRenderContext,
-    snapshot:          TitleSnapshot,
-    cache:             ?TitleCache,
-    allocator:         std.mem.Allocator,
-    title_invalidated: bool,
-) !void {
-    const single_win   = snapshot.current_ws_wins[0];
-    const is_minimized = snapshot.minimized_set.contains(single_win);
-    // `has_focus` is true when any window on this workspace is focused,
-    // meaning the segment gets the accent colour rather than plain bg.
-    const has_focus    = snapshot.focused_window != null;
-
-    const accent = if (is_minimized)
-        ctx.config.title_minimized_accent
-    else if (has_focus)
-        ctx.config.title_accent_color
-    else
-        ctx.config.bg;
-    ctx.dc.fillRect(ctx.start_x, 0, ctx.width, ctx.height, accent);
-
-    const scaled_padding = ctx.config.scaledSegmentPadding(ctx.height);
-    const baseline_y     = ctx.dc.baselineY(ctx.height);
-    const text_x         = ctx.start_x + scaled_padding + title_lead_px;
-    // Saturating arithmetic guards against extreme padding values before the
-    // saturating subtraction, preventing a u16 wrap in the intermediate result.
-    const avail_w        = ctx.width -| scaled_padding *| 2 -| title_lead_px;
-    const geom           = carousel.SegmentGeometry{
-        .seg_x   = ctx.start_x,
-        .seg_w   = ctx.width,
-        .text_x  = text_x,
-        .avail_w = avail_w,
-    };
-
-    if (is_minimized) {
-        // Pre-fetched on the main thread via fetchWindowTitleInto — zero X11
-        // I/O here, upholding the render-thread threading contract.
-        if (snapshot.minimized_title.len > 0)
-            try carousel.drawScrollingTitle(
-                ctx.dc, baseline_y, geom,
-                snapshot.minimized_title, accent, ctx.config.fg,
-                single_win, false,
-            );
-        return;
-    }
-
-    if (snapshot.focused_title.len == 0) return;
-
-    // Update the bar slot's title cache for the next drawCached() tick.
-    // Only the draw() path passes a non-null cache.
-    if (cache) |slot| {
-        if (title_invalidated or slot.cached_title_window.* != snapshot.focused_window) {
-            slot.cached_title.clearRetainingCapacity();
-            slot.cached_title.appendSlice(allocator, snapshot.focused_title) catch {};
-            slot.cached_title_window.* = snapshot.focused_window;
-        }
-    }
-
-    const fg = if (has_focus) ctx.config.selected_fg else ctx.config.fg;
-    try carousel.drawScrollingTitle(
-        ctx.dc, baseline_y, geom,
-        snapshot.focused_title, accent, fg,
-        snapshot.focused_window, title_invalidated,
-    );
-}
-
-// Private — split-view segmented titles
-
-/// Renders one title segment per window in a horizontal split-view layout.
-/// Windows are sorted spatially so each segment position is stable across focus changes.
-fn drawSegmentedTitles(
-    ctx:               TitleRenderContext,
-    snapshot:          TitleSnapshot,
-    allocator:         std.mem.Allocator,
-    title_invalidated: bool,
-) !void {
-    const windows = snapshot.current_ws_wins;
-    if (windows.len == 0) return;
-
-    const win_count = @min(windows.len, max_visible_windows);
-
-    // Free the single-window carousel: the single and segmented paths are
-    // mutually exclusive.  Leaving it alive would cause the carousel timer
-    // to blit the stale single-window pixmap over the correct split view.
-    carousel.deinitSingleCarousel();
-
-    // Prune the seg-carousel if its window has left the workspace so we never
-    // blit a title for a window that was closed or moved to another workspace.
-    if (carousel.getSegmentedCarouselWindow()) |tracked_win| {
-        if (std.mem.indexOfScalar(u32, windows[0..win_count], tracked_win) == null)
-            carousel.deinitSegmentedCarousel();
-    }
-
-    // Determine whether pre-fetched title data is available.
-    // When window_title_ends is populated with the correct count of entries,
-    // all N title round-trips are skipped on the render thread (they were
-    // already fetched on the main thread in captureStateIntoSlot).
-    const has_prefetched_titles = snapshot.window_title_ends.len >= win_count;
-
-    atoms.ensureResolved();
-    const net_atom = atoms.net_wm_name;
-    const utf_type = atoms.utf8AtomType();
-
-    // XCB cookie arrays — only populated for windows whose titles are not
-    // available from the pre-fetched snapshot data.
-    var net_wm_cookies: [max_visible_windows]xcb.xcb_get_property_cookie_t = undefined;
-    var geom_cookies:   [max_visible_windows]xcb.xcb_get_geometry_cookie_t = undefined;
-    var needs_xcb_title:    [max_visible_windows]bool = @splat(false);
-    var needs_xcb_geometry: [max_visible_windows]bool = @splat(false);
-    var is_minimized:       [max_visible_windows]bool = @splat(false);
-
-    // Phase 1 — fire only the cookies we actually need.
-    // Tiled windows: geometry comes from the tiling CacheMap (zero round-trips).
-    // Pre-fetched titles: skip xcb_get_property entirely.
-    for (windows[0..win_count], 0..) |win, i| {
-        is_minimized[i] = snapshot.minimized_set.contains(win);
-
-        if (!has_prefetched_titles) {
-            if (net_atom) |na|
-                net_wm_cookies[i] = xcb.xcb_get_property(ctx.conn, 0, win, na, utf_type, 0, 8192);
-            needs_xcb_title[i] = true;
-        }
-
-        if (!is_minimized[i]) {
-            // Tiling cache hit: geometry is already known, no round-trip needed.
-            if (tiling.getWindowGeom(win) == null) {
-                geom_cookies[i]       = xcb.xcb_get_geometry(ctx.conn, win);
-                needs_xcb_geometry[i] = true;
-            }
-        }
-    }
-
-    // Phase 2 — collect _NET_WM_NAME replies; queue WM_NAME fallbacks.
-    var titles:          [max_visible_windows]?[]const u8                   = @splat(null);
-    var fallback_cookies:[max_visible_windows]xcb.xcb_get_property_cookie_t = undefined;
-    var needs_fallback:  [max_visible_windows]bool                          = @splat(false);
-
-    if (!has_prefetched_titles) {
-        for (windows[0..win_count], 0..) |win, i| {
-            got: {
-                if (net_atom != null) {
-                    const r = xcb.xcb_get_property_reply(ctx.conn, net_wm_cookies[i], null) orelse break :got;
-                    defer std.c.free(r);
-                    const len = xcb.xcb_get_property_value_length(r);
-                    if (len > 0) {
-                        const ptr: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(r));
-                        titles[i] = try allocator.dupe(u8, ptr[0..@intCast(len)]);
-                        break :got;
-                    }
-                }
-                fallback_cookies[i] = xcb.xcb_get_property(
-                    ctx.conn, 0, win, xcb.XCB_ATOM_WM_NAME, xcb.XCB_ATOM_STRING, 0, 8192);
-                needs_fallback[i] = true;
-            }
-        }
-
-        // Phase 3 — collect WM_NAME fallback replies.
-        for (0..win_count) |i| {
-            if (!needs_fallback[i]) continue;
-            const r = xcb.xcb_get_property_reply(ctx.conn, fallback_cookies[i], null) orelse continue;
-            defer std.c.free(r);
-            const len = xcb.xcb_get_property_value_length(r);
-            if (len > 0) {
-                const ptr: [*]const u8 = @ptrCast(xcb.xcb_get_property_value(r));
-                titles[i] = try allocator.dupe(u8, ptr[0..@intCast(len)]);
-            }
-        }
-    }
-    defer for (titles[0..win_count]) |t| if (t) |s| allocator.free(s);
-
-    // Build WindowInfo list.
-    // Geometry: tiling cache → xcb_get_geometry reply → offscreen sentinel.
-    var window_info_buf: [max_visible_windows]WindowInfo = undefined;
-    var info_count:      usize                           = 0;
-
-    for (windows[0..win_count], 0..) |win, i| {
-        const geom: utils.Rect = if (is_minimized[i])
-            .{ .x = std.math.maxInt(i16), .y = std.math.maxInt(i16), .width = 0, .height = 0 }
-        else if (tiling.getWindowGeom(win)) |cached|
-            cached
-        else if (needs_xcb_geometry[i]) blk: {
-            const r = xcb.xcb_get_geometry_reply(ctx.conn, geom_cookies[i], null) orelse continue;
-            defer std.c.free(r);
-            break :blk utils.Rect{
-                .x      = @intCast(r.*.x),
-                .y      = @intCast(r.*.y),
-                .width  = r.*.width,
-                .height = r.*.height,
-            };
-        } else .{ .x = std.math.maxInt(i16), .y = std.math.maxInt(i16), .width = 0, .height = 0 };
-
-        const title_str: []const u8 = if (has_prefetched_titles)
-            snapshot.windowTitle(i)
-        else
-            titles[i] orelse "";
-
-        window_info_buf[info_count] = .{
-            .window    = win,
-            .x         = geom.x,
-            .y         = geom.y,
-            .title     = title_str,
-            .minimized = is_minimized[i],
-        };
-        info_count += 1;
-    }
-
-    if (info_count == 0) return;
-
-    const window_infos = window_info_buf[0..info_count];
-    // void context: sort order is purely spatial + window ID, never dependent
-    // on focus (see `compareWindows`).  This prevents segment reordering on
-    // focus changes, which would be visually jarring.
-    std.mem.sort(WindowInfo, window_infos, {}, compareWindows);
-
-    const window_count:    u32 = @intCast(window_infos.len);
-    const scaled_padding       = ctx.config.scaledSegmentPadding(ctx.height);
-    const baseline_y           = ctx.dc.baselineY(ctx.height);
-
-    for (window_infos, 0..) |info, i| {
-        // Pixel-perfect tiling: segment i spans [i*W/n, (i+1)*W/n).
-        const x0: u16 = @intCast(@divFloor(@as(u32, @intCast(i))     * ctx.width, window_count));
-        const x1: u16 = @intCast(@divFloor(@as(u32, @intCast(i + 1)) * ctx.width, window_count));
-        const segment_x:     u16 = ctx.start_x + x0;
-        const segment_width: u16 = x1 - x0;
-        if (segment_width == 0) continue;
-
-        const is_focused_win = snapshot.focused_window == info.window;
-
-        const accent = if (is_focused_win)  ctx.config.title_accent_color
-            else if (info.minimized)         ctx.config.title_minimized_accent
-            else                             ctx.config.title_unfocused_accent;
-
-        ctx.dc.fillRect(segment_x, 0, segment_width, ctx.height, accent);
-
-        if (info.title.len == 0 or segment_width <= scaled_padding *| 2) continue;
-
-        const text_x  = segment_x + scaled_padding + title_lead_px;
-        const avail_w = segment_width -| scaled_padding *| 2 -| title_lead_px;
-        const text_fg = if (is_focused_win) ctx.config.selected_fg else ctx.config.fg;
-        const text_w  = ctx.dc.measureTextWidth(info.title);
-        const geom    = carousel.SegmentGeometry{
-            .seg_x   = segment_x,
-            .seg_w   = segment_width,
-            .text_x  = text_x,
-            .avail_w = avail_w,
-        };
-
-        if (is_focused_win and carousel.isCarouselEnabled()) {
-            // Focused + carousel enabled: pass full segment bounds so
-            // the scroll covers the entire segment width.
-            const scrolled = try carousel.drawSegmentedCarousel(
-                ctx.dc, baseline_y, geom, text_w,
-                info.title, accent, text_fg, info.window, title_invalidated,
-            );
-            if (!scrolled) {
-                // Text fits — draw it inset with normal padding.
-                try ctx.dc.drawText(text_x, baseline_y, info.title, text_fg);
-            }
-        } else {
-            // Non-focused or carousel disabled: ellipsis on overflow.
-            if (text_w <= avail_w)
-                try ctx.dc.drawText(text_x, baseline_y, info.title, text_fg)
-            else
-                try ctx.dc.drawTextEllipsis(text_x, baseline_y, info.title, avail_w, text_fg);
-        }
-    }
-}
-
-// Private helpers — window sorting
-
-/// Sort order for the split-view segment layout:
-///
-///   1. Non-minimized windows before minimized windows (minimized are shown
-///      last/rightmost, matching their visual demotion in tiling).
-///   2. On-screen windows before off-screen windows.  Windows with negative x
-///      are off-screen (monocle background windows); demoting them prevents
-///      artificial coordinates from overriding real spatial ordering.
-///   3. Left-to-right by x, then top-to-bottom by y.  Preserves the spatial
-///      order of tiled windows so each window's segment is stable across
-///      focus changes.
-///   4. Tie-break by window ID for deterministic ordering.
-///
-/// Focus is intentionally NOT a sort key.  Using focus as a tie-break would
-/// cause segments to reorder when two windows share identical coordinates
-/// (e.g. in a future stacking mode), making the bar jump on every focus
-/// change.  The focused window is highlighted via accent colour instead.
-fn compareWindows(_: void, a: WindowInfo, b: WindowInfo) bool {
-    if (a.minimized != b.minimized) return !a.minimized;
-    const a_offscreen = a.x < 0;
-    const b_offscreen = b.x < 0;
-    if (a_offscreen != b_offscreen) return !a_offscreen;
-    if (a.x != b.x) return a.x < b.x;
-    if (a.y != b.y) return a.y < b.y;
-    return a.window < b.window;
 }
 </file>
 
@@ -10587,419 +10600,6 @@ inline fn isEmptySizeHints(h: SizeHints) bool {
     return h.max_width == 0 and h.max_height == 0 and
            h.inc_width == 0 and h.inc_height == 0 and
            h.min_aspect == 0.0 and h.max_aspect == 0.0;
-}
-</file>
-
-<file path="src/bar/modules/title/carousel.zig">
-//! Carousel title extension.
-//! Extends title by adding a smooth-scroll carousel effect for titles that
-//! don't fully fit the segment.
-//!
-//! Design
-//! ──────
-//! A wide XCB pixmap is pre-rendered once per title change:
-//!
-//!   [ bg * left_pad | text A | bg * gap | text B ]
-//!    ←── left_pad ──→←text_w→←── gap ──→←text_w→
-//!
-//! where left_pad = text_x − seg_x (the segment's left inset).
-//! cycle_w = text_w + gap.  At scroll offset O the hot-path blit is a
-//! single xcb_copy_area of seg_w pixels from pixmap position O into the
-//! offscreen pixmap, then a blitAndFlush.  Two XCB calls total per tick —
-//! no fill, no clipping arithmetic, no second copy.
-//!
-//! Offset formula: O = (elapsed_ms × speed / 1000) mod cycle_w.
-//! Continuous linear interpolation — no frame-quantisation.  Smooth at
-//! any wakeup rate.
-//!
-//! Invalidation is deliberately unified: any change (window, title, bg,
-//! or geometry) rebuilds the pixmap and resets start_ms to now.  The
-//! previous code's three-way full_stale / bg_changed / geom_changed split
-//! was a source of subtle bugs and is removed.
-
-const std = @import("std");
-
-const core    = @import("core");
-    const xcb = core.xcb;
-const utils   = @import("utils");
-
-const scale   = @import("scale");
-const drawing = @import("drawing");
-
-// ── Public constants ────────────────────────────────────────────────────────
-
-/// Default scroll speed in pixels per second.
-pub const default_scroll_speed: f64 = 125.0;
-
-/// Pixel gap between the end of text copy A and the start of copy B in the
-/// pre-rendered pixmap.
-pub const carousel_gap_px: u16 = 60;
-
-// ── Public geometry type ────────────────────────────────────────────────────
-
-/// Segment geometry passed to carousel draw functions.
-///
-///   seg_x  / seg_w  — full segment bounds (clip + fill region).
-///   text_x / avail_w — inset text area used for the overflow check and for
-///                      static / ellipsis fallback drawing.
-pub const SegmentGeometry = struct {
-    seg_x:   u16,
-    seg_w:   u16,
-    text_x:  u16,
-    avail_w: u16,
-};
-
-// ── Internal types ──────────────────────────────────────────────────────────
-
-/// All state for one live carousel (single-window or segmented).
-const CarouselEntry = struct {
-    cp:       drawing.CarouselPixmap,
-    cycle_w:  u16,   // text_w + carousel_gap_px
-    start_ms: i64,   // monotonicMs() at the moment the animation started
-    last_bg:  u32,   // accent colour baked into cp; used by drawCarouselTick
-                     //   to detect a colour change before the next full draw
-    window:   ?u32,  // window the pixmap was built for (null = no window)
-    geom:     SegmentGeometry,
-};
-
-/// Runtime-configurable scroll parameters.
-const ScrollConfig = struct {
-    speed:         f64 = default_scroll_speed,
-    /// When > 0, overrides the monitor's detected refresh rate for the wake
-    /// interval. Set via `carousel_refresh_rate` in the config file.
-    rate_override: f64 = 0.0,
-};
-
-/// All state exclusively owned by the render thread.
-/// `is_enabled` is also written by the main thread (setCarouselEnabled) and
-/// is therefore an atomic; all other fields are render-thread-only.
-const RenderState = struct {
-    single:     ?CarouselEntry                    = null,
-    seg:        ?CarouselEntry                    = null,
-    is_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
-};
-
-/// Cross-thread signal: main thread sets is_invalidated when focus changes;
-/// render thread consumes it on the next seg-carousel blit.
-///
-/// `seg_window` is the window the render thread last built the seg carousel
-/// for (0 = none).  The render thread writes it atomically after updating
-/// render.seg so the main thread never has to read the non-atomic render.seg.
-const FocusSignal = struct {
-    is_invalidated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    seg_window:     std.atomic.Value(u32)  = std.atomic.Value(u32).init(0),
-};
-
-var scroll_config: ScrollConfig = .{};
-var render:        RenderState  = .{};
-var focus_signal:  FocusSignal  = .{};
-
-// ── Public API — feature toggles and scroll config ──────────────────────────
-
-/// Enable or disable the carousel globally.
-/// Disabling immediately frees all carousel pixmaps.
-pub fn setCarouselEnabled(enabled: bool) void {
-    if (!enabled and render.is_enabled.load(.acquire)) deinitCarousel();
-    render.is_enabled.store(enabled, .release);
-}
-
-/// Returns true when the carousel feature is currently enabled.
-pub fn isCarouselEnabled() bool { return render.is_enabled.load(.acquire); }
-
-/// Set the scroll speed in pixels per second.
-/// Values ≤ 0 are clamped to default_scroll_speed.
-pub fn setScrollSpeed(px_per_s: f64) void {
-    scroll_config.speed = if (px_per_s > 0.0) px_per_s else default_scroll_speed;
-}
-
-/// Override the refresh rate used for the wake interval.
-/// Pass 0 (the default) to use the monitor's auto-detected rate.
-pub fn setRefreshRateOverride(hz: f64) void {
-    scroll_config.rate_override = if (hz > 0.0) hz else 0.0;
-}
-
-/// Returns the bar thread's carousel wake interval in nanoseconds.
-///
-/// Priority:
-///   1. User-configured `carousel_refresh_rate` (rate_override > 0).
-///   2. Monitor refresh rate detected via RandR at startup.
-///   3. 60 Hz fallback when detection has not yet run.
-///
-/// Called once per bar-thread sleep cycle; the division is cheap relative
-/// to the timedWait syscall that follows.
-pub fn wakeIntervalNs() u64 {
-    const hz: f64 = if (scroll_config.rate_override > 0.0)
-        scroll_config.rate_override
-    else
-        scale.getDetectedRateHz();
-    return @intFromFloat(1_000_000_000.0 / hz);
-}
-
-// ── Public API — lifecycle ───────────────────────────────────────────────────
-
-/// True when either carousel pixmap is live.
-pub fn isCarouselActive() bool {
-    return render.single != null or render.seg != null;
-}
-
-/// Returns the window ID the segmented carousel was built for, or null.
-/// Render thread only — reading render.seg here is safe.
-pub fn getSegmentedCarouselWindow() ?u32 {
-    return if (render.seg) |e| e.window else null;
-}
-
-/// Free all carousel pixmaps and reset cross-thread signals.
-/// Call on bar deinit or config reload.  Render thread only.
-pub fn deinitCarousel() void {
-    deinitSingleCarousel();
-    deinitSegmentedCarousel();
-    focus_signal.is_invalidated.store(false, .monotonic);
-}
-
-/// Free the single-window carousel pixmap.  Render thread only.
-pub fn deinitSingleCarousel() void {
-    if (render.single) |*e| { e.cp.deinit(); render.single = null; }
-}
-
-/// Free the segmented carousel pixmap.  Render thread only.
-pub fn deinitSegmentedCarousel() void {
-    if (render.seg) |*e| { e.cp.deinit(); render.seg = null; }
-    focus_signal.seg_window.store(0, .release);
-}
-
-// ── Public API — focus notification (main thread only) ───────────────────────
-
-/// Called by the focus system when the focused window changes.
-/// MUST be called from the main thread only.
-/// Sets focus_signal.is_invalidated so the render thread rebuilds the
-/// seg-carousel on the next blit.
-pub fn notifyFocusChanged(new_window: ?u32) void {
-    const tracked = focus_signal.seg_window.load(.acquire);
-    const changed = if (new_window) |nw| nw != tracked else tracked != 0;
-    if (!changed) return;
-    focus_signal.is_invalidated.store(true, .release);
-}
-
-// ── Public API — hot-path carousel tick ─────────────────────────────────────
-
-/// Fast per-tick single-window carousel blit.
-///
-/// Returns false when:
-///   • no single carousel is live,
-///   • the segment position/size changed (bar resize — caller triggers a full draw), or
-///   • the accent colour changed (minimize/unminimize — caller triggers a full draw
-///     which rebuilds the pixmap with the new bg baked in).
-///
-/// Hot path: one xcb_copy_area (wide pixmap → offscreen) + blitAndFlush.
-/// No fill, no Cairo, no Pango.
-pub fn drawCarouselTick(
-    dc:    *drawing.DrawContext,
-    bg:    u32,
-    seg_x: u16,
-    seg_w: u16,
-) bool {
-    const e = render.single orelse return false;
-    if (seg_x != e.geom.seg_x or seg_w != e.geom.seg_w or bg != e.last_bg)
-        return false;
-
-    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
-    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, seg_x, off, seg_w);
-    dc.blitAndFlush(seg_x, seg_w);
-    return true;
-}
-
-/// Parameterless segmented carousel tick for use from the bar's drawTitleOnly path.
-///
-/// Reads seg_x, seg_w, and last_bg directly from the live render.seg entry so
-/// the caller does not need to cache or re-derive the focused segment's bounds.
-/// Returns false when no segmented carousel is live or the accent colour changed
-/// (indicating a minimize/unminimize that requires a full rebuild).
-pub fn drawSegCarouselTickAuto(dc: *drawing.DrawContext, accent: u32) bool {
-    const e = render.seg orelse return false;
-    if (accent != e.last_bg) return false;
-    // If a focus change is pending, bail out so the caller falls through to
-    // drawCached → drawSegmentedTitles, which redraws ALL segments with the
-    // correct accent colours (old focused → unfocused, new focused → focused).
-    if (focus_signal.is_invalidated.load(.acquire)) return false;
-    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
-    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, e.geom.seg_x, off, e.geom.seg_w);
-    dc.blitAndFlush(e.geom.seg_x, e.geom.seg_w);
-    return true;
-}
-
-// ── Public API — single-window title rendering ───────────────────────────────
-
-/// Render `text` into the segment described by `geom`.
-///
-/// • If text fits within geom.avail_w: draw statically, free any carousel.
-/// • If text overflows and carousel is enabled: build (or reuse) the wide
-///   pixmap and blit one frame.
-/// • If text overflows and carousel is disabled: draw with ellipsis.
-///
-/// Pixmap rebuild triggers (unified — any change resets start_ms to now):
-///   • No pixmap live
-///   • Window ID changed
-///   • Title text changed (title_invalidated)
-///   • Accent colour changed
-///   • Text width changed (cycle_w mismatch)
-///   • Segment geometry changed (position or size)
-pub fn drawScrollingTitle(
-    dc:                *drawing.DrawContext,
-    y:                 u16,
-    geom:              SegmentGeometry,
-    text:              []const u8,
-    bg:                u32,
-    fg:                u32,
-    window:            ?u32,
-    title_invalidated: bool,
-) !void {
-    const text_w = dc.measureTextWidth(text);
-
-    if (text_w <= geom.avail_w) {
-        deinitSingleCarousel();
-        try dc.drawText(geom.text_x, y, text, fg);
-        return;
-    }
-
-    if (!render.is_enabled.load(.acquire)) {
-        deinitSingleCarousel();
-        try dc.drawTextEllipsis(geom.text_x, y, text, geom.avail_w, fg);
-        return;
-    }
-
-    const cycle_w: u16 = text_w + carousel_gap_px;
-
-    const stale = render.single == null
-        or render.single.?.window  != window
-        or render.single.?.last_bg != bg
-        or title_invalidated
-        or render.single.?.cycle_w         != cycle_w
-        or render.single.?.geom.seg_x      != geom.seg_x
-        or render.single.?.geom.seg_w      != geom.seg_w
-        or render.single.?.geom.avail_w    != geom.avail_w;
-
-    if (stale) {
-        deinitSingleCarousel();
-
-        const left_pad: u16 = if (geom.text_x > geom.seg_x)
-            geom.text_x - geom.seg_x else 0;
-        const pixmap_w: u16 = @max(
-            left_pad + cycle_w + text_w,   // room for text copy B
-            cycle_w  + geom.seg_w,          // room for blit at max offset
-        );
-
-        var cp = try drawing.CarouselPixmap.init(dc, pixmap_w);
-        errdefer cp.deinit();
-        try cp.render(dc, text, bg, fg, y, left_pad, cycle_w);
-
-        render.single = .{
-            .cp       = cp,
-            .cycle_w  = cycle_w,
-            .start_ms = utils.monotonicMs(),
-            .last_bg  = bg,
-            .window   = window,
-            .geom     = geom,
-        };
-    }
-
-    const e   = render.single.?;
-    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
-    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, geom.seg_x, off, geom.seg_w);
-}
-
-// ── Public API — segmented carousel ─────────────────────────────────────────
-
-/// Render the focused window's title for a split-view segment.
-///
-/// Returns true when a carousel blit was performed; false when the text fits
-/// and the caller should draw it with dc.drawText directly.
-///
-/// Rebuild triggers: same unified logic as drawScrollingTitle, plus
-/// externally_invalidated from focus_signal (set by notifyFocusChanged).
-pub fn drawSegmentedCarousel(
-    dc:                *drawing.DrawContext,
-    baseline_y:        u16,
-    geom:              SegmentGeometry,
-    text_w:            u16,
-    text:              []const u8,
-    accent:            u32,
-    text_fg:           u32,
-    window:            u32,
-    title_invalidated: bool,
-) !bool {
-    if (text_w <= geom.avail_w) {
-        // Text fits — free any live seg-carousel pixmap so the tick fast-path
-        // (drawSegCarouselTickAuto) cannot blit stale scrolling content over
-        // the static text that the caller is about to draw.  Mirrors the
-        // deinitSingleCarousel() call in drawScrollingTitle for the same case.
-        deinitSegmentedCarousel();
-        return false;
-    }
-
-    // Consume the focus-change signal atomically.
-    const externally_invalidated = focus_signal.is_invalidated.swap(false, .acq_rel);
-
-    const cycle_w: u16 = text_w + carousel_gap_px;
-
-    const stale = externally_invalidated
-        or render.seg == null
-        or render.seg.?.window            != window
-        or render.seg.?.last_bg           != accent
-        or title_invalidated
-        or render.seg.?.cycle_w           != cycle_w
-        or render.seg.?.geom.seg_x        != geom.seg_x
-        or render.seg.?.geom.seg_w        != geom.seg_w
-        or render.seg.?.geom.avail_w      != geom.avail_w;
-
-    if (stale) {
-        deinitSegmentedCarousel();
-
-        const left_pad: u16 = if (geom.text_x > geom.seg_x)
-            geom.text_x - geom.seg_x else 0;
-        const pixmap_w: u16 = @max(
-            left_pad + cycle_w + text_w,
-            cycle_w  + geom.seg_w,
-        );
-
-        var cp = try drawing.CarouselPixmap.init(dc, pixmap_w);
-        errdefer cp.deinit();
-        try cp.render(dc, text, accent, text_fg, baseline_y, left_pad, cycle_w);
-
-        render.seg = .{
-            .cp       = cp,
-            .cycle_w  = cycle_w,
-            .start_ms = utils.monotonicMs(),
-            .last_bg  = accent,
-            .window   = window,
-            .geom     = geom,
-        };
-        // Publish the window atomically so notifyFocusChanged on the main
-        // thread can check it without touching render.seg.
-        focus_signal.seg_window.store(window, .release);
-    }
-
-    const e   = render.seg.?;
-    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
-    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, geom.seg_x, off, geom.seg_w);
-    return true;
-}
-
-// ── Private — scroll math ────────────────────────────────────────────────────
-
-/// Smooth continuous scroll offset.
-///
-///   offset = (elapsed_ms × speed / 1000.0) mod cycle_w
-///
-/// Linear interpolation with no frame quantisation — the position advances
-/// proportionally to elapsed wall-clock time regardless of the bar thread's
-/// wakeup cadence.  The previous frame-quantised formula stepped at display
-/// Hz (e.g. every 16.67 ms at 60 Hz) while the bar woke at 165 Hz (6 ms),
-/// producing a step-function: frozen for ~10 ms then a 2 px snap.
-fn carouselOffset(start_ms: i64, cycle_w: u16, now_ms: i64) u16 {
-    std.debug.assert(cycle_w > 0);
-    const elapsed = @as(f64, @floatFromInt(@max(0, now_ms - start_ms)));
-    const raw_px  = elapsed * scroll_config.speed / 1000.0;
-    return @intFromFloat(@mod(raw_px, @as(f64, @floatFromInt(cycle_w))));
 }
 </file>
 
@@ -12152,6 +11752,419 @@ fn drawActive(
 }
 </file>
 
+<file path="src/bar/modules/title/carousel.zig">
+//! Carousel title extension.
+//! Extends title by adding a smooth-scroll carousel effect for titles that
+//! don't fully fit the segment.
+//!
+//! Design
+//! ──────
+//! A wide XCB pixmap is pre-rendered once per title change:
+//!
+//!   [ bg * left_pad | text A | bg * gap | text B ]
+//!    ←── left_pad ──→←text_w→←── gap ──→←text_w→
+//!
+//! where left_pad = text_x − seg_x (the segment's left inset).
+//! cycle_w = text_w + gap.  At scroll offset O the hot-path blit is a
+//! single xcb_copy_area of seg_w pixels from pixmap position O into the
+//! offscreen pixmap, then a blitAndFlush.  Two XCB calls total per tick —
+//! no fill, no clipping arithmetic, no second copy.
+//!
+//! Offset formula: O = (elapsed_ms × speed / 1000) mod cycle_w.
+//! Continuous linear interpolation — no frame-quantisation.  Smooth at
+//! any wakeup rate.
+//!
+//! Invalidation is deliberately unified: any change (window, title, bg,
+//! or geometry) rebuilds the pixmap and resets start_ms to now.  The
+//! previous code's three-way full_stale / bg_changed / geom_changed split
+//! was a source of subtle bugs and is removed.
+
+const std = @import("std");
+
+const core    = @import("core");
+    const xcb = core.xcb;
+const utils   = @import("utils");
+
+const scale   = @import("scale");
+const drawing = @import("drawing");
+
+// ── Public constants ────────────────────────────────────────────────────────
+
+/// Default scroll speed in pixels per second.
+pub const default_scroll_speed: f64 = 125.0;
+
+/// Pixel gap between the end of text copy A and the start of copy B in the
+/// pre-rendered pixmap.
+pub const carousel_gap_px: u16 = 60;
+
+// ── Public geometry type ────────────────────────────────────────────────────
+
+/// Segment geometry passed to carousel draw functions.
+///
+///   seg_x  / seg_w  — full segment bounds (clip + fill region).
+///   text_x / avail_w — inset text area used for the overflow check and for
+///                      static / ellipsis fallback drawing.
+pub const SegmentGeometry = struct {
+    seg_x:   u16,
+    seg_w:   u16,
+    text_x:  u16,
+    avail_w: u16,
+};
+
+// ── Internal types ──────────────────────────────────────────────────────────
+
+/// All state for one live carousel (single-window or segmented).
+const CarouselEntry = struct {
+    cp:       drawing.CarouselPixmap,
+    cycle_w:  u16,   // text_w + carousel_gap_px
+    start_ms: i64,   // monotonicMs() at the moment the animation started
+    last_bg:  u32,   // accent colour baked into cp; used by drawCarouselTick
+                     //   to detect a colour change before the next full draw
+    window:   ?u32,  // window the pixmap was built for (null = no window)
+    geom:     SegmentGeometry,
+};
+
+/// Runtime-configurable scroll parameters.
+const ScrollConfig = struct {
+    speed:         f64 = default_scroll_speed,
+    /// When > 0, overrides the monitor's detected refresh rate for the wake
+    /// interval. Set via `carousel_refresh_rate` in the config file.
+    rate_override: f64 = 0.0,
+};
+
+/// All state exclusively owned by the render thread.
+/// `is_enabled` is also written by the main thread (setCarouselEnabled) and
+/// is therefore an atomic; all other fields are render-thread-only.
+const RenderState = struct {
+    single:     ?CarouselEntry                    = null,
+    seg:        ?CarouselEntry                    = null,
+    is_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+};
+
+/// Cross-thread signal: main thread sets is_invalidated when focus changes;
+/// render thread consumes it on the next seg-carousel blit.
+///
+/// `seg_window` is the window the render thread last built the seg carousel
+/// for (0 = none).  The render thread writes it atomically after updating
+/// render.seg so the main thread never has to read the non-atomic render.seg.
+const FocusSignal = struct {
+    is_invalidated: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    seg_window:     std.atomic.Value(u32)  = std.atomic.Value(u32).init(0),
+};
+
+var scroll_config: ScrollConfig = .{};
+var render:        RenderState  = .{};
+var focus_signal:  FocusSignal  = .{};
+
+// ── Public API — feature toggles and scroll config ──────────────────────────
+
+/// Enable or disable the carousel globally.
+/// Disabling immediately frees all carousel pixmaps.
+pub fn setCarouselEnabled(enabled: bool) void {
+    if (!enabled and render.is_enabled.load(.acquire)) deinitCarousel();
+    render.is_enabled.store(enabled, .release);
+}
+
+/// Returns true when the carousel feature is currently enabled.
+pub fn isCarouselEnabled() bool { return render.is_enabled.load(.acquire); }
+
+/// Set the scroll speed in pixels per second.
+/// Values ≤ 0 are clamped to default_scroll_speed.
+pub fn setScrollSpeed(px_per_s: f64) void {
+    scroll_config.speed = if (px_per_s > 0.0) px_per_s else default_scroll_speed;
+}
+
+/// Override the refresh rate used for the wake interval.
+/// Pass 0 (the default) to use the monitor's auto-detected rate.
+pub fn setRefreshRateOverride(hz: f64) void {
+    scroll_config.rate_override = if (hz > 0.0) hz else 0.0;
+}
+
+/// Returns the bar thread's carousel wake interval in nanoseconds.
+///
+/// Priority:
+///   1. User-configured `carousel_refresh_rate` (rate_override > 0).
+///   2. Monitor refresh rate detected via RandR at startup.
+///   3. 60 Hz fallback when detection has not yet run.
+///
+/// Called once per bar-thread sleep cycle; the division is cheap relative
+/// to the timedWait syscall that follows.
+pub fn wakeIntervalNs() u64 {
+    const hz: f64 = if (scroll_config.rate_override > 0.0)
+        scroll_config.rate_override
+    else
+        scale.getDetectedRateHz();
+    return @intFromFloat(1_000_000_000.0 / hz);
+}
+
+// ── Public API — lifecycle ───────────────────────────────────────────────────
+
+/// True when either carousel pixmap is live.
+pub fn isCarouselActive() bool {
+    return render.single != null or render.seg != null;
+}
+
+/// Returns the window ID the segmented carousel was built for, or null.
+/// Render thread only — reading render.seg here is safe.
+pub fn getSegmentedCarouselWindow() ?u32 {
+    return if (render.seg) |e| e.window else null;
+}
+
+/// Free all carousel pixmaps and reset cross-thread signals.
+/// Call on bar deinit or config reload.  Render thread only.
+pub fn deinitCarousel() void {
+    deinitSingleCarousel();
+    deinitSegmentedCarousel();
+    focus_signal.is_invalidated.store(false, .monotonic);
+}
+
+/// Free the single-window carousel pixmap.  Render thread only.
+pub fn deinitSingleCarousel() void {
+    if (render.single) |*e| { e.cp.deinit(); render.single = null; }
+}
+
+/// Free the segmented carousel pixmap.  Render thread only.
+pub fn deinitSegmentedCarousel() void {
+    if (render.seg) |*e| { e.cp.deinit(); render.seg = null; }
+    focus_signal.seg_window.store(0, .release);
+}
+
+// ── Public API — focus notification (main thread only) ───────────────────────
+
+/// Called by the focus system when the focused window changes.
+/// MUST be called from the main thread only.
+/// Sets focus_signal.is_invalidated so the render thread rebuilds the
+/// seg-carousel on the next blit.
+pub fn notifyFocusChanged(new_window: ?u32) void {
+    const tracked = focus_signal.seg_window.load(.acquire);
+    const changed = if (new_window) |nw| nw != tracked else tracked != 0;
+    if (!changed) return;
+    focus_signal.is_invalidated.store(true, .release);
+}
+
+// ── Public API — hot-path carousel tick ─────────────────────────────────────
+
+/// Fast per-tick single-window carousel blit.
+///
+/// Returns false when:
+///   • no single carousel is live,
+///   • the segment position/size changed (bar resize — caller triggers a full draw), or
+///   • the accent colour changed (minimize/unminimize — caller triggers a full draw
+///     which rebuilds the pixmap with the new bg baked in).
+///
+/// Hot path: one xcb_copy_area (wide pixmap → offscreen) + blitAndFlush.
+/// No fill, no Cairo, no Pango.
+pub fn drawCarouselTick(
+    dc:    *drawing.DrawContext,
+    bg:    u32,
+    seg_x: u16,
+    seg_w: u16,
+) bool {
+    const e = render.single orelse return false;
+    if (seg_x != e.geom.seg_x or seg_w != e.geom.seg_w or bg != e.last_bg)
+        return false;
+
+    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
+    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, seg_x, off, seg_w);
+    dc.blitAndFlush(seg_x, seg_w);
+    return true;
+}
+
+/// Parameterless segmented carousel tick for use from the bar's drawTitleOnly path.
+///
+/// Reads seg_x, seg_w, and last_bg directly from the live render.seg entry so
+/// the caller does not need to cache or re-derive the focused segment's bounds.
+/// Returns false when no segmented carousel is live or the accent colour changed
+/// (indicating a minimize/unminimize that requires a full rebuild).
+pub fn drawSegCarouselTickAuto(dc: *drawing.DrawContext, accent: u32) bool {
+    const e = render.seg orelse return false;
+    if (accent != e.last_bg) return false;
+    // If a focus change is pending, bail out so the caller falls through to
+    // drawCached → drawSegmentedTitles, which redraws ALL segments with the
+    // correct accent colours (old focused → unfocused, new focused → focused).
+    if (focus_signal.is_invalidated.load(.acquire)) return false;
+    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
+    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, e.geom.seg_x, off, e.geom.seg_w);
+    dc.blitAndFlush(e.geom.seg_x, e.geom.seg_w);
+    return true;
+}
+
+// ── Public API — single-window title rendering ───────────────────────────────
+
+/// Render `text` into the segment described by `geom`.
+///
+/// • If text fits within geom.avail_w: draw statically, free any carousel.
+/// • If text overflows and carousel is enabled: build (or reuse) the wide
+///   pixmap and blit one frame.
+/// • If text overflows and carousel is disabled: draw with ellipsis.
+///
+/// Pixmap rebuild triggers (unified — any change resets start_ms to now):
+///   • No pixmap live
+///   • Window ID changed
+///   • Title text changed (title_invalidated)
+///   • Accent colour changed
+///   • Text width changed (cycle_w mismatch)
+///   • Segment geometry changed (position or size)
+pub fn drawScrollingTitle(
+    dc:                *drawing.DrawContext,
+    y:                 u16,
+    geom:              SegmentGeometry,
+    text:              []const u8,
+    bg:                u32,
+    fg:                u32,
+    window:            ?u32,
+    title_invalidated: bool,
+) !void {
+    const text_w = dc.measureTextWidth(text);
+
+    if (text_w <= geom.avail_w) {
+        deinitSingleCarousel();
+        try dc.drawText(geom.text_x, y, text, fg);
+        return;
+    }
+
+    if (!render.is_enabled.load(.acquire)) {
+        deinitSingleCarousel();
+        try dc.drawTextEllipsis(geom.text_x, y, text, geom.avail_w, fg);
+        return;
+    }
+
+    const cycle_w: u16 = text_w + carousel_gap_px;
+
+    const stale = render.single == null
+        or render.single.?.window  != window
+        or render.single.?.last_bg != bg
+        or title_invalidated
+        or render.single.?.cycle_w         != cycle_w
+        or render.single.?.geom.seg_x      != geom.seg_x
+        or render.single.?.geom.seg_w      != geom.seg_w
+        or render.single.?.geom.avail_w    != geom.avail_w;
+
+    if (stale) {
+        deinitSingleCarousel();
+
+        const left_pad: u16 = if (geom.text_x > geom.seg_x)
+            geom.text_x - geom.seg_x else 0;
+        const pixmap_w: u16 = @max(
+            left_pad + cycle_w + text_w,   // room for text copy B
+            cycle_w  + geom.seg_w,          // room for blit at max offset
+        );
+
+        var cp = try drawing.CarouselPixmap.init(dc, pixmap_w);
+        errdefer cp.deinit();
+        try cp.render(dc, text, bg, fg, y, left_pad, cycle_w);
+
+        render.single = .{
+            .cp       = cp,
+            .cycle_w  = cycle_w,
+            .start_ms = utils.monotonicMs(),
+            .last_bg  = bg,
+            .window   = window,
+            .geom     = geom,
+        };
+    }
+
+    const e   = render.single.?;
+    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
+    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, geom.seg_x, off, geom.seg_w);
+}
+
+// ── Public API — segmented carousel ─────────────────────────────────────────
+
+/// Render the focused window's title for a split-view segment.
+///
+/// Returns true when a carousel blit was performed; false when the text fits
+/// and the caller should draw it with dc.drawText directly.
+///
+/// Rebuild triggers: same unified logic as drawScrollingTitle, plus
+/// externally_invalidated from focus_signal (set by notifyFocusChanged).
+pub fn drawSegmentedCarousel(
+    dc:                *drawing.DrawContext,
+    baseline_y:        u16,
+    geom:              SegmentGeometry,
+    text_w:            u16,
+    text:              []const u8,
+    accent:            u32,
+    text_fg:           u32,
+    window:            u32,
+    title_invalidated: bool,
+) !bool {
+    if (text_w <= geom.avail_w) {
+        // Text fits — free any live seg-carousel pixmap so the tick fast-path
+        // (drawSegCarouselTickAuto) cannot blit stale scrolling content over
+        // the static text that the caller is about to draw.  Mirrors the
+        // deinitSingleCarousel() call in drawScrollingTitle for the same case.
+        deinitSegmentedCarousel();
+        return false;
+    }
+
+    // Consume the focus-change signal atomically.
+    const externally_invalidated = focus_signal.is_invalidated.swap(false, .acq_rel);
+
+    const cycle_w: u16 = text_w + carousel_gap_px;
+
+    const stale = externally_invalidated
+        or render.seg == null
+        or render.seg.?.window            != window
+        or render.seg.?.last_bg           != accent
+        or title_invalidated
+        or render.seg.?.cycle_w           != cycle_w
+        or render.seg.?.geom.seg_x        != geom.seg_x
+        or render.seg.?.geom.seg_w        != geom.seg_w
+        or render.seg.?.geom.avail_w      != geom.avail_w;
+
+    if (stale) {
+        deinitSegmentedCarousel();
+
+        const left_pad: u16 = if (geom.text_x > geom.seg_x)
+            geom.text_x - geom.seg_x else 0;
+        const pixmap_w: u16 = @max(
+            left_pad + cycle_w + text_w,
+            cycle_w  + geom.seg_w,
+        );
+
+        var cp = try drawing.CarouselPixmap.init(dc, pixmap_w);
+        errdefer cp.deinit();
+        try cp.render(dc, text, accent, text_fg, baseline_y, left_pad, cycle_w);
+
+        render.seg = .{
+            .cp       = cp,
+            .cycle_w  = cycle_w,
+            .start_ms = utils.monotonicMs(),
+            .last_bg  = accent,
+            .window   = window,
+            .geom     = geom,
+        };
+        // Publish the window atomically so notifyFocusChanged on the main
+        // thread can check it without touching render.seg.
+        focus_signal.seg_window.store(window, .release);
+    }
+
+    const e   = render.seg.?;
+    const off = carouselOffset(e.start_ms, e.cycle_w, utils.monotonicMs());
+    e.cp.blitFrame(dc.offscreen_pixmap, dc.gc, geom.seg_x, off, geom.seg_w);
+    return true;
+}
+
+// ── Private — scroll math ────────────────────────────────────────────────────
+
+/// Smooth continuous scroll offset.
+///
+///   offset = (elapsed_ms × speed / 1000.0) mod cycle_w
+///
+/// Linear interpolation with no frame quantisation — the position advances
+/// proportionally to elapsed wall-clock time regardless of the bar thread's
+/// wakeup cadence.  The previous frame-quantised formula stepped at display
+/// Hz (e.g. every 16.67 ms at 60 Hz) while the bar woke at 165 Hz (6 ms),
+/// producing a step-function: frozen for ~10 ms then a 2 px snap.
+fn carouselOffset(start_ms: i64, cycle_w: u16, now_ms: i64) u16 {
+    std.debug.assert(cycle_w > 0);
+    const elapsed = @as(f64, @floatFromInt(@max(0, now_ms - start_ms)));
+    const raw_px  = elapsed * scroll_config.speed / 1000.0;
+    return @intFromFloat(@mod(raw_px, @as(f64, @floatFromInt(cycle_w))));
+}
+</file>
+
 <file path="src/window/modules/workspaces.zig">
 //! Workspace management — creation, window assignment, and workspace switching.
 
@@ -13016,14 +13029,14 @@ const std   = @import("std");
 const build = @import("build_options");
 
 // core/
-const core       = @import("core");
-    const xcb    = core.xcb;
+const core    = @import("core");
+    const xcb = core.xcb;
 
 // core/modules/
-const debug      = @import("debug");
+const debug = @import("debug");
 
 // config/
-const types  = @import("types");
+const types = @import("types");
 
 // window/
 const window = @import("window");
@@ -14292,13 +14305,14 @@ pub fn updateIfDirty() !void {
     if (s.is_dirty) { submitDraw(); s.is_dirty = false; }
 }
 
-pub fn checkClockUpdate() void {
-    const s = gBar.state orelse return;
-    if (!s.is_visible) return;
+pub fn checkClockUpdate() bool {
+    const s = gBar.state orelse return false;
+    if (!s.is_visible) return false;
     gBar.channel.mutex.lock();
     gBar.channel.work.has_clock_tick = true;
     gBar.channel.work_ready.signal();
     gBar.channel.mutex.unlock();
+    return true;
 }
 
 pub fn pollTimeoutMs() i32     { return clockSegment.pollTimeoutMs(); }
