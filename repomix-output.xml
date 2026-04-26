@@ -1,3 +1,1120 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: src/window/modules/tiling
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+src/
+  window/
+    modules/
+      tiling/
+        modules/
+          fibonacci.zig
+          grid.zig
+          leaf.zig
+          master.zig
+          monocle.zig
+          scroll.zig
+        layouts.zig
+        tiling.zig
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/window/modules/tiling/modules/fibonacci.zig">
+//! Fibonacci (spiral) tiling layout
+//! Arranges windows in a counter-clockwise spiral, each taking half the remaining screen area.
+
+const constants = @import("constants");
+const utils     = @import("utils");
+const layouts   = @import("layouts");
+const tiling    = @import("tiling");
+const State     = tiling.State;
+
+/// Counter-clockwise spiral direction for the next window split.
+const SpiralDirection = enum(u2) {
+    right, // Split vertically:   window on left,   remainder on right.
+    down,  // Split horizontally: window on top,    remainder below.
+    left,  // Split vertically:   window on right,  remainder on left.
+    up,    // Split horizontally: window on bottom, remainder above.
+
+    inline fn next(self: SpiralDirection) SpiralDirection {
+        return @enumFromInt(@intFromEnum(self) +% 1); // 2-bit wrapping; 4 variants
+    }
+};
+
+/// Tile `windows` into a Fibonacci spiral using the given screen area.
+pub fn tileWithOffset(
+    ctx:      *const layouts.LayoutCtx,
+    state:    *State,
+    windows:  []const u32,
+    screen_w: u16,
+    screen_h: u16,
+    y_offset: u16,
+) void {
+    if (windows.len == 0) return;
+
+    const m       = state.margins();
+    const border2 = 2 *| m.border;
+
+    var x: i32 = @intCast(m.gap);
+    var y: i32 = @intCast(y_offset +| m.gap);
+    var w: u16 = screen_w -| m.gap *| 2;
+    var h: u16 = screen_h -| m.gap *| 2;
+    var dir: SpiralDirection = .right;
+
+    for (windows, 0..) |win, i| {
+        // Remaining area too small to split: stack all overflow windows here.
+        if (w < m.gap * 2 + border2 or h < m.gap * 2 + border2) {
+            const overflow_rect = utils.Rect{
+                .x      = @intCast(x),
+                .y      = @intCast(y),
+                .width  = if (w > border2) w - border2 else constants.MIN_WINDOW_DIM,
+                .height = if (h > border2) h - border2 else constants.MIN_WINDOW_DIM,
+            };
+            for (windows[i..]) |overflow_win| layouts.configureWithHints(ctx, overflow_win, overflow_rect);
+            return;
+        }
+
+        // Last window takes the entire remaining area.
+        if (i == windows.len - 1) {
+            layouts.configureWithHints(ctx, win, .{
+                .x      = @intCast(x),
+                .y      = @intCast(y),
+                .width  = w -| border2,
+                .height = h -| border2,
+            });
+            return;
+        }
+
+        splitAndAdvance(ctx, win, dir, border2, m.gap, &x, &y, &w, &h);
+        dir = dir.next();
+    }
+}
+
+/// Place `win` in its split half and advance the remaining area cursor.
+inline fn splitAndAdvance(
+    ctx:     *const layouts.LayoutCtx,
+    win:     u32,
+    dir:     SpiralDirection,
+    border2: u16,
+    gap:     u16,
+    x: *i32, y: *i32, w: *u16, h: *u16,
+) void {
+    switch (dir) {
+        .right => {
+            const win_w = (w.* -| gap) / 2;
+            layouts.configureWithHints(ctx, win, .{
+                .x = @intCast(x.*), .y = @intCast(y.*),
+                .width = win_w -| border2, .height = h.* -| border2,
+            });
+            x.* += @as(i32, @intCast(win_w + gap));
+            w.*  = w.* -| (win_w + gap);
+        },
+        .down => {
+            const win_h = (h.* -| gap) / 2;
+            layouts.configureWithHints(ctx, win, .{
+                .x = @intCast(x.*), .y = @intCast(y.*),
+                .width = w.* -| border2, .height = win_h -| border2,
+            });
+            y.* += @as(i32, @intCast(win_h + gap));
+            h.*  = h.* -| (win_h + gap);
+        },
+        .left => {
+            const win_w = (w.* -| gap) / 2;
+            layouts.configureWithHints(ctx, win, .{
+                .x = @intCast(x.* + @as(i32, @intCast(w.* - win_w))),
+                .y = @intCast(y.*),
+                .width = win_w -| border2, .height = h.* -| border2,
+            });
+            w.* = w.* -| (win_w + gap); // x stays; shrink from the right
+        },
+        .up => {
+            const win_h = (h.* -| gap) / 2;
+            layouts.configureWithHints(ctx, win, .{
+                .x = @intCast(x.*),
+                .y = @intCast(y.* + @as(i32, @intCast(h.* - win_h))),
+                .width = w.* -| border2, .height = win_h -| border2,
+            });
+            h.* = h.* -| (win_h + gap); // y stays; shrink from the bottom
+        },
+    }
+}
+</file>
+
+<file path="src/window/modules/tiling/modules/grid.zig">
+//! Grid tiling layout
+//! Arranges windows in an evenly divided grid, with rigid or relaxed row sizing.
+
+const constants = @import("constants");
+const utils     = @import("utils");
+const layouts   = @import("layouts");
+const tiling    = @import("tiling");
+const State     = tiling.State;
+
+/// Tile `windows` into a grid using the given screen area.
+pub fn tileWithOffset(
+    ctx:      *const layouts.LayoutCtx,
+    state:    *State,
+    windows:  []const u32,
+    screen_w: u16,
+    screen_h: u16,
+    y_offset: u16,
+) void {
+    const n = windows.len;
+    if (n == 0) return;
+
+    const m    = state.margins();
+    const grid = calcGridShape(n);
+    const bm   = 2 *| m.border;
+
+    const cell_w = (screen_w -| (grid.cols + 1) *| m.gap) / grid.cols;
+    const cell_h = (screen_h -| (grid.rows + 1) *| m.gap) / grid.rows;
+    const win_h  = cellToWindowSize(cell_h, bm);
+
+    // In relaxed mode, windows on a partial last row divide the full screen
+    // width among themselves rather than using the narrower grid-column width.
+    // The computation is gated on .relaxed so the division is skipped entirely
+    // on the default .rigid path where partial_cell_w is never used.
+    const last_row_count = n % grid.cols;
+    const partial_cell_w: u16 = if (state.layout_variants.grid == .relaxed and last_row_count != 0) blk: {
+        const count: u16 = @intCast(last_row_count);
+        break :blk (screen_w -| (count + 1) * m.gap) / count;
+    } else cell_w;
+
+    for (windows, 0..) |win, idx| {
+        const col: u16 = @intCast(idx % grid.cols);
+        const row: u16 = @intCast(idx / grid.cols);
+
+        const is_partial_row = last_row_count != 0 and row == grid.rows - 1;
+        const effective_cell_w: u16 = switch (state.layout_variants.grid) {
+            .rigid   => cell_w,
+            .relaxed => if (is_partial_row) partial_cell_w else cell_w,
+        };
+
+        layouts.configureWithHints(ctx, win, utils.Rect{
+            .x      = @intCast(m.gap +| col *| (effective_cell_w + m.gap)),
+            .y      = @intCast(y_offset +| m.gap +| row *| (cell_h + m.gap)),
+            .width  = cellToWindowSize(effective_cell_w, bm),
+            .height = win_h,
+        });
+    }
+}
+
+/// Returns the window content dimension for a cell of `cell_size`, subtracting
+/// the combined border margin. Falls back to MIN_WINDOW_DIM on underflow.
+inline fn cellToWindowSize(cell_size: u16, border_margin: u16) u16 {
+    return if (cell_size > border_margin) cell_size - border_margin else constants.MIN_WINDOW_DIM;
+}
+
+/// Returns the column and row count for the smallest square grid that holds `n`
+/// windows. Special-cases `n == 3` to produce a single row of three rather than
+/// a 2×2 grid with a dead cell.
+///
+/// Uses integer ceiling-sqrt to avoid the float pipeline entirely; terminates
+/// in at most 12 iterations for any realistic window count.
+inline fn calcGridShape(n: usize) struct { cols: u16, rows: u16 } {
+    if (n == 3) return .{ .cols = 3, .rows = 1 };
+    var cols: u16 = 1;
+    while (@as(usize, cols) * cols < n) cols += 1;
+    return .{ .cols = cols, .rows = @intCast((n + cols - 1) / cols) };
+}
+</file>
+
+<file path="src/window/modules/tiling/modules/leaf.zig">
+//! Binary Space Partitioning tiling layout
+//! Recursively partitions the screen using a balanced binary tree.
+//TODO: improve these comments
+
+const constants = @import("constants");
+const utils     = @import("utils");
+const layouts   = @import("layouts");
+const tiling    = @import("tiling");
+const State     = tiling.State;
+
+/// Tile `windows` into a balanced BSP layout using the given screen area.
+/// Strips the outer gap margin, then delegates to the recursive `tileRegion` splitter.
+pub fn tileWithOffset(
+    ctx:      *const layouts.LayoutCtx,
+    state:    *State,
+    windows:  []const u32,
+    screen_w: u16,
+    screen_h: u16,
+    y_offset: u16,
+) void {
+    if (windows.len == 0) return;
+
+    const m = state.margins();
+
+    // Strip the outer gap; each recursive split inserts one gap at its seam,
+    // so adjacent windows are always separated by exactly one gap_width.
+    tileRegion(
+        ctx,
+        windows,
+        m,
+        @as(i32, @intCast(m.gap)),
+        @as(i32, @intCast(y_offset +| m.gap)),
+        screen_w -| m.gap *| 2,
+        screen_h -| m.gap *| 2,
+    );
+}
+
+/// Recursively tile `windows` into the region (x, y, w, h).
+/// Splits the longer axis 50/50, inserting one gap at each seam; border subtracted at leaf nodes only.
+/// Ties (w == h) favour a vertical split.
+fn tileRegion(
+    ctx:     *const layouts.LayoutCtx,
+    windows: []const u32,
+    m:       utils.Margins,
+    x: i32,
+    y: i32,
+    w: u16,
+    h: u16,
+) void {
+    const n = windows.len;
+    if (n == 0) return;
+
+    const b2: u16 = 2 *| m.border;
+
+    // Leaf
+    // Place the single window in this region 
+    if (n == 1) {
+        layouts.configureWithHints(ctx, windows[0], .{
+            .x      = @intCast(x),
+            .y      = @intCast(y),
+            .width  = if (w > b2) w - b2 else constants.MIN_WINDOW_DIM,
+            .height = if (h > b2) h - b2 else constants.MIN_WINDOW_DIM,
+        });
+        return;
+    }
+
+    // Internal node
+    // Split this region into two and recurse 
+    const n_left: usize = n / 2;
+    const gap = m.gap;
+
+    if (w >= h) {
+        // Vertical split (wide/square region) 
+        const left_w: u16  = if (w > gap) (w - gap) / 2 else constants.MIN_WINDOW_DIM;
+        const right_w: u16 = if (w > left_w +| gap) w - left_w - gap
+                             else constants.MIN_WINDOW_DIM;
+        const right_x: i32 = x + @as(i32, @intCast(left_w +| gap));
+
+        tileRegion(ctx, windows[0..n_left], m, x,       y, left_w,  h);
+        tileRegion(ctx, windows[n_left..],  m, right_x, y, right_w, h);
+    } else {
+        // Horizontal split (tall region) 
+        const top_h: u16    = if (h > gap) (h - gap) / 2 else constants.MIN_WINDOW_DIM;
+        const bottom_h: u16 = if (h > top_h +| gap) h - top_h - gap
+                              else constants.MIN_WINDOW_DIM;
+        const bottom_y: i32 = y + @as(i32, @intCast(top_h +| gap));
+
+        tileRegion(ctx, windows[0..n_left], m, x, y,        w, top_h);
+        tileRegion(ctx, windows[n_left..],  m, x, bottom_y, w, bottom_h);
+    }
+}
+</file>
+
+<file path="src/window/modules/tiling/modules/master.zig">
+//! Master-stack tiling layout
+//! Divides the screen into a master pane and a stack pane, with overflow handling for extra windows.
+
+const utils     = @import("utils");
+const constants = @import("constants");
+
+const tiling  = @import("tiling");
+const layouts = @import("layouts");
+
+/// Tile `windows` into the master-stack layout using the given screen area.
+pub fn tileWithOffset(
+    ctx:      *const layouts.LayoutCtx,
+    state:    *tiling.State,
+    windows:  []const u32,
+    screen_w: u16,
+    screen_h: u16,
+    y_offset: u16,
+) void {
+    const n = windows.len;
+    if (n == 0) return;
+
+    const m         = state.margins();
+    const master_n: u16 = @intCast(@min(state.master_count, n));
+    const stack_n:  u16 = @intCast(n - master_n);
+
+    // When no stack exists the master pane takes the full width.
+    const master_w: u16 = if (stack_n > 0)
+        @intFromFloat(@as(f32, @floatFromInt(screen_w)) * state.master_width)
+    else
+        screen_w;
+
+    const is_master_on_right = state.master_side == .right;
+    const master_x: u16      = if (is_master_on_right) screen_w -| master_w else 0;
+
+    // Inner width accounts for the gap between master and stack panes.
+    const master_inner_w = if (stack_n > 0)
+        calcInnerWidth(master_w, m.gap, m.gap / 2 + 2 * m.border)
+    else
+        calcInnerWidth(master_w, m.gap, m.gap + 2 * m.border);
+
+    tileColumn(ctx, windows[0..master_n], master_x +| m.gap, y_offset, screen_h, master_inner_w, m);
+
+    if (stack_n == 0) return;
+
+    const stack_x: u16 = if (is_master_on_right) 0 else master_w;
+    tileStack(ctx, windows[master_n..], stack_x, y_offset, screen_w -| master_w, screen_h, m);
+}
+
+/// Tile a vertical column of `windows` at a fixed x position with a fixed
+/// content width. Used for both the master pane and the simple stack path.
+///
+/// When ctx.defer_configure is non-null and names a window in this column,
+/// that window's configure_window call is emitted after all other windows in
+/// the column.  This guarantees the shrinking window (old master moving into
+/// the stack) fills its slot before the growing window (new master) vacates its
+/// old slot, preventing a one-frame wallpaper gap.
+fn tileColumn(
+    ctx:      *const layouts.LayoutCtx,
+    windows:  []const u32,
+    x:        u16,
+    y_offset: u16,
+    h:        u16,
+    inner_w:  u16,
+    m:        utils.Margins,
+) void {
+    const count: u16 = @intCast(windows.len);
+    const avail = calcAvailableHeight(h, count, m);
+    var deferred_win:  ?u32        = null;
+    var deferred_rect: utils.Rect  = undefined;
+    for (windows, 0..) |win, i| {
+        const row: u16 = @intCast(i);
+        const rect = utils.Rect{
+            .x      = @intCast(x),
+            .y      = @intCast(windowY(row, count, avail, y_offset, m)),
+            .width  = inner_w,
+            .height = windowHeight(row, count, avail),
+        };
+        if (ctx.defer_configure == win) {
+            deferred_win  = win;
+            deferred_rect = rect;
+        } else {
+            layouts.configureWithHints(ctx, win, rect);
+        }
+    }
+    if (deferred_win) |w| layouts.configureWithHints(ctx, w, deferred_rect);
+}
+
+/// Tile the stack pane, spilling into a column-major overflow grid when the
+/// number of stack windows exceeds what fits in a single column.
+fn tileStack(
+    ctx:      *const layouts.LayoutCtx,
+    windows:  []const u32,
+    x:        u16,
+    y_offset: u16,
+    w:        u16,
+    h:        u16,
+    m:        utils.Margins,
+) void {
+    const stack_n: u16 = @intCast(windows.len);
+
+    const space_per_window: u32 = constants.MIN_WINDOW_DIM + 2 * @as(u32, m.border) + @as(u32, m.gap);
+    const available: u32        = @as(u32, h) -| @as(u32, m.gap);
+    const max_fit: u16          = @intCast(@max(1, available / space_per_window));
+
+    if (stack_n <= max_fit) {
+        tileColumn(ctx, windows, x +| m.gap / 2, y_offset, h,
+            calcInnerWidth(w, m.gap / 2, m.gap + 2 * m.border), m);
+        return;
+    }
+    tileStackExtra(ctx, windows, x, y_offset, w, h, max_fit, m);
+}
+
+/// Column-major overflow grid: row `r` holds windows at indices r, r+max_fit,
+/// r+2*max_fit, … Each row's column count is ceil((stack_n - r) / max_fit).
+/// Respects ctx.defer_configure: the named window is emitted last.
+fn tileStackExtra(
+    ctx:      *const layouts.LayoutCtx,
+    windows:  []const u32,
+    x:        u16,
+    y_offset: u16,
+    w:        u16,
+    h:        u16,
+    max_fit:  u16,
+    m:        utils.Margins,
+) void {
+    const stack_n: u16 = @intCast(windows.len);
+    const row_avail    = calcAvailableHeight(h, max_fit, m);
+
+    var deferred_win:  ?u32       = null;
+    var deferred_rect: utils.Rect = undefined;
+
+    var row: u16 = 0;
+    while (row < max_fit) : (row += 1) {
+        const cols_in_row: u16 = (stack_n - row + max_fit - 1) / max_fit;
+
+        const gaps_in_row = m.gap / 2 +| m.gap *| cols_in_row;
+        const row_total_w = if (w > gaps_in_row) w - gaps_in_row else cols_in_row * constants.MIN_WINDOW_DIM;
+        const col_w       = row_total_w / cols_in_row;
+        const col_inner_w = calcInnerWidth(col_w, 0, 2 * m.border);
+
+        const y_pos = windowY(row, max_fit, row_avail, y_offset, m);
+        const row_h = windowHeight(row, max_fit, row_avail);
+
+        var win_idx: u16 = row;
+        while (win_idx < stack_n) : (win_idx += max_fit) {
+            const col: u16 = (win_idx - row) / max_fit;
+            const rect = utils.Rect{
+                .x      = @intCast(x +| m.gap / 2 +| col *| (col_w +| m.gap)),
+                .y      = @intCast(y_pos),
+                .width  = col_inner_w,
+                .height = row_h,
+            };
+            if (ctx.defer_configure == windows[win_idx]) {
+                deferred_win  = windows[win_idx];
+                deferred_rect = rect;
+            } else {
+                layouts.configureWithHints(ctx, windows[win_idx], rect);
+            }
+        }
+    }
+    if (deferred_win) |win| layouts.configureWithHints(ctx, win, deferred_rect);
+}
+
+/// Total pixel height available for window content after gaps and borders.
+/// Falls back to count * MIN_WINDOW_DIM when margins exceed total_h.
+inline fn calcAvailableHeight(total_h: u16, count: u16, m: utils.Margins) u16 {
+    const overhead = m.gap *| (count + 1) +| m.border *| 2 *| count;
+    return if (total_h > overhead) total_h - overhead else count * constants.MIN_WINDOW_DIM;
+}
+
+/// Height of window `i` out of `count`, distributing `available` pixels via
+/// cumulative integer division. No two siblings differ by more than 1 px.
+inline fn windowHeight(i: u16, count: u16, available: u16) u16 {
+    const h = ((i + 1) * available / count) -| (i * available / count);
+    return @max(constants.MIN_WINDOW_DIM, h);
+}
+
+/// Y position of window `i`, derived from the same cumulative formula so that
+/// preceding windows' heights (which may vary by 1 px) are accounted for.
+inline fn windowY(i: u16, count: u16, available: u16, y_offset: u16, m: utils.Margins) u16 {
+    return y_offset +| m.gap +| (i * available / count) +| i *| (m.gap +| 2 *| m.border);
+}
+
+/// Width available for window content after subtracting left and right margins.
+inline fn calcInnerWidth(full_w: u16, left_margin: u16, right_margin: u16) u16 {
+    return if (full_w > left_margin + right_margin)
+        full_w - left_margin - right_margin
+    else
+        constants.MIN_WINDOW_DIM;
+}
+</file>
+
+<file path="src/window/modules/tiling/modules/monocle.zig">
+//! Monocle tiling layout
+//! Stacks all windows fullscreen, showing only the topmost one, with optional gap insets.
+
+const core      = @import("core");
+const constants = @import("constants");
+const utils     = @import("utils");
+const layouts   = @import("layouts");
+const tiling    = @import("tiling");
+const State     = tiling.State;
+const xcb       = core.xcb;
+
+/// Tile `windows` into monocle mode using the given screen area.
+pub fn tileWithOffset(
+    ctx:      *const layouts.LayoutCtx,
+    state:    *State,
+    windows:  []const u32,
+    screen_w: u16,
+    screen_h: u16,
+    y_offset: u16,
+) void {
+    if (windows.len == 0) return;
+
+    const m      = state.margins();
+    const inset: u16 = if (state.layout_variants.monocle == .gaps) m.gap else 0;
+    const total_margin = m.border * 2 + inset * 2;
+
+    const top_win  = windows[windows.len - 1];
+    const top_rect = utils.Rect{
+        .x      = @intCast(inset),
+        .y      = @intCast(y_offset +| inset),
+        .width  = if (screen_w > total_margin) screen_w - total_margin else constants.MIN_WINDOW_DIM,
+        .height = if (screen_h > total_margin) screen_h - total_margin else constants.MIN_WINDOW_DIM,
+    };
+
+    layouts.configureWithHintsAndRaise(ctx, top_win, top_rect);
+
+    pushBackgroundWindowsOffscreen(ctx, windows[0 .. windows.len - 1]);
+}
+
+/// Push non-top windows off the visible screen area so they never show through
+/// a transparent top window. Skips windows already known to be offscreen to
+/// avoid redundant round-trips; invalidates their cache rect so
+/// `restoreWorkspaceGeom` does not replay a stale on-screen position.
+fn pushBackgroundWindowsOffscreen(ctx: *const layouts.LayoutCtx, background: []const u32) void {
+    for (background) |win| {
+        if (ctx.cache.getPtr(win)) |wd| {
+            if (!wd.hasValidRect()) continue; // already offscreen — skip round-trip
+            wd.rect = tiling.zero_rect;       // invalidate before sending
+        }
+        utils.pushWindowOffscreen(ctx.conn, win);
+    }
+}
+</file>
+
+<file path="src/window/modules/tiling/modules/scroll.zig">
+//! Scrolling tiling layout
+//! Arranges windows in a horizontal strip of equal-width slots (each half the screen width)
+//! with a scrollable viewport. New windows snap the viewport right so they appear immediately;
+//! manual scrolling and window closes are handled by clamping on every retile.
+
+const std = @import("std");
+
+const core      = @import("core");
+const utils     = @import("utils");
+const constants = @import("constants");
+
+const tiling  = @import("tiling");
+const layouts = @import("layouts");
+
+// i16 bounds for utils.Rect.x; positions outside this range are parked at
+// OFFSCREEN_X_POSITION rather than sent as an overflowing cast to the X server.
+const I16_MAX: i32 = std.math.maxInt(i16);
+const I16_MIN: i32 = std.math.minInt(i16);
+
+pub fn tileWithOffset(
+    ctx:      *const layouts.LayoutCtx,
+    state:    *tiling.State,
+    windows:  []const u32,
+    screen_w: u16,
+    screen_h: u16,
+    y_offset: u16,
+) void {
+    const n = windows.len;
+    if (n == 0) return;
+
+    const m = state.margins();
+
+    // Every slot is exactly half the screen width.
+    const slot_w: i32 = @intCast(screen_w / 2);
+
+    const n_i32: i32  = @intCast(n);
+    const sw_i32: i32 = @intCast(screen_w);
+
+    // Max scroll: reached when the last window's right edge is flush with the screen.
+    const max_off: i32 = @max(0, n_i32 * slot_w - sw_i32);
+
+    // New window: snap viewport right so it is immediately visible.
+    // Killed window: the clamp below is sufficient.
+    if (n > state.scroll_prev_n) {
+        state.scrolling_offset = max_off;
+    }
+    state.scroll_prev_n = n;
+
+    // Clamp keeps the offset in [0, max_off] after manual scrolling or kills.
+    state.scrolling_offset = std.math.clamp(state.scrolling_offset, 0, max_off);
+    const scroll: i32 = state.scrolling_offset;
+
+    const content_h: u16 = calcContentH(screen_h, m);
+    const win_y: i32     = @as(i32, @intCast(y_offset)) + @as(i32, @intCast(m.gap));
+
+    // Full gap at screen edges; half-gap at interior slot boundaries so that
+    // adjacent windows together share exactly one full gap.
+    const gap_i32:  i32 = @intCast(m.gap);
+    const gap_half: i32 = @intCast(m.gap / 2);
+    const border2:  i32 = 2 * @as(i32, @intCast(m.border));
+
+    for (windows, 0..) |win, i| {
+        const col: i32 = @intCast(i);
+
+        const slot_left: i32 = col * slot_w - scroll;
+
+        // <= / >= rather than < / > to handle off-by-one from integer-division of odd screen widths.
+        const left_inset:  i32 = if (slot_left <= 0)               gap_i32 else gap_half;
+        const right_inset: i32 = if (slot_left + slot_w >= sw_i32) gap_i32 else gap_half;
+
+        const x: i32         = slot_left + left_inset;
+        const avail: i32     = slot_w - left_inset - right_inset - border2;
+        const content_w: u16 = if (avail > constants.MIN_WINDOW_DIM)
+            @intCast(avail)
+        else
+            constants.MIN_WINDOW_DIM;
+
+        const right: i32 = x + avail + border2; // right edge the X server clips against
+
+        // Completely off-screen: park the window. Use sentinel when x overflows i16
+        // (avoids sending a garbage position to the X server); otherwise configure at
+        // the true position to keep the cache coherent.
+        if (x >= sw_i32 or right <= 0) {
+            if (x < I16_MIN or x > I16_MAX) {
+                _ = core.xcb.xcb_configure_window(
+                    ctx.conn, win,
+                    core.xcb.XCB_CONFIG_WINDOW_X,
+                    &[_]u32{@bitCast(constants.OFFSCREEN_X_POSITION)},
+                );
+                // Invalidate so the next on-screen retile always reconfigures.
+                ctx.cache.getOrPut(win).value_ptr.rect = tiling.zero_rect;
+            } else {
+                layouts.configureWithHints(ctx, win, .{
+                    .x      = @intCast(x),
+                    .y      = @intCast(win_y),
+                    .width  = content_w,
+                    .height = content_h,
+                });
+            }
+            continue;
+        }
+
+        layouts.configureWithHints(ctx, win, .{
+            .x      = @intCast(x),
+            .y      = @intCast(win_y),
+            .width  = content_w,
+            .height = content_h,
+        });
+    }
+}
+
+/// Height of each window: full screen height minus top + bottom gap and borders.
+inline fn calcContentH(screen_h: u16, m: utils.Margins) u16 {
+    const overhead = m.gap *| 2 +| m.border *| 2;
+    return if (screen_h > overhead) screen_h - overhead else constants.MIN_WINDOW_DIM;
+}
+</file>
+
+<file path="src/window/modules/tiling/layouts.zig">
+//! Shared tiling layout infrastructure
+//! Provides the geometry constraints and the configuration entry point shared by all layout modules.
+
+const std     = @import("std");
+const core    = @import("core");
+    const xcb = core.xcb;
+const utils   = @import("utils");
+
+const debug = @import("debug");
+
+
+// WM_NORMAL_HINTS size constraint cache
+//
+// Populated from WM_NORMAL_HINTS during handleMapRequest; evicted on unmanage.
+// `configureWithHints` clamps every rect to stored minimums so terminals always
+// receive a geometry they can render.
+
+/// ICCCM WM_NORMAL_HINTS geometry constraints for a single window.
+pub const SizeHints = struct {
+    /// PMaxSize: upper bounds on window dimensions.
+    /// 0 means unconstrained (no max declared by the client).
+    max_width:  u16 = 0,
+    max_height: u16 = 0,
+    /// PResizeInc: dimensions must satisfy w = base_width + N * inc_width.
+    /// 0 means unconstrained (no increment declared by the client).
+    inc_width:  u16 = 0,
+    inc_height: u16 = 0,
+    /// PAspect: aspect ratio bounds (dwm convention).
+    /// 0.0 means unconstrained (no aspect hint declared by the client).
+    min_aspect: f32 = 0.0,
+    max_aspect: f32 = 0.0,
+};
+
+// Per-window geometry, border-color, and size-hint cache
+
+/// Combined per-window cache entry: last geometry, last border color, and
+/// WM_NORMAL_HINTS size constraints.
+pub const WindowData = struct {
+    /// A zeroed rect is the sentinel for "stale / not yet computed".
+    /// The layout engine never produces a 0×0 rect, so the sentinel is
+    /// unambiguous. Prefer `hasValidRect()` over open-coding the checks.
+    rect:   utils.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    border: u32 = 0,
+    /// WM_NORMAL_HINTS constraints populated at map time via `CacheMap.cacheHints`.
+    /// All-zero (the default) means unconstrained — `applyHintsToRect` is a
+    /// no-op when every field is zero, so windows without declared hints are
+    /// handled correctly with zero branches on the hot retile path.
+    hints:  SizeHints = .{},
+
+    /// Returns false when the rect is zeroed, indicating the entry is stale or
+    /// has not yet been populated by a retile pass.
+    pub fn hasValidRect(self: WindowData) bool {
+        return self.rect.width != 0 or self.rect.height != 0;
+    }
+};
+
+// Hash table parameters
+const cache_capacity:  usize = 256; // max live entries; overflow_sentinel fires above this
+const hash_table_cap:  usize = 512; // power-of-two slot count; load factor ≤ 0.5
+const hash_table_mask: usize = hash_table_cap - 1;
+const hash_shift:      u5    = 23;  // 32 - log2(512)
+const EMPTY_WIN:       u32   = 0;   // XCB_NONE; never a real window ID
+
+/// Overflow sentinel used by `CacheMap.getOrPut` when the hard cap is exceeded.
+///
+/// Returning a pointer to this throwaway slot lets every call-site proceed
+/// without a null-check while guaranteeing no live cache entry is corrupted.
+/// The affected window simply misses the dedup check and receives a redundant
+/// configure_window on the next retile — an unconditionally correct outcome.
+///
+/// SINGLE-THREADED ASSUMPTION: two concurrent overflows would alias to the same
+/// pointer.  The WM is single-threaded for all geometry operations.
+/// If that invariant ever changes, this sentinel must become per-call or the
+/// overflow path must return an error.
+var overflow_sentinel: WindowData = .{};
+
+/// Open-addressing hash table mapping window IDs to their last geometry,
+/// border color, and WM_NORMAL_HINTS constraints — all three in one slot.
+///
+/// Zero-initializable: `CacheMap{}` or `.{}` produces an empty table because
+/// EMPTY_WIN = 0.
+pub const CacheMap = struct {
+    const Slot = struct {
+        win:  u32        = EMPTY_WIN,
+        data: WindowData = .{},
+    };
+
+    pub const GetOrPutResult = struct {
+        found_existing: bool,
+        value_ptr: *WindowData,
+    };
+
+    slots: [hash_table_cap]Slot = std.mem.zeroes([hash_table_cap]Slot),
+    count: usize = 0,
+
+    /// Knuth's multiplicative hash for 32-bit keys, producing a 9-bit index
+    /// (log2(512) = 9) into the hash table.  Distributes XCB's near-sequential
+    /// window IDs uniformly across all slots.
+    inline fn hashSlot(win: u32) usize {
+        return @intCast((win *% 2654435761) >> hash_shift);
+    }
+
+    /// Locate or insert the entry for `win`. Always succeeds — no allocator,
+    /// no error union.  When the live-entry count reaches cache_capacity the
+    /// insertion is routed to the module-level overflow sentinel (no live entry
+    /// is corrupted) and a debug error is logged.
+    pub fn getOrPut(self: *CacheMap, win: u32) GetOrPutResult {
+        std.debug.assert(win != EMPTY_WIN); // XCB never assigns ID 0
+        var idx = hashSlot(win);
+        while (true) : (idx = (idx + 1) & hash_table_mask) {
+            const slot = &self.slots[idx];
+            if (slot.win == win)
+                return .{ .found_existing = true, .value_ptr = &slot.data };
+            if (slot.win == EMPTY_WIN) {
+                if (self.count >= cache_capacity) {
+                    debug.err("CacheMap: capacity exceeded, dropping cache for 0x{x}", .{win});
+                    overflow_sentinel = .{};
+                    return .{ .found_existing = false, .value_ptr = &overflow_sentinel };
+                }
+                slot.* = .{ .win = win, .data = .{} };
+                self.count += 1;
+                return .{ .found_existing = false, .value_ptr = &slot.data };
+            }
+        }
+    }
+
+    /// Returns a mutable pointer to the cached WindowData for `win`, or null if absent.
+    pub fn getPtr(self: *CacheMap, win: u32) ?*WindowData {
+        var idx = hashSlot(win);
+        while (true) : (idx = (idx + 1) & hash_table_mask) {
+            const slot = &self.slots[idx];
+            if (slot.win == win)       return &slot.data;
+            if (slot.win == EMPTY_WIN) return null;
+        }
+    }
+
+    /// Remove the entry for `win` (no-op when absent).
+    ///
+    /// Uses backward-shift deletion to maintain the linear-probe invariant
+    /// (every entry sits in the contiguous run that starts at its ideal slot)
+    /// without tombstones.  After the deleted slot becomes a hole, subsequent
+    /// entries in the same run are pulled back one step as long as doing so
+    /// does not move them before their ideal slot.  This keeps probe chains
+    /// compact and avoids the lookup degradation that tombstones cause over time.
+    ///
+    /// Correctness condition for shifting entry at `j` into the hole at `h`:
+    ///   An entry with ideal slot `r` can move from `j` to `h` when the probe
+    ///   chain from `r` passes through `h` before `j`, i.e. when h is not
+    ///   strictly between r and j in the modular sense.  Equivalently:
+    ///     (j − r) mod cap ≥ (j − h) mod cap
+    pub fn remove(self: *CacheMap, win: u32) void {
+        // Locate the entry.
+        var hole: usize = hashSlot(win);
+        while (true) : (hole = (hole + 1) & hash_table_mask) {
+            if (self.slots[hole].win == EMPTY_WIN) return; // not present
+            if (self.slots[hole].win == win)       break;
+        }
+        self.count -= 1;
+
+        // Backward-shift: pull subsequent entries toward the hole until we
+        // reach an empty slot.  Each iteration either shifts an entry back
+        // (advancing the hole) or leaves it in place (non-moveable entry) and
+        // keeps scanning — both paths advance j, so the loop always terminates.
+        var j = (hole + 1) & hash_table_mask;
+        while (self.slots[j].win != EMPTY_WIN) {
+            const r = hashSlot(self.slots[j].win);
+            // Can entry at j (ideal r) move to hole?
+            // Yes when (j-r) mod cap >= (j-hole) mod cap.
+            if (((j -% r) & hash_table_mask) >= ((j -% hole) & hash_table_mask)) {
+                self.slots[hole] = self.slots[j];
+                hole = j;
+            }
+            j = (j + 1) & hash_table_mask;
+        }
+        self.slots[hole] = .{}; // clear the final hole (original or shifted)
+    }
+
+    /// Reset the cache to empty in O(count) time, visiting only occupied slots.
+    /// Safe to call on a hot path: with typical window counts (10–80) this
+    /// avoids zeroing 6–50× more memory than necessary.
+    pub fn clearRetainingCapacity(self: *CacheMap) void {
+        var i: usize = 0;
+        var cleared: usize = 0;
+        while (cleared < self.count) : (i = (i + 1) & hash_table_mask) {
+            if (self.slots[i].win != EMPTY_WIN) {
+                self.slots[i] = .{};
+                cleared += 1;
+            }
+        }
+        self.count = 0;
+    }
+
+    /// Store WM_NORMAL_HINTS constraints for `win` in its cache entry.
+    /// No-op when all hint fields are zero (client published an empty atom).
+    /// Creates the entry if absent; updates in-place if already present.
+    /// Eviction happens automatically with `remove()` at unmanage time, so no
+    /// separate `evictSizeHints` call is required.
+    pub fn cacheHints(self: *CacheMap, win: u32, hints: SizeHints) void {
+        if (isEmptySizeHints(hints)) return;
+        self.getOrPut(win).value_ptr.hints = hints;
+    }
+};
+
+// Layout context and the configureWithHints entry point
+
+/// Context passed into every layout module's `tileWithOffset` call.
+///
+/// Carries the XCB connection and geometry cache by pointer so layout modules
+/// do not depend on module-level globals, making their dependencies explicit
+/// and their behaviour independently verifiable.
+pub const LayoutCtx = struct {
+    conn: *xcb.xcb_connection_t,
+    /// Pointer into tiling.State.cache. Always non-null during a retile pass.
+    cache: *CacheMap,
+    /// When non-null, `configureWithHints` emits a border-color change in the same
+    /// cache scan, eliminating the separate updateBorders pass and halving the
+    /// number of linear searches over CacheMap per window per retile.
+    /// Set by `makeLayoutCtx` during a normal retile; null in contexts that
+    /// do not have focus/border information (e.g. direct utils.configureWindow
+    /// calls in restoreWorkspaceGeom).
+    get_border_color: ?*const fn (win: u32) u32 = null,
+    /// When non-null, layout modules should emit this window's configure_window
+    /// call LAST within each column or stack group it belongs to.
+    ///
+    /// Used by swap_master to avoid a one-frame wallpaper gap: after swapping
+    /// the focused window into the master slot the growing window (new master)
+    /// must not vacate its old stack slot until the shrinking window (old master)
+    /// has already been configured into that slot.  Setting defer_configure to
+    /// the new master achieves this ordering without changing geometry arithmetic.
+    defer_configure: ?u32 = null,
+    /// When non-null, `configureWithHints` merges XCB_CONFIG_WINDOW_BORDER_WIDTH
+    /// into the geometry configure_window call, reducing 3 requests/window to 2.
+    /// Set only during reloadConfig retile; null for all normal retile passes.
+    border_width: ?u16 = null,
+};
+
+/// Returns true when both rects have identical coordinates and dimensions.
+pub inline fn rectsEqual(a: utils.Rect, b: utils.Rect) bool {
+    return a.x == b.x and a.y == b.y and a.width == b.width and a.height == b.height;
+}
+
+/// Shared implementation for configureWithHints and configureWithHintsAndRaise.
+///
+/// `raise` is a comptime bool — the compiler eliminates the dead branch, so
+/// codegen is identical to the previous two-function approach with zero runtime
+/// cost. The two public entry points are thin wrappers that instantiate this.
+///
+/// When `ctx.border_width` is non-null, the BORDER_WIDTH value is merged into
+/// the geometry configure_window call, reducing 3 XCB requests per window to 2.
+/// This is only set during reloadConfig; it is null for all normal retile passes.
+fn configureWithHintsImpl(comptime raise: bool, ctx: *const LayoutCtx, win: u32, rect: utils.Rect) void {
+    // Single probe: gop.value_ptr.hints holds any cached WM_NORMAL_HINTS
+    // constraints alongside the geometry and border dedup data.
+    const gop = ctx.cache.getOrPut(win);
+    const effective = applyHintsToRect(rect, gop.value_ptr.hints);
+
+    if (!effective.isValid()) {
+        debug.err("Invalid rect for window 0x{x}: {}x{} at {},{}",
+            .{ win, effective.width, effective.height, effective.x, effective.y });
+        if (comptime raise) {
+            _ = xcb.xcb_configure_window(ctx.conn, win,
+                xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
+        }
+        return;
+    }
+
+    const is_rect_changed = !gop.found_existing or !rectsEqual(gop.value_ptr.rect, effective);
+    if (is_rect_changed) {
+        gop.value_ptr.rect = effective;
+        if (comptime raise) {
+            _ = xcb.xcb_configure_window(ctx.conn, win,
+                xcb.XCB_CONFIG_WINDOW_X     | xcb.XCB_CONFIG_WINDOW_Y     |
+                xcb.XCB_CONFIG_WINDOW_WIDTH | xcb.XCB_CONFIG_WINDOW_HEIGHT |
+                xcb.XCB_CONFIG_WINDOW_STACK_MODE,
+                &[_]u32{
+                    @bitCast(@as(i32, effective.x)),
+                    @bitCast(@as(i32, effective.y)),
+                    effective.width,
+                    effective.height,
+                    xcb.XCB_STACK_MODE_ABOVE,
+                });
+        } else if (ctx.border_width) |bw| {
+            // Merge BORDER_WIDTH into the geometry request — saves one XCB round-trip
+            // per window during reloadConfig (the only caller that sets border_width).
+            _ = xcb.xcb_configure_window(ctx.conn, win,
+                xcb.XCB_CONFIG_WINDOW_X     | xcb.XCB_CONFIG_WINDOW_Y     |
+                xcb.XCB_CONFIG_WINDOW_WIDTH | xcb.XCB_CONFIG_WINDOW_HEIGHT |
+                xcb.XCB_CONFIG_WINDOW_BORDER_WIDTH,
+                &[_]u32{
+                    @bitCast(@as(i32, effective.x)),
+                    @bitCast(@as(i32, effective.y)),
+                    effective.width,
+                    effective.height,
+                    bw,
+                });
+        } else {
+            utils.configureWindow(ctx.conn, win, effective);
+        }
+    } else if (comptime raise) {
+        // Geometry unchanged (cache hit) — only raise; no intermediate state possible.
+        _ = xcb.xcb_configure_window(ctx.conn, win,
+            xcb.XCB_CONFIG_WINDOW_STACK_MODE, &[_]u32{xcb.XCB_STACK_MODE_ABOVE});
+    }
+
+    const getBorderColor = ctx.get_border_color orelse return;
+    const color = getBorderColor(win);
+    if (gop.found_existing and gop.value_ptr.border == color) return;
+    gop.value_ptr.border = color;
+    _ = xcb.xcb_change_window_attributes(ctx.conn, win,
+        xcb.XCB_CW_BORDER_PIXEL, &[_]u32{color});
+}
+
+/// Apply geometry to `win`, clamped to its WM_NORMAL_HINTS constraints.
+/// Skips the XCB round-trip when the rect is unchanged; updates border color
+/// in the same probe when `ctx.get_border_color` is set.
+pub fn configureWithHints(ctx: *const LayoutCtx, win: u32, rect: utils.Rect) void {
+    configureWithHintsImpl(false, ctx, win, rect);
+}
+
+/// Like configureWithHints, but also raises the window atomically.
+/// Combines XCB_CONFIG_WINDOW_{X,Y,WIDTH,HEIGHT} with XCB_CONFIG_WINDOW_STACK_MODE
+/// in a single request when geometry changes, so the compositor never sees an
+/// intermediate frame between the reposition/resize and the raise.
+pub fn configureWithHintsAndRaise(ctx: *const LayoutCtx, win: u32, rect: utils.Rect) void {
+    configureWithHintsImpl(true, ctx, win, rect);
+}
+
+/// Apply ICCCM §4.1.2.3 hint passes to a raw rect.
+///
+/// Pass 1 (min-size clamping) is intentionally omitted for tiling: the layout
+/// engine owns the window's dimensions, and honouring a client's declared
+/// minimum would silently pin the effective rect to that minimum on every
+/// retile — making the dedup check always a cache hit and preventing
+/// mod_h/mod_l from resizing the window at all.  Floating drag already
+/// ignores minimums (the drag handler echoes back whatever size the user
+/// dragged to), so this makes tiling consistent with floating behaviour.
+///
+/// Pass 2 (resize-increment snap) is retained so terminal emulators still
+/// snap to whole character cells; the base is 0 rather than min_width since
+/// we are no longer enforcing the declared minimum.
+fn applyHintsToRect(rect: utils.Rect, h: SizeHints) utils.Rect {
+    var w:  u16 = rect.width;
+    var ht: u16 = rect.height;
+
+    // Pass 2: Snap to resize increments (base = 0; min-size not enforced).
+    //   effective = floor(dim / inc) * inc
+    w  = snapDimToIncrement(w,  0, h.inc_width);
+    ht = snapDimToIncrement(ht, 0, h.inc_height);
+
+    // Pass 3: Clamp to declared maximum (after increment snap so we never
+    //   exceed the max even after rounding up to the next increment).
+    if (h.max_width  > 0) w  = @min(w,  h.max_width);
+    if (h.max_height > 0) ht = @min(ht, h.max_height);
+
+    // Pass 4: Aspect ratio (ICCCM §4.1.2.3, matching dwm's applysizehints).
+    //   min_aspect = min_aspect.y / min_aspect.x — lower bound on h/w
+    //   max_aspect = max_aspect.x / max_aspect.y — upper bound on w/h
+    //
+    // Divisions replaced with cross-multiplications to avoid two FP divides on
+    // every retile for windows that declare PAspect hints (terminals, players):
+    //   fw/fh > max_aspect  →  fw > fh * max_aspect
+    //   fh/fw > min_aspect  →  fh > fw * min_aspect
+    if (h.min_aspect > 0.0 and h.max_aspect > 0.0) {
+        const fw: f32 = @floatFromInt(w);
+        const fh: f32 = @floatFromInt(ht);
+        if (fw > fh * h.max_aspect) {
+            w = @intFromFloat(@round(fh * h.max_aspect));
+            if (h.max_width > 0) w = @min(w, h.max_width);
+        } else if (fh > fw * h.min_aspect) {
+            ht = @intFromFloat(@round(fw * h.min_aspect));
+            if (h.max_height > 0) ht = @min(ht, h.max_height);
+        }
+    }
+
+    return .{ .x = rect.x, .y = rect.y, .width = w, .height = ht };
+}
+
+/// Snap `dim` to the nearest multiple of `inc` above `base`.
+/// Returns `dim` unchanged when `inc` is zero or dim does not exceed `base`.
+inline fn snapDimToIncrement(dim: u16, base: u16, inc: u16) u16 {
+    if (inc == 0 or dim <= base) return dim;
+    const excess = dim - base;
+    return base + (excess / inc) * inc;
+}
+
+/// Returns true when all hint fields are zero, indicating the client published no constraints.
+inline fn isEmptySizeHints(h: SizeHints) bool {
+    return h.max_width == 0 and h.max_height == 0 and
+           h.inc_width == 0 and h.inc_height == 0 and
+           h.min_aspect == 0.0 and h.max_aspect == 0.0;
+}
+</file>
+
+<file path="src/window/modules/tiling/tiling.zig">
 //! Tiling window manager
 //! Orchestrates window layout, tracking, and border management for all tiled windows.
 
@@ -1475,3 +2592,6 @@ inline fn cycleEnum(v: anytype) void {
     const T = @TypeOf(v.*);
     v.* = @enumFromInt((@intFromEnum(v.*) + 1) % std.meta.fields(T).len);
 }
+</file>
+
+</files>
