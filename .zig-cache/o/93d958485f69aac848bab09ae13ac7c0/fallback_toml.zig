@@ -1,0 +1,1 @@
+pub const content: []const u8 = @embedFile("fallback.toml");
